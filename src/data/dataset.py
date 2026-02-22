@@ -19,6 +19,64 @@ from ..config import (
 from .feature_eng import FeatureEngineer
 
 
+def _reorder_hitter_first(segment: np.ndarray, hitter_position: str) -> np.ndarray:
+    """
+    Ensure the hitting player occupies nodes 0–16 in the skeleton.
+
+    After Y-sorting in pose_extractor:
+      player 0 (nodes  0-16) = top court  (smaller Y in image)
+      player 1 (nodes 17-33) = bottom court (larger Y in image)
+
+    If the annotation says the hitter is on the bottom court, swap both halves
+    so downstream models always see the hitter at player-0 nodes.
+
+    Args:
+        segment: (2, T, 34) raw skeleton — C=2 (x,y), T=frames, V=34 joints
+        hitter_position: "top", "bottom", or "" (unknown → no-op)
+
+    Returns:
+        (2, T, 34) skeleton with hitter at nodes 0-16
+    """
+    if hitter_position == "bottom":
+        segment = segment.copy()
+        tmp = segment[:, :, :17].copy()
+        segment[:, :, :17] = segment[:, :, 17:]
+        segment[:, :, 17:] = tmp
+    return segment
+
+
+def _reorder_hitter_first_by_location(
+    segment: np.ndarray, player_location_y: float
+) -> np.ndarray:
+    """
+    Hitter-first reordering for ShuttleSet using the annotated player Y position.
+
+    Compares player_location_y (pixel Y of the hitter from the JSON annotation)
+    against the Y centroid of each skeleton player to identify which
+    skeleton player (0 or 1) is the hitter, then swaps if needed.
+
+    Args:
+        segment: (2, T, 34) raw skeleton
+        player_location_y: pixel Y coordinate of the hitter from JSON record
+
+    Returns:
+        (2, T, 34) skeleton with hitter at nodes 0-16
+    """
+    if player_location_y is None or np.isnan(player_location_y):
+        return segment
+    # C=1 is the Y channel; mean over time and joints for each player
+    p0_y = segment[1, :, :17].mean()   # player 0 (top court)
+    p1_y = segment[1, :, 17:].mean()   # player 1 (bottom court)
+    # Which player centroid is closer to the annotated hitter Y?
+    if abs(player_location_y - p1_y) < abs(player_location_y - p0_y):
+        # Hitter is player 1 → swap
+        segment = segment.copy()
+        tmp = segment[:, :, :17].copy()
+        segment[:, :, :17] = segment[:, :, 17:]
+        segment[:, :, 17:] = tmp
+    return segment
+
+
 class FineBadmintonDataset(Dataset):
     """
     Labeled dataset for few-shot strategy classification.
@@ -81,6 +139,8 @@ class FineBadmintonDataset(Dataset):
                     "has_skeleton": skeleton_path.exists(),
                     "hit_type": hit.get("hit_type", ""),
                     "player": hit.get("player", ""),
+                    # "top" = upper court (player 0 after Y-sort), "bottom" = lower court (player 1)
+                    "hitter": hit.get("hitter", ""),
                     "strategy": canonical,
                     "raw_strategy": raw_label,
                     "quality": hit.get("quality"),
@@ -153,6 +213,12 @@ class FineBadmintonDataset(Dataset):
             pad = np.zeros((C, pad_len, V), dtype=segment.dtype)
             segment = np.concatenate([segment, pad], axis=1)
 
+        # Reorder so the hitting player is always at nodes 0–16.
+        # Pose extractor Y-sorts: player 0 = top court, player 1 = bottom court.
+        # If hitter is "bottom", swap the two halves.
+        hitter = info.get("hitter", "")
+        segment = _reorder_hitter_first(segment, hitter)
+
         return segment
 
     def get_labels(self):
@@ -185,8 +251,14 @@ class ShuttleSetDataset(Dataset):
     """
     Unlabeled dataset for self-supervised pre-training.
 
-    Loads skeleton sequences from processed ShuttleSet match data.
-    Each sample is one shot segment with optional shot-type label.
+    Loads per-shot skeleton .npy files extracted by notebook 02.
+    Each file is a (2, T, 34) window already centred on the hit frame
+    and already hitter-first ordered. Falls back to placeholder zeros
+    (indexed from JSON records) until extraction is done.
+
+    Per-shot extraction mirrors FineBadminton's per-rally approach so
+    that hitter-first reordering is applied at extraction time with the
+    annotated player_location_y, not deferred to load time.
     """
 
     def __init__(self, skeleton_dir=None, outputs_dir=None,
@@ -199,19 +271,23 @@ class ShuttleSetDataset(Dataset):
         self.load_shot_types = load_shot_types
         self.feature_eng = FeatureEngineer(feature_layer=feature_layer)
 
-        self.samples = []
+        self.samples = []   # (npy_path, shot_type_idx) or ("zero", shot_type_idx)
         self._load_data()
 
     def _load_data(self):
-        """Load skeleton data from processed ShuttleSet outputs."""
-        if self.skeleton_dir.exists():
-            for npy_file in sorted(self.skeleton_dir.rglob("*.npy")):
-                self.samples.append(("npy", str(npy_file), None))
-            if self.samples:
-                print(f"[INFO] ShuttleSet: {len(self.samples)} skeleton files")
-                return
+        """
+        Prefer per-shot .npy files (saved by notebook 02).
+        Falls back to indexing JSON records with placeholder zeros.
+        """
+        # Per-shot npy files live in subdirs: SS_SKELETONS/{match_id}/{shot}.npy
+        per_shot_files = sorted(self.skeleton_dir.rglob("*.npy"))
+        if per_shot_files:
+            for npy_file in per_shot_files:
+                self.samples.append((str(npy_file), None))
+            print(f"[INFO] ShuttleSet: {len(self.samples)} per-shot skeleton files")
+            return
 
-        # Fallback: index from JSON outputs
+        # Fallback: index from JSON outputs, return zeros until notebook 02 runs
         if self.outputs_dir.exists():
             total = 0
             for json_file in sorted(self.outputs_dir.glob("*.json")):
@@ -223,7 +299,7 @@ class ShuttleSetDataset(Dataset):
                         shot_type_idx = SS_SHOT_TYPE_TO_IDX.get(
                             record.get("type", ""), None
                         )
-                    self.samples.append(("record", record, shot_type_idx))
+                    self.samples.append(("zero", shot_type_idx))
                     total += 1
             print(f"[INFO] ShuttleSet: {total} shot records from "
                   f"{len(list(self.outputs_dir.glob('*.json')))} matches "
@@ -233,27 +309,21 @@ class ShuttleSetDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample_type, data, shot_type_idx = self.samples[idx]
+        npy_path, shot_type_idx = self.samples[idx]
 
-        if sample_type == "npy":
-            raw_skel = np.load(data)
+        if npy_path != "zero":
+            # Per-shot file: already correct size and hitter-first ordered
+            raw_skel = np.load(npy_path)
+            C, T, V = raw_skel.shape
+            if T < self.shot_window:
+                pad = np.zeros((C, self.shot_window - T, V), dtype=raw_skel.dtype)
+                raw_skel = np.concatenate([raw_skel, pad], axis=1)
+            elif T > self.shot_window:
+                raw_skel = raw_skel[:, :self.shot_window, :]
         else:
             raw_skel = np.zeros((2, self.shot_window, 34), dtype=np.float32)
-            shot_type_idx = data if isinstance(data, int) else shot_type_idx
 
-        C, T, V = raw_skel.shape
-        if T < self.shot_window:
-            pad = np.zeros((C, self.shot_window - T, V), dtype=raw_skel.dtype)
-            raw_skel = np.concatenate([raw_skel, pad], axis=1)
-        elif T > self.shot_window:
-            start = np.random.randint(0, T - self.shot_window)
-            raw_skel = raw_skel[:, start:start + self.shot_window, :]
-
-        if raw_skel.shape[0] == 2:
-            features = self.feature_eng.compute(raw_skel)
-        else:
-            features = raw_skel
-
+        features = self.feature_eng.compute(raw_skel)
         x = torch.tensor(features, dtype=torch.float32)
 
         if self.transform:

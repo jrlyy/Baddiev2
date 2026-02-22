@@ -1578,3 +1578,125 @@ at 30fps = ~600 frames):
 
 TrackNet and YOLOv8-Pose can run in parallel since they are independent
 models operating on the same frames. The bottleneck is pose estimation.
+
+A.11 Hitter-First Skeleton Ordering — The Core Data Convention
+--------------------------------------------------------------
+
+**The problem:** Tactical strategy is decided by the *hitting* player in
+response to the opponent's previous shot. The model must always know
+which player is the hitter so that it learns strategy signals from the
+correct skeleton. Without this, the model sees the same shot from two
+random perspectives per frame and cannot consistently associate body
+movement with the hitting player.
+
+**The skeleton layout:** YOLOv8-Pose returns keypoints for all detected
+persons. After selecting the top-2 by confidence, the two players must
+be assigned to canonical positions: nodes 0–16 (hitter) and nodes 17–33
+(opponent). The assignment must be consistent across all shots and both
+datasets, otherwise the model learns from noise.
+
+**Initial bug — X-sort instead of Y-sort:** The original implementation
+sorted players by X position (left vs. right on screen). This is
+incorrect for badminton because:
+
+- Broadcasts can flip orientation depending on match setup
+- The FineBadminton annotation "hitter" field uses "top" and "bottom"
+  (court halves), not "left" and "right"
+- X position is not a stable identity signal across rallies
+
+**The fix — Y-sort by court position:**
+
+In image coordinates, Y increases downward. Players positioned at the
+top of the court have smaller Y values; players at the bottom have
+larger Y values. YOLOv8-Pose is corrected to sort by mean joint Y
+centroid:
+
+```
+player 0 (nodes 0–16)  = top court   (smaller Y = top of image)
+player 1 (nodes 17–33) = bottom court (larger Y = bottom of image)
+```
+
+This maps cleanly to the FineBadminton annotation field:
+`"hitter": "top"` → hitter is already at nodes 0–16, no swap needed.
+`"hitter": "bottom"` → swap both halves so hitter moves to nodes 0–16.
+
+**FineBadminton implementation (`dataset.py`):** After extracting the
+T=16 frame window centred on the hit frame, `_reorder_hitter_first()` is
+called with the "hitter" annotation field. If "bottom", nodes 0–16 and
+17–33 are swapped in-place. If "top" or unknown, no operation.
+
+**ShuttleSet implementation (notebook 02):** ShuttleSet annotations do
+not have a "top"/"bottom" field. Instead they provide `player_location_y`
+— the pixel Y coordinate of the hitting player from the JSON record. At
+extraction time, `_reorder_hitter_first_by_location()` computes the mean
+Y centroid of each skeleton player and compares it to `player_location_y`.
+The closer player is identified as the hitter and swapped to nodes 0–16
+if needed. This reordering is applied at extraction time (notebook 02)
+so the saved per-shot `.npy` files are already hitter-first ordered.
+The `ShuttleSetDataset` loader does not need to re-apply it.
+
+**End result:** For both datasets, every model input has the same
+semantics: nodes 0–16 are the hitting player, nodes 17–33 are the
+opponent. The encoder learns strategy signals from a consistent first-person
+perspective.
+
+A.12 Extraction Granularity — Why FineBadminton is Per-Rally and ShuttleSet is Per-Shot
+----------------------------------------------------------------------------------------
+
+Both datasets share the same logical hierarchy: match → rally → shot.
+However, their physical frame file organisation differs, which
+determines the natural extraction granularity.
+
+**FineBadminton frame files:**
+
+Frames are stored with filenames that encode rally identity:
+
+```
+FineBadminton-dataset/dataset/image/
+  0011_001_00001.jpg   ← match 0011, rally 001, frame 00001
+  0011_001_00002.jpg
+  ...
+  0011_002_00001.jpg   ← same match, rally 002
+```
+
+Since rally identity is encoded in the filename, frames can be grouped
+by rally with a simple filename parse. The natural unit is: load all
+frames for rally `0011_001`, run YOLOv8-Pose, save one `.npy` file
+covering the entire rally duration. At dataset load time, the
+FineBadmintonDataset windowing logic slices the per-rally skeleton to
+the T=16 frame window centred on each shot's `hit_frame` timestamp from
+the JSON annotation.
+
+**ShuttleSet frame files:**
+
+Frames are stored as flat sequential integers within a match directory:
+
+```
+datasets_preprocessing/ShuttleSet/frames/
+  MATCH_ID/
+    frame_000001.png
+    frame_000002.png
+    ...
+    frame_021191.png   ← all frames across all rallies in one flat sequence
+```
+
+There is no rally or shot identity in the filename. The only way to
+locate a specific shot is to look up `frame_num` from the JSON record
+and seek into the flat frame sequence. Since per-shot lookup is required
+anyway to identify which frames to load, extracting one `.npy` per shot
+(16 frames centred on `frame_num`) is equally straightforward and avoids
+loading the entire match (thousands of frames) into memory. It also
+enables hitter-first reordering to be applied at extraction time using
+`player_location_y` from the same JSON record.
+
+**Resulting file layout:**
+
+| Dataset | Skeleton granularity | File per | Shape | Hitter reordering |
+|---|---|---|---|---|
+| FineBadminton | Per rally | `{rally_id}.npy` | (2, T_full, 34) | Applied at load time using "hitter" field |
+| ShuttleSet | Per shot | `{match_id}/r{rally:04d}_b{ball:04d}.npy` | (2, 16, 34) | Applied at extraction time using `player_location_y` |
+
+**Both produce the same model input:** A `(2, 16, 34)` tensor, hitter at
+nodes 0–16, opponent at nodes 17–33. The granularity difference is an
+implementation detail driven by how each dataset physically organises its
+frames. The downstream model and training code are identical for both.

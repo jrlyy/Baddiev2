@@ -38,6 +38,35 @@ class PoseExtractor:
                 "ultralytics not installed. Run: pip install ultralytics"
             )
 
+    def _parse_result(self, result) -> Optional[np.ndarray]:
+        """
+        Parse a single YOLO result into dual-player keypoints.
+
+        Args:
+            result: single ultralytics result object
+
+        Returns:
+            keypoints: (2, 17, 2) array of (x, y) for 2 players,
+                      or None if fewer than 2 people detected
+        """
+        if result.keypoints is None or len(result.keypoints) < 2:
+            return None
+
+        kpts = result.keypoints.xy.cpu().numpy()   # (N, 17, 2)
+        confs = result.keypoints.conf.cpu().numpy()  # (N, 17)
+
+        # Select top-2 by mean keypoint confidence
+        mean_confs = confs.mean(axis=1)
+        top2_idx = np.argsort(mean_confs)[-2:]
+        player_kpts = kpts[top2_idx]  # (2, 17, 2)
+
+        # Sort by y-position (top court player = player 0, bottom court = player 1).
+        # In image coordinates Y increases downward, so smaller Y = top of court.
+        # This matches the annotation "hitter" field which uses "top"/"bottom".
+        center_y = player_kpts[:, :, 1].mean(axis=1)
+        sort_idx = np.argsort(center_y)
+        return player_kpts[sort_idx]
+
     def extract_frame(self, frame) -> Optional[np.ndarray]:
         """
         Extract dual-player keypoints from a single frame.
@@ -50,61 +79,60 @@ class PoseExtractor:
                       or None if fewer than 2 people detected
         """
         self.load_model()
-
         results = self.model(frame, verbose=False)
-        if not results or len(results) == 0:
+        if not results:
             return None
-
-        result = results[0]
-        if result.keypoints is None or len(result.keypoints) < 2:
-            return None
-
-        # Get keypoints and confidence for all detections
-        kpts = result.keypoints.xy.cpu().numpy()   # (N, 17, 2)
-        confs = result.keypoints.conf.cpu().numpy()  # (N, 17)
-
-        # Select top-2 by mean keypoint confidence
-        mean_confs = confs.mean(axis=1)
-        top2_idx = np.argsort(mean_confs)[-2:]
-
-        player_kpts = kpts[top2_idx]  # (2, 17, 2)
-
-        # Sort by x-position (left player = player 0)
-        center_x = player_kpts[:, :, 0].mean(axis=1)
-        sort_idx = np.argsort(center_x)
-        player_kpts = player_kpts[sort_idx]
-
-        return player_kpts
+        return self._parse_result(results[0])
 
     def extract_sequence(self, frames) -> np.ndarray:
         """
-        Extract skeleton sequence from a list of frames.
+        Extract skeleton sequence from a list of frames using batched inference.
+
+        Passes frames to YOLOv8 in batches (self.config.batch_size) so the
+        GPU processes multiple frames per forward pass instead of one at a time.
 
         Args:
             frames: list of numpy arrays (H, W, 3)
 
         Returns:
-            skeleton: (2, T, 17, 2) — channels-last format
-                      Reshaped to (C, T, V) = (2, T, 34) for the model
+            skeleton: (C, T, V) = (2, T, 34) for the model
         """
+        self.load_model()
         T = len(frames)
         skeletons = np.zeros((T, 2, NUM_JOINTS, JOINT_DIM), dtype=np.float32)
+        batch_size = self.config.batch_size
 
-        for t, frame in enumerate(frames):
-            kpts = self.extract_frame(frame)
-            if kpts is not None:
-                skeletons[t] = kpts
-            elif t > 0:
-                # Forward-fill from previous frame on detection failure
-                skeletons[t] = skeletons[t - 1]
+        # Use batch inference on CUDA; fall back to single-frame on CPU/MPS
+        # (CPU batching adds preprocessing overhead without parallel speedup)
+        import torch
+        use_batch = torch.cuda.is_available() and batch_size > 1
+
+        if use_batch:
+            t = 0
+            for batch_start in range(0, T, batch_size):
+                batch = frames[batch_start:batch_start + batch_size]
+                results = self.model(batch, verbose=False)
+                for result in results:
+                    kpts = self._parse_result(result)
+                    if kpts is not None:
+                        skeletons[t] = kpts
+                    elif t > 0:
+                        skeletons[t] = skeletons[t - 1]
+                    t += 1
+        else:
+            for t, frame in enumerate(frames):
+                results = self.model(frame, verbose=False)
+                kpts = self._parse_result(results[0]) if results else None
+                if kpts is not None:
+                    skeletons[t] = kpts
+                elif t > 0:
+                    skeletons[t] = skeletons[t - 1]
 
         if self.config.kalman_smoothing:
             skeletons = self._apply_kalman(skeletons)
 
         # Reshape to model input format: (C, T, V)
-        # C = 2 (x, y), T = num_frames, V = 34 (17 joints x 2 players)
-        # From (T, 2_players, 17_joints, 2_xy)
-        # → (T, 34, 2) → (2, T, 34)
+        # From (T, 2_players, 17_joints, 2_xy) → (T, 34, 2) → (2, T, 34)
         skeletons = skeletons.reshape(T, -1, JOINT_DIM)  # (T, 34, 2)
         skeletons = skeletons.transpose(2, 0, 1)          # (2, T, 34)
 
