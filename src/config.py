@@ -14,10 +14,11 @@ MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
 # FineBadminton (in Datasets/)
-FB_ROOT = PROJECT_ROOT / "Datasets" / "FineBadminton-dataset" / "dataset"
-FB_FRAMES = FB_ROOT / "image"
+FB_ROOT        = PROJECT_ROOT / "Datasets" / "FineBadminton-dataset" / "dataset"
+FB_FRAMES      = FB_ROOT / "image"
 FB_ANNOTATIONS = FB_ROOT / "transformed_combined_rounds_output_en_evals_translated.json"
-FB_SKELETONS = PROJECT_ROOT / "Datasets" / "finebadminton_skeletons"
+FB_SKELETONS       = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons"
+FB_SKELETONS_GDINO = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino"
 
 # ShuttleSet CSV annotations (in datasets/)
 SS_CSV_ROOT = PROJECT_ROOT / "datasets" / "ShuttleSet" / "set"

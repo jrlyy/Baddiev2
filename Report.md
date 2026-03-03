@@ -246,11 +246,13 @@ skeleton and positional features:
 | **Passive** | Non-aggressive return with no spatial advantage gained | Neutral body posture, no significant court position change |
 | **Defensive** | Reactive shot from disadvantaged position | Stretched/extended body posture, rear/lateral court position, upward arm trajectory |
 
-Three strategies from FineBadminton are excluded: deception (requires
-biomechanical discrepancy data unavailable from 2D skeletons),
-hesitation (requires sub-frame timing precision beyond our temporal
-resolution of \~30fps), and seamlessly (a quality modifier rather than a
-discrete tactical category).
+Four annotation values from FineBadminton are excluded: **deception**
+(requires biomechanical discrepancy data unavailable from 2D skeletons),
+**hesitation** (requires sub-frame timing precision beyond our temporal
+resolution of ~30fps), **seamlessly** (a quality modifier rather than a
+discrete tactical category), and **"a high net early shot"** (insufficient
+samples for reliable classification). Shots with these or any unmapped
+strategy labels are dropped from the dataset at load time.
 
 4\. Datasets and Data Acquisition
 
@@ -260,31 +262,36 @@ discrete tactical category).
 
 | Dataset | Size | What Is Provided | Acquisition Steps | Role in Pipeline |
 |---|---|---|---|---|
-| **FineBadminton** | 40 rallies, ~500 shots, ~12K frames | Frames at 20fps (jpg), strategy annotations, shot subtypes, quality scores (1–7) | 1. Request from authors 2. Run YOLOv8-Pose on frames 3. Extract skeletons | Few-shot classification (support + query sets) |
-| **ShuttleSet** | 1,500 matches total; 50-match subset selected | CSV tracking data, 22 shot type labels, YouTube video links. No video files provided. | 1. Parse CSV, select 50 matches 2. Download via yt-dlp 3. Extract frames (30fps) 4. Run YOLOv8-Pose | SSL pre-training (skeleton extraction) + auxiliary shot-type task |
+| **FineBadminton** | 40 rallies, **355 annotated shots** (296 skeletal + 59 annotation-only), 10,620 frames across 11 matches | Frames at 20fps (jpg); JSON annotations with per-shot `hit_frame`, `start_frame`, `end_frame`, `hitter` ("top"/"bottom"), `strategies`, and quality scores (1–7) | 1. Request from authors 2. Run YOLOv8s-Pose on provided frames 3. Save per-rally skeleton .npy | Few-shot classification (support + query sets). 414 total hitting events; 59 excluded (deception×14, high\_net\_early×36, hesitation×8, seamlessly×1). |
+| **ShuttleSet** | 44 matches in `match.csv`; **25 successfully processed** (19 had broken or missing YouTube links) | JSON outputs per match with per-shot `type`, `rally`, `frame_num`, and `player_location_y`. YouTube links provided; no video files. | 1. Parse `match.csv` 2. Download available videos via yt-dlp streaming pipeline 3. Extract frames at 30fps 4. Run YOLOv8-Pose 5. Save per-shot skeleton .npy | SSL pre-training (21,191 unlabeled shot sequences) + auxiliary shot-type task |
 
 4.2 Optimized Acquisition Strategy
 
-A key practical consideration is that the full ShuttleSet corpus (1,500
-matches, \~100GB) is neither necessary nor feasible to download. We
-select a 50-match subset (\~500--800 rallies, \~5K--8K shots) that
-provides sufficient diversity for contrastive pre-training while
-reducing download time from weeks to days. This subset is 5--10× the
-size of the FineBadminton labeled set, which is adequate for
-self-supervised learning to discover meaningful motion patterns.
+The ShuttleSet corpus provides 44 annotated matches via `match.csv`. Of
+these, 25 were successfully downloaded and processed — 1 match had no
+YouTube URL and 18 had broken links (content removed from YouTube). The
+25 processed matches yield **21,191 labeled shot records** across 963
+rallies, covering 19 shot types (e.g., smash, clear, drop, drive, net
+shot). This is approximately 71× the size of the FineBadminton labeled
+set and provides adequate diversity for self-supervised pre-training.
 
-**ShuttleSet match selection criteria:** Matches are filtered for high
-video quality (1080p available), diverse players and tournaments (to
-maximize playing style variation), and complete rally data in the CSV
-(no missing shot entries). From the filtered pool, 50 matches are
-sampled with a fixed random seed for reproducibility.
+**ShuttleSet corpus:** The dataset's `match.csv` covers 44 elite men's
+and women's singles matches from 2018–2021 tournaments. Players include
+Viktor Axelsen, Kento Momota, Carolina Marin, and Chou Tien Chen across
+tournaments such as Fuzhou Open, Denmark Open, and Thailand Open. The
+diversity in playing styles and match contexts is intentional — contrastive
+pre-training benefits from varied motion patterns.
 
 **FineBadminton acquisition:** The FineBadminton authors provide
-pre-extracted frames at 20fps as jpg files. This eliminates the video
-download and frame extraction step entirely. The 20fps rate is
-sufficient for pose estimation (human motion is smooth at this rate),
-and each shot window of \~0.8 seconds yields 16 frames---an ideal
-temporal window size for the ST-GCN encoder.
+pre-extracted frames at 20fps as jpg files, organized by rally ID.
+This eliminates the video download and frame extraction step entirely.
+Frames are named `{rally_id}_{absolute_frame_num}.jpg`, and the JSON
+annotations reference absolute frame numbers, allowing direct alignment
+between frames and per-shot annotation windows.
+
+The 20fps rate is sufficient for pose estimation (human motion is smooth
+at this rate), and each shot window of \~0.8 seconds yields 16 frames —
+the temporal window size used by the ST-GCN encoder.
 
 4.3 Data Volume and Storage Requirements
 
@@ -293,18 +300,19 @@ planning:
 
 *Table 4: Data volumes through the pipeline*
 
-| Pipeline Stage | FineBadminton | ShuttleSet (50 matches) | Notes |
+| Pipeline Stage | FineBadminton | ShuttleSet (25 processed matches) | Notes |
 |---|---|---|---|
-| Raw frames (jpg) | ~12K frames, ~2–3GB | ~200K frames, ~20GB | FineBadminton: provided. ShuttleSet: extracted at 30fps via ffmpeg. |
-| Downloaded videos (mp4) | N/A (frames provided) | ~10GB (50 matches) | Deletable after frame extraction to save storage. |
-| Processed skeletons (npy/pkl) | ~100MB | ~1–2GB | Compact numerical arrays. Frames deletable after this stage. |
-| Shot segments (T=16 frames each) | ~500 labeled shots | ~5K–8K unlabeled shots | Grouped using annotation timestamps (FB) or CSV shot timestamps (SS). |
+| Raw frames (jpg) | ~12K frames, ~2–3GB | Varies by match (~30fps × match duration) | FineBadminton: provided by authors. ShuttleSet: extracted via ffmpeg streaming pipeline. |
+| Downloaded videos (mp4) | N/A (frames provided) | ~5–8GB (25 matches) | Deletable after frame extraction to save storage. |
+| Processed skeletons (.npy) | **40 per-rally .npy files** `(2, T_full, 34)` — range 74–652 frames, avg 265, total 10,620 frames. Stored in `datasets_preprocessing/finebadminton_skeletons/`. | 21,191 per-shot .npy files (2, 16, 34) stored in `datasets_preprocessing/ShuttleSet/skeletons/`. | FineBadminton: one .npy per rally, full rally duration. ShuttleSet: one .npy per shot, windowed to T=16. |
+| Shuttle trajectories (.npy) | **40 per-rally .npy files** `(T, 3)` — columns [x, y, visible]. Stored in `datasets_preprocessing/finebadminton_shuttles/`. Extracted via TrackNetV4. | N/A (shuttle extraction not yet applied to ShuttleSet) | Rally-level trajectories aligned frame-for-frame with skeleton arrays. |
+| Shot segments used in training | **296 labeled shots** (T=16, extracted at load time from per-rally .npy). 59 additional annotation-only shots excluded from model but surfaced in demo UI with disclaimer. | **21,191 unlabeled shots** (T=16, extracted at save time) | FB windows centered on `hit_frame` from annotations. SS windows centered on `frame_num` from JSON records. |
 | Model checkpoints | — | — | ~500MB for ST-GCN weights. |
 
-**Storage optimization:** By deleting raw videos after frame extraction
-(−10GB) and deleting frames after skeleton extraction (−20GB), the
-minimal persistent footprint is \~5GB (FineBadminton frames + all
-processed skeletons + checkpoints).
+**Storage optimization:** Deleting raw videos after frame extraction and
+frames after skeleton extraction reduces persistent storage to the .npy
+skeleton files, which are compact (each (2, 16, 34) float32 array is
+~14KB; 21,191 shots ≈ 300MB total for ShuttleSet).
 
 4.4 Few-Shot Data Split Strategy
 
@@ -334,6 +342,485 @@ ShuttleSet's YouTube videos. We treat the contrastive learning and
 auxiliary supervision as complementary objectives on the same data
 source (ShuttleSet videos + ShuttleSet CSVs).
 
+4.6 Skeleton Extraction and Labeling Pipeline
+
+This section precisely describes how raw frames are converted to labeled
+skeleton tensors — a two-stage process where player ordering and hitter
+identity are assigned at different points in the pipeline.
+
+**4.6.1 Pose Extraction**
+
+Skeleton keypoints are extracted using **YOLOv8-Pose** (`yolov8s-pose`),
+which performs joint person detection and 17-joint COCO keypoint
+estimation in a single forward pass. For each frame, all detected
+persons are scored by their mean keypoint confidence; the **top-2
+detections** are retained as the two players. Frames where fewer than 2
+people are confidently detected are forward-filled from the previous
+frame. The `s` (small) variant is used over `x` for CPU-viable batch
+processing; the `x` variant is listed in `config.py` as the default for
+GPU environments.
+
+Batched inference is used when a CUDA GPU is available (`batch_size=8`
+by default). On CPU or MPS, frames are processed one at a time.
+
+Temporal smoothing is applied via **exponential smoothing** (α = 0.7):
+
+```
+smoothed[t] = 0.7 × raw[t] + 0.3 × smoothed[t−1]
+```
+
+This approximates Kalman filtering without requiring a full state-space
+model. Higher α preserves more of the raw signal; lower α smooths more
+aggressively.
+
+> **Potential improvement:** Replace exponential smoothing with a proper
+> constant-velocity Kalman filter. A Kalman filter separates measurement
+> noise from process noise and adapts its effective smoothing weight
+> frame-by-frame — particularly useful during fast motion or occlusion
+> events where YOLOv8 keypoint confidence is low. The state vector
+> would be [x, y, vx, vy] per joint, with two tunable noise covariance
+> matrices (process noise Q, measurement noise R). This is a tractable
+> experiment that would improve skeleton quality without changing any
+> downstream components.
+
+**Output format:** `(2, T, 34)` — where dim 0 is the coordinate channel
+(0 = X, 1 = Y in pixel space), dim 1 is the frame index T, and dim 2
+is the joint index (0–16 = player 0, 17–33 = player 1).
+
+**4.6.2 Player Ordering: Y-Sort (applied at extraction time)**
+
+After selecting the top-2 detections, both players are sorted by their
+**mean Y keypoint centroid** in image coordinates. Since image Y
+increases downward:
+
+- **Player 0** (joints 0–16) = the player with the **smaller mean Y** = top-court player
+- **Player 1** (joints 17–33) = the player with the **larger mean Y** = bottom-court player
+
+This assignment is made purely from the extracted image geometry — no
+annotations are consulted. The resulting `(2, T, 34)` skeleton arrays
+saved to disk always follow this Y-sort convention.
+
+**4.6.3 Hitter-First Reordering (applied at different points for each dataset)**
+
+The Y-sort tells us *where* each player is on court, but not *who is
+hitting*. For the few-shot classifier to generalize across rallies where
+either player may be serving as hitter, we always place the **hitting
+player at nodes 0–16**. This is done by conditionally swapping the two
+17-joint halves:
+
+| Dataset | When applied | Source of hitter identity | Where stored |
+|---|---|---|---|
+| **FineBadminton** | At **dataset load time** (`dataset.py`) | `"hitter"` field in JSON annotation: `"top"` or `"bottom"` | NOT in .npy. Applied on-the-fly per sample. |
+| **ShuttleSet** | At **extraction time** (notebook 02) | `player_location_y` in JSON record: pixel Y of the annotated hitting player | Stored in the per-shot .npy directly. |
+
+For FineBadminton: if `hitter == "bottom"`, nodes 0–16 and 17–33 are
+swapped after windowing. If `hitter == "top"`, no swap is needed (the
+Y-sorted player 0 is already the hitter). The per-rally `.npy` files
+on disk are always raw Y-sorted and are never modified.
+
+For ShuttleSet: the annotated `player_location_y` (pixel Y of the
+hitter's position) is compared against each player's skeleton centroid
+Y. The player whose centroid Y is closest to `player_location_y` is
+identified as the hitter; if this is player 1, the halves are swapped
+before saving the per-shot `.npy`.
+
+**4.6.4 Strategy Labels (FineBadminton)**
+
+Strategy labels are assigned from the JSON annotation field
+`strategies[0]` (the primary strategy for each shot). The raw label
+string is lowercased, stripped, and mapped through two lookup tables:
+
+1. **`FB_STRATEGY_MAP`** normalises annotation variants to canonical
+   names (e.g., `"move to the net"` → `"move_to_net"`, `"to create
+   depth"` → `"create_depth"`).
+2. **`STRATEGY_TO_IDX`** maps canonical names to integer class indices:
+
+| Index | Strategy | Raw annotation variants |
+|---|---|---|
+| 0 | intercept | "intercept" |
+| 1 | defensive | "defensive" |
+| 2 | move_to_net | "move to the net", "move to net" |
+| 3 | create_depth | "to create depth", "create depth" |
+| 4 | passive | "passive" |
+
+Four annotation values are excluded entirely: `"deception"` (requires
+biomechanical discrepancy between preparation and execution phases),
+`"hesitation"` (requires sub-frame timing precision), `"seamlessly"`
+(a quality modifier, not a discrete tactical category), and `"a high
+net early shot"` (insufficient samples for reliable classification).
+Shots with excluded or unmapped strategy labels are silently skipped
+during annotation loading.
+
+**4.6.5 Shot Type Labels (ShuttleSet, auxiliary)**
+
+ShuttleSet provides 22 shot-type categories per shot in the `type`
+field of the JSON records (labels are in Traditional Chinese, e.g.,
+殺球 = smash, 過渡球 = clear). These are mapped to integer indices via
+`SS_SHOT_TYPE_TO_IDX` and used only for the auxiliary classification
+head during SSL pre-training (weighted at 0.3 relative to the
+contrastive loss). They are not used in the few-shot strategy
+classification task.
+
+**4.6.6 Shot Window Extraction**
+
+Both datasets use a fixed temporal window of **T = 16 frames** centered
+on the hit frame. The handling differs between datasets:
+
+- **FineBadminton:** Skeletons are saved as one `.npy` per rally
+  covering the full rally duration (shape `(2, T_full, 34)`). At load
+  time, the window is sliced from `[hit_frame − 8, hit_frame + 8)` using
+  the `hit_frame` field from the annotation and the rally's
+  `start_frame` offset. If the window extends beyond the skeleton
+  boundaries, it is clamped and zero-padded at the end.
+
+- **ShuttleSet:** Skeletons are saved as one `.npy` per shot, already
+  windowed to shape `(2, 16, 34)` at extraction time. The window is
+  centered on `frame_num` from the JSON record. Missing frames within
+  the window are filled by copying the nearest valid neighbour.
+
+**4.6.7 Skeleton Extraction Quality: Chair Umpire Contamination**
+
+A systematic quality audit of the extracted FineBadminton skeletons
+revealed a significant contamination issue that directly impacts
+hitter-first reordering accuracy.
+
+**Root cause.** YOLOv8-Pose selects the **top-2 persons by mean
+keypoint confidence** per frame, with no spatial constraint on where
+those persons must be. The chair umpire (seated at the left edge of
+the court at approximately x ≈ 102px on a 1280px-wide frame) is
+consistently detected with high confidence because they are stationary,
+upright, and well-lit. In rallies where the umpire is detected ahead
+of one of the actual court players, they are assigned as **P0**
+(top-court player) via the Y-sort, displacing the real player.
+
+**Impact measured across all 40 rallies (355 shots with skeletons):**
+
+| Metric | Count | % |
+|---|---|---|
+| Shots with ANY contaminated frame in window | 50 | 14.1% |
+| Shots fully contaminated (all 16 frames wrong) | 6 | 1.7% |
+| Worst strategy (`to create depth`) | 12/61 | 20% |
+
+Rally `0011_001` shows the clearest example: frames 66–138 and 235
+assign P0 to the umpire (x ≈ 102px mean centroid), which contaminates
+4 of the 13 hit windows in that rally, including one `move_to_net`
+shot where **all 16 frames** show the umpire as P0.
+
+**Why this breaks hitter-first reordering.** The reordering in
+`dataset.py` is logically correct — it reads the annotation `hitter`
+field ("top" or "bottom") and swaps joints 0–16 with 17–33 if the
+hitter is on the bottom court. However, when P0 is the umpire rather
+than the top-court player, this swap operates on (umpire, actual_player)
+instead of (top_player, bottom_player), producing a corrupted training
+sample where the model sees the umpire's skeleton labeled as the
+hitter's motion.
+
+**Annotation confirmed correct.** Inspection of the JSON annotation
+for rally `0011_001` confirms the `hitter` field correctly alternates:
+Kento MOMOTA (top) → Viktor AXELSEN (bottom) → Kento MOMOTA (top) …
+at every shot transition. The inaccuracy is entirely upstream in the
+skeleton extraction, not in the annotation or reordering code.
+
+**Remedy: Grounding DINO-guided extraction.** A GDINO-guided approach
+uses Grounding DINO (`grounding-dino-tiny`) with the text prompt
+`"player"` to produce court-region bounding boxes before YOLOv8
+keypoint estimation. Only YOLO detections with IoU ≥ 0.25 against a
+GDINO bounding box are accepted as valid players. The chair umpire is
+rejected because their position falls outside the set of GDINO "player"
+detections (which are prompted to find players in motion on court).
+If fewer than 2 valid players pass this filter, the pipeline falls back
+to plain YOLOv8 top-2 selection.
+
+GDINO-guided skeletons are saved to a separate directory
+(`datasets_preprocessing/finebadminton_skeletons_gdino/`) so that the
+original extractions are preserved. The HTML overlay provides a
+**toggle** (Original / GDINO) to visually compare both extractions
+on any frame before committing to a full re-extraction run.
+
+This validation is implemented in
+`notebooks/02_skeleton_extraction_finebadminton.ipynb` (Section 7,
+GDINO-Guided Extraction) and tested on the rallies with the highest
+contamination rates before a full re-run is scheduled.
+
+4.7 Exploratory Data Analysis
+------------------------------
+
+This section reports factual statistics, annotation structure, and
+visualisation summaries for both datasets, as produced by
+`notebooks/01_EDA_finebadminton.ipynb` and
+`notebooks/01_EDA_shuttleset.ipynb`.
+
+### 4.7.1 FineBadminton Dataset
+
+**Source and acquisition.** The dataset was obtained directly from the
+authors and provides pre-extracted frames (no video download required).
+Frames are stored as JPEG files named `{rally_id}_{abs_frame}.jpg`
+under `dataset/image/`. Annotations are in two JSON files: a
+Chinese-language original and an English-translated version; the
+pipeline uses the English version
+(`transformed_combined_rounds_output_en_evals_translated.json`).
+
+**Top-level structure.** Each entry in the JSON array corresponds to
+one rally and contains:
+
+| Field | Type | Description |
+|---|---|---|
+| `video_name` | str | Rally identifier (e.g. `"0011"`) |
+| `fps` | float | Varies per clip (~24.6–25.0 fps) |
+| `resolution` | dict | `{width, height}` — mix of 1280×720, 1912×1080, 1920×1080 |
+| `start_frame` / `end_frame` | int | Absolute frame indices covering the rally |
+| `duration_frames` | int | Derived frame count |
+| `playerList` | list | Player names for top and bottom court |
+| `hitting` | list | Per-shot annotation objects (see below) |
+| `evaluations_new` | dict | Rally-level tactical summary (score/lose reason text) |
+| `QA` | list | Natural-language Q&A pairs over the rally |
+
+**Per-shot (hitting) annotation fields:**
+
+| Field | Type | Values / Notes |
+|---|---|---|
+| `hit_frame` | int | Exact contact frame (absolute, no missing values) |
+| `start_frame` / `end_frame` | int | Shot window boundaries |
+| `hitter` | str | `"top"` or `"bottom"` (1 missing across all shots) |
+| `player` | str | Player name string |
+| `hit_type` | str | Stroke type (12 classes — see below) |
+| `subtype` | list[str] | Sub-classification (e.g. `"flat lift"`, `"short serve"`) |
+| `quality` | int | Annotator quality score 1–7 |
+| `ball_area` | str | Court zone of shot (9 zones: left/mid/right × front/mid/back) |
+| `player_actions` | list[str] | `"forehand"`, `"backhand"`, `"turnaround"` |
+| `shot_characteristics` | list[str] | `"cross-court"`, `"straight"`, `"over head"`, etc. |
+| `strategies` | list[str] | Tactical strategy labels (present for 355/414 shots) |
+| `get_point` | list | Frames where a point was won (empty if mid-rally) |
+
+**Scale:**
+
+| Statistic | Value |
+|---|---|
+| Total rallies | 40 (across 11 matches, all from same video source) |
+| Total hitting events | 414 |
+| Shots with strategy labels | 355 (85.7%) |
+| Shots used in training | 296 (after excluding out-of-scope strategy labels) |
+| Total frames | 10,620 JPEG images |
+| Rally frame length | min 73 · max 651 · mean 264 frames |
+| Shots per rally | min 3 · max 27 · mean 10.3 |
+| Resolution mix | 1280×720, 1912×1080, 1920×1080 |
+| FPS range | ~24.6–25.0 fps |
+
+**Shot type distribution (hit_type, N=414):**
+
+| Shot type | Count | % |
+|---|---|---|
+| push shot | 84 | 20.3% |
+| kill | 70 | 16.9% |
+| net shot | 44 | 10.6% |
+| block | 43 | 10.4% |
+| serve | 40 | 9.7% |
+| drive | 34 | 8.2% |
+| clear | 31 | 7.5% |
+| drop shot | 23 | 5.6% |
+| cross-court net shot | 20 | 4.8% |
+| net lift | 16 | 3.9% |
+| net kill | 8 | 1.9% |
+| (unlabelled) | 1 | 0.2% |
+
+**Strategy label distribution (N=355 shots with strategy, multi-label):**
+
+| Strategy | Count | % of all shots |
+|---|---|---|
+| passive | 137 | 33.1% |
+| intercept | 120 | 29.0% |
+| To create depth | 61 | 14.7% |
+| defensive | 61 | 14.7% |
+| move to the net | 59 | 14.3% |
+| a high net early shot | 44 | 10.6% |
+| hesitation | 27 | 6.5% |
+| seamlessly | 25 | 6.0% |
+| deception | 21 | 5.1% |
+
+Strategies are multi-label; the 5 target classes kept in training are
+`intercept`, `defensive`, `passive`, `move to the net`, and
+`To create depth` (normalised to `create_depth` in the pipeline). The
+remaining labels — `a high net early shot` (36 shots),
+`hesitation` (8), `deception` (14), and `seamlessly` (1) — are
+excluded because they require sub-frame timing or continuous
+sequential context that a single fixed window cannot reliably capture
+(see §3.3 for label set rationale).
+
+**Quality score distribution (scale 1–7, N=414):**
+
+| Score | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|
+| Count | 11 | 27 | 70 | 136 | 108 | 32 | 30 |
+| % | 2.7 | 6.5 | 16.9 | 32.9 | 26.1 | 7.7 | 7.2 |
+
+Score 4 is most common (32.9%); scores 1–2 (low quality, e.g. obstructed
+view or ambiguous shot) together account for only 9.2% of shots.
+
+**Ball area distribution (court zone of contact, N=413):**
+
+```
+mid front court    85  (20.6%)
+left front court   52  (12.6%)
+mid court          47  (11.4%)
+right front court  46  (11.1%)
+right mid court    41   (9.9%)
+right back court   38   (9.2%)
+left mid court     37   (9.0%)
+left back court    35   (8.5%)
+mid back court     32   (7.7%)
+```
+
+Front-court shots dominate (44.3% of contacts are in the front three
+zones), consistent with the high frequency of net shots, push shots,
+and blocks in elite men's singles.
+
+**Shot characteristics and player actions (multi-label):**
+
+| Characteristic | Count | Action | Count |
+|---|---|---|---|
+| cross-court | 241 | forehand | 254 |
+| straight | 169 | backhand | 158 |
+| over head | 96 | turnaround | 8 |
+| body hit | 16 | | |
+| wide placement | 11 | | |
+| passing shot | 7 | | |
+
+**Hitter balance:** top-court hitter: 206 shots (49.8%), bottom-court
+hitter: 207 shots (50.0%), 1 missing (0.2%). Near-perfect balance
+eliminates systematic hitter-position bias.
+
+---
+
+### 4.7.2 ShuttleSet Dataset
+
+**Source and acquisition.** ShuttleSet provides per-shot tracking CSV
+files and a `match.csv` of 44 elite singles matches with YouTube URLs.
+Videos must be downloaded separately; the pipeline uses a streaming
+yt-dlp approach to avoid storing full video files. Frames are extracted
+at 30fps and stored as PNGs under `datasets_preprocessing/ShuttleSet/frames/`.
+
+**Top-level structure (match.csv):**
+
+| Field | Description |
+|---|---|
+| `id` | Match integer ID |
+| `video` | Match name string (encodes players and event) |
+| `tournament` | Tournament name |
+| `round` | Match round (Finals, Semi-finals, Group-Stage, etc.) |
+| `year` / `month` / `day` | Match date |
+| `set` | Number of sets played (best of 3) |
+| `duration` | Match duration in minutes |
+| `winner` / `loser` | Player names |
+| `downcourt` | Binary flag for camera orientation |
+| `url` | YouTube URL (used for download) |
+
+**Per-shot annotation fields (from per-match JSON pipeline output):**
+
+| Field | Description |
+|---|---|
+| `match_id` | Match identifier string |
+| `rally` | Rally index within the match |
+| `ball_round` | Shot index within the rally (stroke number) |
+| `frame_num` | Absolute frame index of the hit event |
+| `type` | Shot type label (Chinese character, 19 classes) |
+| `player` | `"A"` or `"B"` |
+| `hit_area` / `hit_x` / `hit_y` | Court zone + pixel coordinates of contact |
+| `landing_area` / `landing_x` / `landing_y` | Shuttle landing position |
+| `player_location_x/y` | Hitter pixel position (used for hitter-first ordering) |
+| `opponent_location_x/y` | Opponent pixel position |
+| `backhand` | Binary (1=backhand) |
+| `hit_height` | Ordinal contact height (1=low, 2=mid, 3=high) |
+
+**Scale:**
+
+| Statistic | Value |
+|---|---|
+| Total matches in match.csv | 44 |
+| Successfully downloaded and processed | 25 (56.8%) |
+| Failed / broken YouTube links | 18 |
+| Missing URL | 1 |
+| Total stroke records | 21,191 |
+| Total rallies | 963 |
+| Unique shot types | 19 |
+| Unique players | 17 |
+| Tournaments covered | 13 |
+| Avg strokes per match | 848 (min 312 · max 1,644) |
+| Avg rally length (strokes) | 22.0 (min 1 · max 83) |
+| Class imbalance (most/least common) | 98× |
+
+**Coverage note.** 19 of 44 matches (43.2%) could not be downloaded
+because YouTube removed the content (18 broken links) or the URL was
+absent (1). All 25 processed matches are from major international
+tournaments (2018–2021). The 25 matches collectively span 13
+tournaments and 17 unique elite players including Viktor Axelsen,
+Kento Momota, Carolina Marín, and Chou Tien Chen.
+
+**Shot type distribution (N=21,191, Chinese labels with English mapping):**
+
+| Shot type (English) | Chinese | Count | % |
+|---|---|---|---|
+| Drop (Net) | 放小球 | 3,823 | 18.0% |
+| Lift | 挑球 | 3,159 | 14.9% |
+| Block | 擋小球 | 2,145 | 10.1% |
+| Push | 推球 | 1,686 | 8.0% |
+| Clear | 長球 | 1,609 | 7.6% |
+| Smash | 殺球 | 1,405 | 6.6% |
+| Short Serve | 發短球 | 1,328 | 6.3% |
+| Slice/Cut | 切球 | 1,208 | 5.7% |
+| Tap Smash | 點扣 | 1,013 | 4.8% |
+| Cross-Net | 勾球 | 842 | 4.0% |
+| (過度切球) | 過度切球 | 787 | 3.7% |
+| (Unknown) | 未知球種 | 615 | 2.9% |
+| Drive | 平球 | 423 | 2.0% |
+| (撲球) | 撲球 | 280 | 1.3% |
+| (後場抽平球) | 後場抽平球 | 253 | 1.2% |
+| (防守回抽) | 防守回抽 | 238 | 1.1% |
+| Defensive Lift | 防守回挑 | 174 | 0.8% |
+| Long Serve | 發長球 | 164 | 0.8% |
+| (小平球) | 小平球 | 39 | 0.2% |
+
+Labels in parentheses lack a standard English mapping in the literature;
+they are used as-is for the auxiliary shot-type classification head
+during SSL pre-training. The extreme class imbalance (98× between Drop
+and 小平球) is handled through weighted sampling in the auxiliary task
+but has no effect on the primary contrastive objective.
+
+**Missing annotation coverage.** The fields `hit_area`, `hit_x/y`,
+`landing_area`, `landing_x/y`, `backhand`, and `hit_height` are
+partially missing (NaN) in a subset of records — particularly for
+serves and for records where the player's exact racket position was
+unclear to annotators. Only `frame_num`, `type`, `rally`,
+`ball_round`, and `player_location_x/y` (needed for hitter-first
+ordering) are required by the skeleton extraction pipeline; all other
+fields are advisory.
+
+---
+
+### 4.7.3 Key Differences Between Datasets
+
+| Property | FineBadminton | ShuttleSet |
+|---|---|---|
+| **Primary use in pipeline** | Few-shot classification (labeled) | SSL pre-training (unlabeled shot sequences) |
+| **Strategy labels** | Yes — 5-class tactical strategy per shot | No — only shot type (19 classes, used for aux. task) |
+| **Shot type labels** | 12 hit_type classes | 19 classes (Chinese) |
+| **Frames provided?** | Yes (JPEG, ~20fps) | No — must download videos and extract frames |
+| **Annotation granularity** | Per-shot hit_frame + hitter + strategy + quality | Per-shot frame_num + type + player location |
+| **Court position data** | Ball area (9 zones) | Hit/landing pixel x,y + player pixel x,y |
+| **Scale (shots)** | 414 annotated / 296 in training | 21,191 shots across 963 rallies |
+| **Video variety** | 11 source matches (single camera angle) | 25 matches, 13 tournaments, 17 players |
+| **FPS** | ~24.6–25.0 fps | 30fps (extracted via ffmpeg) |
+| **Resolution mix** | 720p + 1080p | Varies by YouTube source |
+| **Skeleton storage** | Per-rally .npy `(2, T_full, 34)` | Per-shot .npy `(2, 16, 34)` |
+| **Hitter-first ordering** | Applied at dataset load time | Applied at skeleton extraction time |
+| **Class imbalance** | Moderate (intercept most common) | Severe (98× ratio) |
+
+The complementarity is intentional: FineBadminton provides the
+high-quality tactical labels needed for the few-shot task, while
+ShuttleSet provides the scale and diversity needed for contrastive
+pre-training without requiring manual strategy annotation.
+
+---
+
 5\. Methodology
 
 5.1 Pipeline Overview
@@ -360,7 +847,7 @@ trajectory as a bonus signal (see Section 5.6.2).
 
 | Stage | Component | Input | Output | Data Volume / Notes |
 |---|---|---|---|---|
-| A1 | Pose Estimator (YOLOv8-Pose + ViTPose) | Video frames (jpg) | 2D skeleton keypoints (17 joints × 2 players) | FB: ~12K frames @ 20fps. SS: ~200K frames @ 30fps. Kalman filtering applied for smoothing. |
+| A1 | Pose Estimator (YOLOv8-Pose) | Video frames (jpg) | 2D skeleton keypoints (17 joints × 2 players), Y-sorted: player 0 = top-court, player 1 = bottom-court | FB: ~12K frames @ 20fps → 40 per-rally .npy files. SS: frames @ 30fps → 21,191 per-shot .npy files. Exponential smoothing (α=0.7) applied for temporal stability. |
 | A2 | Graph Builder + Feature Engineering | Skeleton sequences | Spatio-temporal graph G = (V, E, X) with enriched node features (L0–L3) | 34 nodes (17 per player), intra + inter-player edges. Node features: coords + velocity + court context + joint angles (9–12 dim per node). Stored as npy. |
 | A3 | Shot Segmentation | Skeleton graphs + timestamps | Fixed-length shot windows (T=16 frames) | FB: ~500 labeled shots (timestamps provided). SS: ~5K–8K unlabeled shots (timestamps from CSV). |
 | A4 | Encoder (ST-GCN or Transformer) | Skeleton graph with enriched features | Motion embedding (d=256) | Pre-trained via contrastive learning on SS data. |
@@ -370,7 +857,7 @@ trajectory as a bonus signal (see Section 5.6.2).
 | **C1** | **Frame Extraction (ffmpeg)** | **New video file (.mp4)** | **Frames at 30fps** | **Standard ffmpeg extraction.** |
 | **C2** | **Court Detector (Hough + RANSAC)** | **Reference frame** | **Homography matrix H (pixel → court coords)** | **Automatic court line detection via Canny + Hough transform, matched against badminton court template via RANSAC. Computed once per video. No manual input.** |
 | **C3** | **TrackNetV3 (pre-trained, frozen)** | **Consecutive frames** | **Shuttle (x,y) per frame + hit event timestamps** | **Pre-trained weights, no training needed. Hit events = sharp shuttle trajectory direction changes. Also provides shuttle trajectory as bonus signal.** |
-| **C4** | **YOLOv8-Pose (pre-trained)** | **All frames** | **2D skeletons (17 joints × 2 players)** | **Same model as Phase A. Kalman filtering applied.** |
+| **C4** | **YOLOv8-Pose (pre-trained)** | **All frames** | **2D skeletons (17 joints × 2 players)** | **Same model as Phase A. Exponential smoothing (α=0.7) applied for temporal stability; Kalman filtering is a planned improvement.** |
 | **C5** | **Shot Segmentation** | **Skeletons + hit timestamps from C3** | **T=16 frame windows per shot** | **Windows centered on each hit event. Wrist velocity peaks from skeleton data used as secondary validation.** |
 | **C6** | **Feature Engineering (L0–L3)** | **Shot skeleton windows + H from C2** | **Enriched node features in court-relative coords** | **Same feature engineering as training. Homography H converts pixel coords to court coords for L0 and L2 features.** |
 | **C7** | **Encoder (Phase A weights)** | **Enriched skeleton graphs** | **256-dim embedding per shot** | **Frozen or lightly fine-tuned encoder from Phase A.** |
@@ -406,7 +893,7 @@ features in layers of increasing richness:
 | L0: Raw coordinates | [x, y] court-relative coordinates (via homography) | 2 | Position only. Model must learn everything else. |
 | L1: + Kinematics | [x, y, vx, vy, ax, ay] velocity via finite difference; acceleration via second difference | 6 | Directly encodes "lunging forward" (intercept) vs. "stationary" (passive). Free to compute. |
 | L2: + Court context | [..., dist_to_net, dist_to_center, dist_to_opponent_centroid] | 9 | Court-relative positional context. Directly encodes "forward court" (intercept) vs. "rear court" (defensive). Free to compute. |
-| L3: + Joint angles | [..., elbow_angle, shoulder_angle, ...] (angles between connected joints) | 11–12 | Body configuration. Encodes "arm extended overhead" (defensive) vs. "arm flat forward" (intercept) vs. "neutral posture" (passive). Derived from coordinates. |
+| L3: + Joint angles | [..., left_elbow_angle, right_elbow_angle, left_knee_angle] computed via arctan2 on joint triplets; broadcast to all joints of the respective player | 12 | Body configuration. Encodes "arm extended overhead" (defensive) vs. "arm flat forward" (intercept) vs. "neutral posture" (passive). Derived from coordinates. |
 | L4: + Racket (stretch) | [..., racket_x, racket_y, racket_angle] as 18th node (requires RacketVision) | 14–15 | Racket state. Partially encodes shot direction — the main signal skeletons miss. Requires external model. |
 
 Layers L0--L3 are all computable from the skeleton coordinates already
@@ -579,7 +1066,7 @@ order:
 2. Run TrackNetV3 to obtain shuttle trajectory and hit event timestamps.
 3. Run court calibration (automatic or manual) to obtain the homography.
 4. Run YOLOv8-Pose on all frames to extract dual-player skeletons.
-5. Apply Kalman filtering for skeleton smoothing.
+5. Apply exponential smoothing (α=0.7) to skeleton sequences for temporal stability. (Kalman filtering is a planned upgrade for better handling of occlusion frames.)
 6. Segment into T=16 frame windows centered on each TrackNet hit event.
 7. Compute enriched node features (L0–L3) using the court homography.
 8. Run each shot window through the trained encoder to obtain 256-dim embeddings.
@@ -896,16 +1383,26 @@ values TBD). Uses ST-GCN encoder, SSL + Aux pre-training, ProtoNet.*
 
 | File | Responsibility | Pipeline Stage |
 |---|---|---|
-| config.py | Hyperparameters, file paths, experiment settings | Global configuration |
-| pose_extractor.py | YOLOv8-Pose + ViTPose skeleton extraction with Kalman filtering | A1 / C3: Pose Extraction |
-| graph_builder.py | Dual-player spatio-temporal graph construction (34 nodes, 3 adjacency types) | A2: Graph Construction |
-| feature_eng.py | Node feature enrichment: velocity, acceleration, court-relative distances, joint angles. Configurable feature layer selection. | A2 / C5: Feature Engineering (L0–L3 layers) |
-| shot_detector.py | TrackNetV3 wrapper for shuttle tracking and hit event detection. Wrist-velocity fallback. Outputs shot timestamps. | C1: Shot Boundary Detection |
-| court_detector.py | Automatic court line detection (Canny edge detection + probabilistic Hough transform) and RANSAC-based homography estimation against badminton court template. No manual input required. | C2: Court Detection |
-| stgcn_model.py | ST-GCN backbone with configurable layers/channels and input dim | A4 / C5: Feature Encoder |
-| transformer_enc.py | Transformer-based encoder (BST-style) for architecture ablation comparison | A4: Encoder (ablation variant) |
-| simclr_loss.py | NT-Xent contrastive loss, projection head, augmentation pipeline | A5: Self-Supervised Learning |
-| dataset.py | Data loading, episode sampling, fold splitting, storage management | Data Pipeline |
+| `src/config.py` | Hyperparameters, file paths, experiment settings | Global configuration |
+| `src/data/pose_extractor.py` | YOLOv8s-Pose skeleton extraction (top-2 by keypoint confidence, Y-sorted player assignment). Temporal smoothing via exponential filter (α=0.7). Kalman filtering is a planned upgrade. | A1 / C4: Pose Extraction |
+| `src/data/graph_builder.py` | Dual-player spatio-temporal graph construction (34 nodes, 3 adjacency types) | A2: Graph Construction |
+| `src/models/stgcn_model.py` | ST-GCN backbone with configurable layers/channels and input dim | A4 / C5: Feature Encoder |
+| `src/models/transformer_encoder.py` | Transformer-based encoder (BST-style) for architecture ablation comparison | A4: Encoder (ablation variant) |
+| `src/models/simclr_loss.py` | NT-Xent contrastive loss, projection head, augmentation pipeline | A5: Self-Supervised Learning |
+| `src/data/dataset.py` | Data loading, episode sampling, fold splitting, storage management | Data Pipeline |
+| `src/models/proto_net.py` | Prototypical network, prototype computation, distance metrics, confidence. Also k-NN variant. | B1–B2 / C6: Few-Shot Classification |
+| `src/inference.py` | End-to-end Phase C prediction on new video. Orchestrates shot detection, calibration, pose extraction, encoding, and classification. | C1–C6: Deployment |
+| **Notebooks** | | |
+| `notebooks/02_skeleton_extraction_finebadminton.ipynb` | Batch YOLOv8s-Pose extraction for all 40 FineBadminton rallies → `datasets_preprocessing/finebadminton_skeletons/` (40 .npy, shape `(2, T, 34)`). Completed: all 10,620 frames extracted. | A1: Pose Extraction (FB) |
+| `notebooks/02_skeleton_extraction_shuttleset.ipynb` | Batch YOLOv8s-Pose extraction for ShuttleSet shots → `datasets_preprocessing/ShuttleSet/skeletons/`. MVP tested; full run pending. | A1: Pose Extraction (SS) |
+| `notebooks/02_shuttlecock_tracking.ipynb` | **TrackNetV4** shuttle position extraction for all 40 FB rallies. Cloned `tracknet-series-pytorch` (local, `datasets/`). Outputs `(T, 3)` [x, y, visible] arrays per rally → `datasets_preprocessing/finebadminton_shuttles/`. | Preprocessing: Shuttle Tracking |
+| `notebooks/03_ssl_pretraining.ipynb` | SimCLR pre-training on ShuttleSet skeletons → `models/ssl_pretrained.pt` | A4–A5: SSL Pre-Training |
+| `notebooks/04_fewshot_training.ipynb` | ProtoNet 5-fold CV on FineBadminton → `models/fewshot_final.pt` | B1–B2: Few-Shot Training |
+| `notebooks/05_ablations.ipynb` | All 6 ablation configurations (RQ1, RQ2, architecture, etc.) | Experiments |
+| `notebooks/06_analysis_and_plots.ipynb` | t-SNE, confusion matrix, K-shot curves, bar charts | Analysis |
+| **Demo** | | |
+| `badminton_server.py` | Python stdlib HTTP server serving real FB frames, per-rally skeleton overlays (from `datasets_preprocessing/finebadminton_skeletons/`), and shuttle trajectories (from `datasets_preprocessing/finebadminton_shuttles/`). Runs on port 7860. | Demo Backend |
+| `badminton_pipeline_demo.html` | Standalone React+Babel demo UI. Match → Rally → Shot hierarchy. Real frame canvas with skeleton overlay, shuttle dot + trail, rally scrubber across all T frames, strategy legend. 9 strategies shown (5 skeletal + 4 annotation-only with disclaimer). | Demo Frontend |
 | proto_net.py | Prototypical network, prototype computation, distance metrics, confidence. Also k-NN variant. | B1–B2 / C6: Few-Shot Classification |
 | train.py | Training loops for both SSL and few-shot stages | Training Pipeline |
 | inference.py | End-to-end Phase C prediction on new video. Orchestrates shot detection, calibration, pose extraction, encoding, and classification. | C1–C6: Deployment / Demo |
@@ -915,13 +1412,10 @@ values TBD). Uses ST-GCN encoder, SSL + Aux pre-training, ProtoNet.*
 -   **Framework:** PyTorch 2.x with PyTorch Geometric for graph
     operations.
 
--   **Pose Estimation:** YOLOv8-Pose (real-time, person detection +
-    keypoints) with ViTPose (high-accuracy 17-joint COCO format) for
-    refinement.
+-   **Pose Estimation:** YOLOv8s-Pose (real-time, combined person detection + 17-joint COCO keypoint estimation). Top-2 detections selected by mean keypoint confidence per frame. Temporal smoothing via exponential filter (α=0.7). The `s` (small) variant used for CPU-viable batch extraction; `x` (extra-large) listed in `config.py` as GPU default. ViTPose (higher-accuracy, slower) is a potential upgrade for difficult frames.
 
--   **Shuttle Tracking:** TrackNetV3 (pre-trained) for shuttle detection,
-    trajectory extraction, and hit event detection during Phase C
-    inference. Open-source with pre-trained weights for badminton.
+-   **Shuttle Tracking (Preprocessing):** **TrackNetV4** (`tracknet-series-pytorch`, cloned to `datasets/`) for per-frame shuttle position extraction on the FineBadminton dataset during data preprocessing. V4 adds a learnable `MotionPrompt` layer (inter-frame difference attention) over the V2 U-Net baseline, improving detection of fast-moving objects. Same `[B, 9, 288, 512] → [B, 3, 288, 512]` interface. Pre-trained weights (`tracknet-v4_best-model.pth`) downloaded from GitHub Releases v1.0.1. Outputs `(T, 3)` rally-level trajectory arrays.
+-   **Shuttle Tracking (Inference, Phase C):** TrackNetV3 (pre-trained, open-source) for real-time shuttle detection and hit event timestamps on unseen video during Phase C inference. Used as a frozen off-the-shelf model.
 
 -   **Court Detection:** OpenCV-based automatic court line detection
     (Canny + probabilistic Hough transform) with RANSAC homography
@@ -941,20 +1435,66 @@ values TBD). Uses ST-GCN encoder, SSL + Aux pre-training, ProtoNet.*
 
 7.3 Data Directory Structure
 
-Processed data follows a consistent directory hierarchy to ensure
-traceability from raw frames to final predictions:
+Processed data follows a consistent directory hierarchy. The actual on-disk
+structure (as implemented) is:
 
--   **FineBadminton:** data/finebadminton/rally_ID/frame_XXXX.jpg
-    (provided frames), data/finebadminton/skeletons/rally_ID.npy
-    (extracted skeletons).
+```
+Baddiev2/
+├── Datasets/                                  # Raw datasets (provided/downloaded)
+│   ├── FineBadminton-dataset/dataset/
+│   │   ├── image/                             # 10,620 .jpg frames (all 40 rallies)
+│   │   └── transformed_combined_rounds_output_en_evals_translated.json
+│   └── finebadminton_skeletons/               # (legacy path — not used)
+│
+├── datasets/                                  # Cloned repos and tools
+│   ├── ShuttleSet/set/match.csv               # ShuttleSet CSV annotations
+│   ├── ShuttleSet22/                          # ShuttleSet22 variant
+│   └── tracknet-series-pytorch/               # TrackNetV4 implementation (cloned)
+│       ├── model/tracknet_v4.py
+│       ├── model/tracknet_v2.py
+│       └── checkpoints/                       # Downloaded pre-trained weights
+│           ├── tracknet-v4_best-model.pth
+│           └── tracknet-v2_best-model.pth
+│
+├── datasets_preprocessing/                    # All extracted/processed data
+│   ├── finebadminton_skeletons/               # 40 per-rally .npy files (2, T, 34)
+│   │   ├── 0011_001.npy  … 0030_004.npy      # T range: 74–652 frames, avg 265
+│   ├── finebadminton_shuttles/                # 40 per-rally .npy files (T, 3)
+│   │   └── [populated by notebooks/02_shuttlecock_tracking.ipynb]
+│   └── ShuttleSet/
+│       ├── frames/                            # Extracted video frames (deletable)
+│       └── skeletons/                         # Per-shot .npy files (2, 16, 34)
+│
+├── models/                                    # Saved model checkpoints
+│   ├── ssl_pretrained.pt                      # Phase A output
+│   └── fewshot_final.pt                       # Phase B output
+│
+├── results/                                   # Metrics and plots per fold
+│
+├── src/                                       # All reusable Python source code
+│   ├── config.py
+│   ├── inference.py
+│   └── data/, models/
+│
+├── notebooks/                                 # All Jupyter notebooks
+│   ├── 02_skeleton_extraction_finebadminton.ipynb   ✅ complete (40 rallies)
+│   ├── 02_skeleton_extraction_shuttleset.ipynb      🔄 MVP tested
+│   ├── 02_shuttlecock_tracking.ipynb                🔄 ready to run (TrackNetV4)
+│   ├── 03_ssl_pretraining.ipynb
+│   ├── 04_fewshot_training.ipynb
+│   ├── 05_ablations.ipynb
+│   └── 06_analysis_and_plots.ipynb
+│
+├── badminton_server.py                        # Demo HTTP server (port 7860)
+└── badminton_pipeline_demo.html               # Standalone React+Babel demo UI
+```
 
--   **ShuttleSet:** data/shuttleset/videos/match_ID.mp4 (downloaded,
-    deletable), data/shuttleset/frames/match_ID/rally_ID/frame_XXXX.jpg
-    (extracted, deletable),
-    data/shuttleset/skeletons/match_ID/rally_ID.npy (persistent).
-
--   **Outputs:** models/ (checkpoints), results/ (metrics, plots,
-    confusion matrices per fold).
+**Key conventions:**
+- `Datasets/` (capital D): raw provided data, never modified
+- `datasets/` (lowercase): cloned third-party repos and tools
+- `datasets_preprocessing/`: all outputs of extraction notebooks (skeletons, shuttle trajectories)
+- Per-rally skeleton `.npy` shape: `(2, T, 34)` — axis 0 = coordinate channel (X/Y), axis 1 = frame, axis 2 = joint (0–16 = player 0, 17–33 = player 1)
+- Per-rally shuttle `.npy` shape: `(T, 3)` — columns = [x, y, visible]; frame-aligned with skeleton array
 
 8\. Project Timeline
 
@@ -966,8 +1506,8 @@ pre-provided (eliminating \~1 week of video extraction work).
 
 | Week | Phase | Tasks | Deliverables |
 |---|---|---|---|
-| 1–2 | **Data Acquisition** | Request FineBadminton frames from authors. Parse ShuttleSet CSV, select 50 matches, download via yt-dlp, extract frames at 30fps. Test YOLOv8-Pose on sample frames from both datasets. | FineBadminton frames verified. ShuttleSet 50-match subset downloaded and extracted. Pose estimation quality validated. |
-| 3–4 | **Skeleton Extraction** | Batch-process all frames through YOLOv8-Pose. Apply Kalman filtering for temporal smoothing. Build dual-player spatio-temporal graphs. Segment shots (T=16 frames per shot). | ~12K FB skeleton frames + ~200K SS skeleton frames processed. Shot-level segments created. Storage optimized (delete raw frames). |
+| 1–2 | **Data Acquisition** | Request FineBadminton frames from authors. Parse ShuttleSet `match.csv` (44 matches), download available videos via yt-dlp, extract frames at 30fps. Test YOLOv8-Pose on sample frames from both datasets. | FineBadminton frames verified. ShuttleSet matches downloaded (target: all available; actual: 25/44 due to broken links). Pose estimation quality validated. |
+| 3–4 | **Skeleton Extraction** | Batch-process all frames through YOLOv8-Pose. Apply exponential smoothing (α=0.7) for temporal stability. Build dual-player spatio-temporal graphs. Segment shots (T=16 frames per shot). Experiment with Kalman filtering as an alternative smoother. | 40 per-rally FB skeleton .npy files + 21,191 per-shot SS skeleton .npy files. Shot-level segments created. Storage optimized (delete raw frames). |
 | 5–6 | **SSL Pre-Training** | Implement SimCLR contrastive learning on ShuttleSet skeletons. Train ST-GCN encoder. Add auxiliary shot-type prediction task. Run linear probe evaluation. | Pre-trained ST-GCN encoder. Linear probe accuracy reported. Embedding visualizations (t-SNE). |
 | 7–8 | **Few-Shot Training** | Implement Prototypical Networks. Run 5-fold CV on FineBadminton. Execute all ablation studies (input representation, encoder architecture, pre-training, few-shot method, K-shot sensitivity). | Main results table populated. Ablation tables complete. Confusion matrices generated. |
 | 9–10 | **Analysis & Visualization** | Generate all planned visualizations. Analyze per-strategy feature importance (RQ1). Quantify SSL benefit (RQ2). Compute confidence calibration. | All figures and tables finalized. RQ1 and RQ2 answered with quantitative evidence. |
@@ -1028,15 +1568,7 @@ and pipeline feasibility:
     recordings. We acknowledge this as an unvalidated claim pending
     future data collection.
 
--   **Shuttle trajectory (partially addressed):** Several strategies
-    (create depth, intercept) are partially defined by shuttle placement.
-    TrackNetV3 is integrated in Phase C for shot boundary detection and
-    also produces shuttle (x, y) trajectory per frame as a byproduct.
-    However, this trajectory is not yet incorporated as an input feature
-    to the encoder during Phases A–B (the encoder is trained on
-    skeleton-only data). Integrating shuttle trajectory as a graph-level
-    feature or 35th node during training is future work that would
-    require re-running Phase A pre-training on skeleton + shuttle data.
+-   **Shuttle trajectory (preprocessing complete; encoder integration pending):** Several strategies (create depth, intercept) are partially defined by shuttle placement. **TrackNetV4** has been used to extract per-frame shuttle `(x, y, visible)` trajectories for all 40 FineBadminton rallies, stored as rally-level `.npy` files frame-aligned with the skeleton arrays (`datasets_preprocessing/finebadminton_shuttles/`). These trajectories are visualized in the demo UI (yellow dot + trail overlay). However, shuttle trajectory is not yet incorporated as an encoder input during Phases A–B — the encoder is still trained on skeleton-only data. Integrating the shuttle position as a 35th graph node or global graph-level feature during Phase A pre-training is the highest-priority near-term extension (see Section 11, Future Work).
 
 -   **Court detection robustness:** Automatic court line detection
     (Canny + Hough transform + RANSAC) works reliably on broadcast
@@ -1086,15 +1618,7 @@ in a novel task with limited data:
 
 11\. Future Work
 
--   **Multi-modal fusion:** TrackNetV3 is already integrated for Phase C
-    inference (shot detection), producing shuttle trajectory as a
-    byproduct. The next step is incorporating this trajectory as an
-    encoder input feature during Phases A–B training — either as a 35th
-    graph node (shuttle position per frame) or as a global graph-level
-    feature. This would give the encoder access to shot direction and
-    landing position, directly addressing the main signal gap for
-    strategies like create depth and intercept. Court occupancy heatmaps
-    are a further extension.
+-   **Multi-modal fusion (high priority):** TrackNetV4 has been used to extract per-frame shuttle trajectories for all 40 FineBadminton rallies (preprocessing complete). The immediate next step is incorporating these trajectories as an encoder input during Phases A–B training — either as a 35th graph node (shuttle position per frame) or as a global graph-level feature. This directly addresses the main signal gap for create depth and intercept strategies. ShuttleSet shuttle extraction is also pending. Court occupancy heatmaps are a further extension.
 
 -   **3D pose lifting:** Replace 2D pose estimation with monocular 3D
     lifting (MotionBERT, MotionAGFormer) to recover depth information
@@ -1700,3 +2224,99 @@ enables hitter-first reordering to be applied at extraction time using
 nodes 0–16, opponent at nodes 17–33. The granularity difference is an
 implementation detail driven by how each dataset physically organises its
 frames. The downstream model and training code are identical for both.
+
+A.13 Shot Segmentation Design — Why a Window Around the Hit, Not Just the Hit Frame
+------------------------------------------------------------------------------------
+
+**The question:** Should the input be (a) only the hit frame, (b) only
+frames after the hit, or (c) frames before and after the hit?
+
+**Answer: a temporal window centred on the hit frame is strongly
+preferred, and the implementation uses T=16 frames (±8 at 20 fps ≈ 0.8 s).**
+
+**Why frames BEFORE the hit are critical:**
+
+Tactical strategy is not formed at the moment of contact — it is
+committed to during the preparation phase:
+
+- **Footwork direction:** A player moving to the net before striking
+  reveals "move to net" strategy in their approach, not in the swing.
+- **Preparation pose:** Shoulder/racket windup angle signals whether a
+  smash or drop is coming, and whether the decision was deliberate.
+- **Opponent positioning:** Where the opponent is *before* the hitter
+  contacts the shuttle determines which strategy is rational. A baseline
+  gap invites intercept; an opponent at the net invites create_depth.
+- **Deception and hesitation** (excluded from our label set, see §4.1)
+  are almost exclusively readable from the preparation window, not from
+  contact.
+
+If we used only the contact frame, the model would see a static pose
+without any motion context and could not learn intent-based strategy.
+
+**Why frames AFTER the hit are also included:**
+
+Post-contact frames show whether the executed shot matches the strategy
+(e.g., a "move to net" stroke should result in the hitter approaching
+the net). Including post-contact context reduces ambiguity in borderline
+cases and aligns with standard practice in action recognition (the full
+action spans preparation → execution → follow-through).
+
+**Stroke-level samples, not frame-level samples:**
+
+The dataset is structured at the stroke level, not the frame level:
+
+```
+# WRONG — frame-level (ambiguous labels):
+frame_001 → label?
+frame_002 → label?
+frame_003 → label?   ← which player? which strategy?
+
+# CORRECT — stroke-level (clear semantics):
+stroke_1: frames [f-8 … f+8] around hit at frame 10, hitter=A, label=intercept
+stroke_2: frames [f-8 … f+8] around hit at frame 24, hitter=B, label=defensive
+```
+
+Each sample in `FineBadmintonDataset.samples` and `ShuttleSetDataset.samples`
+is one stroke (one hit event), not one frame.
+
+**Dynamic role assignment per stroke:**
+
+Hitter and opponent roles are *not* fixed to a player for the whole
+rally. They flip with each stroke event. The table below illustrates:
+
+| Stroke event | Hit frame | Hitter | Opponent | Nodes 0–16 | Nodes 17–33 |
+|---|---|---|---|---|---|
+| Stroke 1 | Frame 10 | Player A | Player B | Player A skeleton | Player B skeleton |
+| Stroke 2 | Frame 24 | Player B | Player A | Player B skeleton | Player A skeleton |
+| Stroke 3 | Frame 38 | Player A | Player B | Player A skeleton | Player B skeleton |
+
+This is implemented via `_reorder_hitter_first()` (FineBadminton) and
+`_reorder_hitter_first_by_location()` (ShuttleSet), applied per stroke.
+
+**Frame overlap between samples is intentional and correct:**
+
+Because consecutive strokes produce overlapping windows (e.g., stroke 1
+covers frames 2–18, stroke 2 covers frames 16–32), the same frame may
+appear in two samples. This is:
+
+- **Standard practice** in temporal action segmentation.
+- **Correct** because the same frame has different semantics in each
+  window: in stroke 1's window it is a post-contact frame (B recovering);
+  in stroke 2's window it is a pre-contact frame (B preparing). The
+  classifier correctly learns both contexts.
+- **Not a data leak:** The two samples have *different labels* and
+  *different hitter assignments*, so the overlap does not inflate metrics.
+
+**Implementation in code:**
+
+```python
+# dataset.py — _extract_shot_window()
+half = self.shot_window // 2          # 8 frames
+start = max(0, rel_hit - half)        # 8 frames before hit
+end   = start + self.shot_window      # 8 frames after hit (T=16 total)
+segment = full_skeleton[:, start:end, :]
+segment = _reorder_hitter_first(segment, hitter)
+```
+
+The `shot_window` parameter (default 16) is set in `DataConfig` and
+controls the tradeoff between context richness and model input size.

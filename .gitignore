@@ -8,4 +8,5 @@ checkpoints/
 *.avi
 __pycache__/
 .ipynb_checkpoints/
-.venv/
+.venv/datasets_preprocessing/ShuttleSet/skeletons/
+.DS_Store

@@ -1,0 +1,2792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Badminton Pipeline Demo</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a0f1a;color:#e2e8f0;font-family:'DM Sans',sans-serif;overflow-x:hidden}
+    ::-webkit-scrollbar{width:6px;background:#1e293b}
+    ::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+    canvas{display:block}
+    input[type=range]{accent-color:#FF6B35;cursor:pointer}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+    .spin{animation:spin 1s linear infinite}
+    .pulse{animation:pulse 2s ease-in-out infinite}
+    button:hover{filter:brightness(1.15)}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const M = "'JetBrains Mono',monospace";
+const F = "'DM Sans',sans-serif";
+const IS = "'Instrument Serif',serif";
+
+const STRAT = {
+  // ── Skeleton-classifiable (used in ProtoNet) ──────────────────────────────
+  intercept:      { color:'#FF6B35', label:'Intercept',        icon:'⚡', idx:0, excluded:false },
+  defensive:      { color:'#4ECDC4', label:'Defensive',        icon:'🛡', idx:1, excluded:false },
+  move_to_net:    { color:'#FFE66D', label:'Move to Net',      icon:'↗', idx:2, excluded:false },
+  create_depth:   { color:'#A855F7', label:'Create Depth',     icon:'↕', idx:3, excluded:false },
+  passive:        { color:'#94A3B8', label:'Passive',          icon:'○', idx:4, excluded:false },
+  // ── Non-skeletal (annotation-only; excluded from model) ──────────────────
+  deception:      { color:'#64748b', label:'Deception',        icon:'🎭', idx:5, excluded:true },
+  hesitation:     { color:'#64748b', label:'Hesitation',       icon:'⏸', idx:6, excluded:true },
+  seamlessly:     { color:'#64748b', label:'Seamlessly',       icon:'🔄', idx:7, excluded:true },
+  high_net_early: { color:'#64748b', label:'High Net Early',   icon:'🏸', idx:8, excluded:true },
+};
+
+// COCO 17 joints (from config.py)
+const JOINT_NAMES = ['Nose','L Eye','R Eye','L Ear','R Ear','L Shoulder','R Shoulder',
+  'L Elbow','R Elbow','L Wrist','R Wrist','L Hip','R Hip','L Knee','R Knee','L Ankle','R Ankle'];
+
+// COCO skeleton edges (from config.py COCO_SKELETON)
+const COCO_EDGES = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
+  [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+
+// Edge group for coloring: 0=head, 1=left-arm, 2=right-arm, 3=torso, 4=left-leg, 5=right-leg
+const EDGE_GROUP = [0,0,0,0,3,1,1,2,2,3,3,3,4,4,5,5];
+const GROUP_COLOR = ['#f59e0b','#3b82f6','#ef4444','#94a3b8','#3b82f6','#ef4444'];
+
+// Mock rally (8 shots, court coords in meters: x∈[0,6.1], y∈[0,13.4])
+// p1=player1 pos, p2=player2 pos, shuttle={from,to} in court coords
+const RALLY = [
+  { strategy:'create_depth', shot:'Clear',    conf:0.85, margin:0.31, hitter:2,
+    p1:[3.0,2.2], p2:[2.8,11.5], shuttle:{ from:[2.8,11.5], to:[3.0,0.9] } },
+  { strategy:'intercept',    shot:'Smash',    conf:0.91, margin:0.44, hitter:1,
+    p1:[3.0,1.6], p2:[3.1,12.0], shuttle:{ from:[3.0,1.6], to:[3.2,10.8] } },
+  { strategy:'defensive',    shot:'Block',    conf:0.78, margin:0.22, hitter:2,
+    p1:[2.6,2.8], p2:[3.2,10.8], shuttle:{ from:[3.2,10.8], to:[2.6,2.2] } },
+  { strategy:'move_to_net',  shot:'Net shot', conf:0.83, margin:0.28, hitter:1,
+    p1:[2.6,4.8], p2:[3.0,11.5], shuttle:{ from:[2.6,4.8], to:[2.9,7.6] } },
+  { strategy:'create_depth', shot:'Lift',     conf:0.76, margin:0.19, hitter:2,
+    p1:[3.0,3.6], p2:[2.9,8.0],  shuttle:{ from:[2.9,8.0], to:[3.1,1.1] } },
+  { strategy:'intercept',    shot:'Drive',    conf:0.88, margin:0.38, hitter:1,
+    p1:[3.0,2.1], p2:[3.0,11.8], shuttle:{ from:[3.0,2.1], to:[3.0,10.5] } },
+  { strategy:'passive',      shot:'Clear',    conf:0.62, margin:0.10, hitter:2,
+    p1:[3.1,2.5], p2:[3.0,10.5], shuttle:{ from:[3.0,10.5], to:[3.1,0.8] } },
+  { strategy:'create_depth', shot:'Drop',     conf:0.79, margin:0.23, hitter:1,
+    p1:[3.1,1.6], p2:[3.0,11.6], shuttle:{ from:[3.1,1.6], to:[2.6,7.4] } },
+];
+
+// Pose definitions: [x,y] normalized to player height, origin at hip center, y↑
+// These represent the poses as seen from a side/front view
+const POSES = {
+  neutral: [
+    [0,-0.85],[-.04,-.90],[.04,-.90],[-.08,-.88],[.08,-.88],
+    [-.20,-.58],[.20,-.58],[-.26,-.30],[.30,-.30],[-.26,-.05],[.38,-.10],
+    [-.10,.0],[.10,.0],[-.12,.42],[.12,.42],[-.12,.82],[.12,.82]
+  ],
+  smash: [
+    [.06,-.88],[.02,-.93],[.12,-.93],[.00,-.91],[.14,-.91],
+    [-.15,-.60],[.25,-.65],[-.22,-.36],[.44,-.78],[-.22,-.08],[.48,-1.12],
+    [-.12,.0],[.12,.0],[-.15,.40],[.10,.38],[-.14,.80],[.08,.76]
+  ],
+  defensive: [
+    [0,-.70],[-.04,-.75],[.04,-.75],[-.08,-.73],[.08,-.73],
+    [-.22,-.46],[.22,-.46],[-.30,-.16],[.30,-.16],[-.32,.06],[.32,.06],
+    [-.14,.06],[.14,.06],[-.20,.40],[.20,.40],[-.22,.72],[.22,.72]
+  ],
+  net_shot: [
+    [-.10,-.82],[-.14,-.87],[-.06,-.87],[-.17,-.85],[-.04,-.85],
+    [-.26,-.58],[.17,-.58],[-.34,-.28],[.36,-.36],[-.32,-.02],[.58,-.54],
+    [-.14,.02],[.10,.02],[-.20,.40],[.08,.38],[-.22,.80],[.07,.76]
+  ],
+};
+function getPose(s) {
+  if (s==='intercept') return POSES.smash;
+  if (s==='defensive') return POSES.defensive;
+  if (s==='move_to_net') return POSES.net_shot;
+  return POSES.neutral;
+}
+
+// Ablation results (mock, matching expected 65-75% target range from Report.md)
+const ABLATIONS = [
+  { name:'Full model (ST-GCN + SSL + L2)', f1:68.2, prec:69.1, rec:67.8, color:'#FF6B35' },
+  { name:'+ L3 features',                  f1:69.4, prec:70.2, rec:68.9, color:'#FF6B3599' },
+  { name:'No SSL pre-training',            f1:61.5, prec:62.4, rec:60.9, color:'#4ECDC4' },
+  { name:'No inter-player edges',          f1:64.1, prec:65.0, rec:63.5, color:'#FFE66D' },
+  { name:'Transformer encoder',            f1:65.3, prec:66.1, rec:64.8, color:'#A855F7' },
+  { name:'L1 features only',              f1:60.8, prec:61.7, rec:60.2, color:'#64748b' },
+  { name:'L0 features only (raw xy)',     f1:55.2, prec:56.0, rec:54.7, color:'#334155' },
+];
+
+
+const SKEL_DIR = 'datasets/finebadminton_skeletons';
+
+// Pre-generated stable t-SNE 2-D embeddings (seeded LCG, no Math.random at render)
+const TSNE_CLUSTERS = {
+  intercept:    { cx:0.72, cy:0.25, color:'#FF6B35' },
+  defensive:    { cx:0.22, cy:0.70, color:'#4ECDC4' },
+  move_to_net:  { cx:0.65, cy:0.72, color:'#FFE66D' },
+  create_depth: { cx:0.20, cy:0.25, color:'#A855F7' },
+  passive:      { cx:0.48, cy:0.48, color:'#94A3B8' },
+};
+const TSNE_PTS = (()=>{
+  let s=54321;
+  const rng=()=>{ s=(s*1664525+1013904223)&0xffffffff; return (s>>>0)/4294967295; };
+  const pts=[];
+  Object.entries(TSNE_CLUSTERS).forEach(([strat,{cx,cy,color}])=>{
+    for(let i=0;i<22;i++){
+      const a=rng()*Math.PI*2, r=rng()*0.10+0.015;
+      pts.push({ x:cx+Math.cos(a)*r, y:cy+Math.sin(a)*r, color, strat });
+    }
+  });
+  return pts;
+})();
+
+// Confusion matrix rows = actual, cols = predicted (5-fold avg, K=10, ~20 shots/strategy)
+const CM_CLASSES = ['intercept','defensive','move_to_net','create_depth','passive'];
+const CM_DATA = [
+  [18, 1, 0, 1, 0],   // intercept (actual)
+  [ 1,16, 1, 1, 1],   // defensive
+  [ 0, 2,17, 0, 1],   // move_to_net
+  [ 1, 1, 0,16, 2],   // create_depth
+  [ 0, 2, 1, 2,15],   // passive
+];
+
+// Simulated SSL loss curve (100 epochs, SimCLR NT-Xent, temp=0.07)
+const SSL_LOSS = Array.from({length:100}, (_,i) => {
+  const t = i/99;
+  return 2.8 * Math.exp(-3.5*t) + 0.65 + Math.sin(i*0.4)*0.04*(1-t);
+});
+
+// Few-shot accuracy per K-shot (5-way, 5-fold CV)
+const KSHOT_ACC = [
+  {k:1,  acc:48.2, std:4.1},
+  {k:3,  acc:57.6, std:3.2},
+  {k:5,  acc:63.1, std:2.8},
+  {k:8,  acc:67.4, std:2.3},
+  {k:10, acc:68.2, std:2.1},
+  {k:15, acc:70.5, std:1.9},
+  {k:20, acc:71.8, std:1.8},
+];
+
+// Per-strategy per-fold accuracy (5-fold CV, K=10)
+const FOLD_ACC = [
+  { fold:1, intercept:72, defensive:65, move_to_net:70, create_depth:66, passive:58 },
+  { fold:2, intercept:74, defensive:68, move_to_net:68, create_depth:69, passive:60 },
+  { fold:3, intercept:70, defensive:71, move_to_net:65, create_depth:64, passive:62 },
+  { fold:4, intercept:76, defensive:67, move_to_net:72, create_depth:67, passive:55 },
+  { fold:5, intercept:73, defensive:69, move_to_net:69, create_depth:65, passive:59 },
+];
+
+// ─── UTILITIES ────────────────────────────────────────────────────────────────
+const lerp = (a,b,t) => a+(b-a)*t;
+const lerpPt = (a,b,t) => [lerp(a[0],b[0],t), lerp(a[1],b[1],t)];
+const smoothstep = t => t*t*(3-2*t);
+const clamp = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+function roundRect(ctx,x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── SVG SKELETON COMPONENT ───────────────────────────────────────────────────
+function SkelSVG({ pose, color, w=120, h=140, flip=false, showLabels=false }) {
+  const scale = h * 0.55;
+  const cx = w/2, cy = h*0.58;
+  const pts = pose.map(([x,y]) => [cx+(flip?-x:x)*scale, cy-y*scale]);
+  return (
+    <svg width={w} height={h}>
+      {COCO_EDGES.map(([a,b],i) => (
+        <line key={i} x1={pts[a][0]} y1={pts[a][1]} x2={pts[b][0]} y2={pts[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.8} strokeLinecap="round" opacity={0.85}/>
+      ))}
+      {pts.map(([x,y],i) => (
+        <circle key={i} cx={x} cy={y} r={i===0?4:2.5}
+          fill={i===0?'#f1f5f9':color} opacity={0.9}/>
+      ))}
+      {showLabels && pts.map(([x,y],i) => i%3===0 && (
+        <text key={i} x={x+5} y={y+3} fontSize={7} fill="#475569" fontFamily={M}>{JOINT_NAMES[i]}</text>
+      ))}
+    </svg>
+  );
+}
+
+// ─── DUAL PLAYER GRAPH VIZ (34 nodes) ────────────────────────────────────────
+function GraphViz({ showInterPlayer=true, size=320 }) {
+  const sw = size, sh = size*0.7;
+  const spacing = sw*0.18;
+  // Layout 17 joints per player horizontally
+  function jointPos(j, player) {
+    // 3-column layout: head(0-4), arms(5-10), legs(11-16)
+    const cols = [[0,1,2,3,4],[5,6,7,8,9,10],[11,12,13,14,15,16]];
+    let col=-1, row=-1;
+    cols.forEach((c,ci)=>{ const ri=c.indexOf(j); if(ri>=0){col=ci;row=ri;}});
+    const yBase = player===0 ? sh*0.18 : sh*0.62;
+    const xOff = (col-1)*(sw*0.28);
+    const yOff = (row-2)*spacing*0.5;
+    return [sw/2+xOff, yBase+yOff];
+  }
+  const p1 = Array.from({length:17},(_,i)=>jointPos(i,0));
+  const p2 = Array.from({length:17},(_,i)=>jointPos(i,1));
+  const allPts = [...p1, ...p2];
+
+  return (
+    <svg width={sw} height={sh} style={{background:'#0c1222',borderRadius:8,border:'1px solid #1e293b'}}>
+      {/* Player labels */}
+      <text x={sw/2} y={sh*0.07} textAnchor="middle" fill="#60a5fa" fontSize={10} fontFamily={M}>PLAYER 1 (hitter)</text>
+      <text x={sw/2} y={sh*0.55} textAnchor="middle" fill="#f472b6" fontSize={10} fontFamily={M}>PLAYER 2</text>
+      {/* Intra-player edges P1 */}
+      {COCO_EDGES.map(([a,b],i)=>(
+        <line key={`p1-${i}`} x1={p1[a][0]} y1={p1[a][1]} x2={p1[b][0]} y2={p1[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.5} opacity={0.7}/>
+      ))}
+      {/* Intra-player edges P2 */}
+      {COCO_EDGES.map(([a,b],i)=>(
+        <line key={`p2-${i}`} x1={p2[a][0]} y1={p2[a][1]} x2={p2[b][0]} y2={p2[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.5} opacity={0.7}/>
+      ))}
+      {/* Inter-player edges (every 3rd for clarity) */}
+      {showInterPlayer && Array.from({length:17},(_,j)=>j%3===0 && (
+        <line key={`ip-${j}`} x1={p1[j][0]} y1={p1[j][1]} x2={p2[j][0]} y2={p2[j][1]}
+          stroke="#a78bfa" strokeWidth={1} strokeDasharray="3,2" opacity={0.5}/>
+      ))}
+      {/* Nodes P1 */}
+      {p1.map(([x,y],i)=>(
+        <circle key={`pn1-${i}`} cx={x} cy={y} r={i===0?5:3.5} fill="#60a5fa" opacity={0.85}/>
+      ))}
+      {/* Nodes P2 */}
+      {p2.map(([x,y],i)=>(
+        <circle key={`pn2-${i}`} cx={x} cy={y} r={i===0?5:3.5} fill="#f472b6" opacity={0.85}/>
+      ))}
+      {/* Legend */}
+      {[['Intra (skeleton)',GROUP_COLOR[1],'─'],['Intra (torso)',GROUP_COLOR[3],'─'],['Inter-player','#a78bfa','···']].map(([l,c,d],i)=>(
+        <g key={i} transform={`translate(${sw*0.05+i*(sw*0.31)},${sh*0.95})`}>
+          <text fontSize={7} fill={c} fontFamily={M}>{d} {l}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// ─── SVG LINE CHART ───────────────────────────────────────────────────────────
+function LineChart({ data, color='#FF6B35', label='', w=400, h=160, yLabel='', xLabel='', yMin, yMax }) {
+  const pad = {t:16,r:12,b:32,l:42};
+  const iw = w-pad.l-pad.r, ih = h-pad.t-pad.b;
+  const ys = yMin!==undefined?yMin:Math.min(...data)*0.97;
+  const ye = yMax!==undefined?yMax:Math.max(...data)*1.02;
+  const sx = (i) => pad.l + (i/(data.length-1))*iw;
+  const sy = (v) => pad.t+ih - ((v-ys)/(ye-ys))*ih;
+  const d = data.map((v,i)=>`${i===0?'M':'L'}${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+  const ticks = 5;
+  return (
+    <svg width={w} height={h}>
+      {/* Grid */}
+      {Array.from({length:ticks},(_,i)=>{
+        const v = ys+(ye-ys)*i/(ticks-1);
+        const y = sy(v);
+        return <g key={i}>
+          <line x1={pad.l} y1={y} x2={pad.l+iw} y2={y} stroke="#1e293b" strokeWidth={1}/>
+          <text x={pad.l-4} y={y+4} fontSize={8} fill="#475569" fontFamily={M} textAnchor="end">{v.toFixed(1)}</text>
+        </g>;
+      })}
+      {/* Axes */}
+      <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t+ih} stroke="#334155" strokeWidth={1}/>
+      <line x1={pad.l} y1={pad.t+ih} x2={pad.l+iw} y2={pad.t+ih} stroke="#334155" strokeWidth={1}/>
+      {/* X ticks */}
+      {[0,.25,.5,.75,1].map((t,i)=>{
+        const xi = Math.floor(t*(data.length-1));
+        return <text key={i} x={sx(xi)} y={pad.t+ih+12} fontSize={8} fill="#475569" fontFamily={M} textAnchor="middle">{xi}</text>;
+      })}
+      {/* Y label */}
+      <text x={10} y={pad.t+ih/2} fontSize={8} fill="#64748b" fontFamily={M} textAnchor="middle"
+        transform={`rotate(-90,10,${pad.t+ih/2})`}>{yLabel}</text>
+      {/* X label */}
+      <text x={pad.l+iw/2} y={h-4} fontSize={8} fill="#64748b" fontFamily={M} textAnchor="middle">{xLabel}</text>
+      {/* Area fill */}
+      <path d={`${d} L${sx(data.length-1)},${pad.t+ih} L${sx(0)},${pad.t+ih} Z`}
+        fill={color} opacity={0.08}/>
+      {/* Line */}
+      <path d={d} fill="none" stroke={color} strokeWidth={2} opacity={0.9}/>
+      {/* Label */}
+      <text x={pad.l+8} y={pad.t+10} fontSize={9} fill={color} fontFamily={M}>{label}</text>
+    </svg>
+  );
+}
+
+// ─── COURT ANIMATION CANVAS ───────────────────────────────────────────────────
+function CourtCanvas({ width=560, height=480 }) {
+  const canvasRef = useRef(null);
+  const stateRef  = useRef({ shot:0, prog:0, trail:[], prev:null, video:null, playing:false });
+  const rafRef    = useRef(null);
+  const [playing, setPlaying]   = useState(false);
+  const [shotIdx,  setShotIdx]  = useState(0);
+  const [speed,    setSpeed]    = useState(1);
+  const [videoSrc, setVideoSrc] = useState(null);
+  const videoElemRef = useRef(null);
+
+  // Court layout constants (meters)
+  const CW = 6.1, CH = 13.4, NET = 6.7;
+  // Canvas layout: court on left, info panel on right
+  const COURT_PX_W = Math.min(width*0.50, 260);
+  const COURT_PX_H = COURT_PX_W*(CH/CW);
+  const COURT_X = 12;
+  const COURT_Y = (height - COURT_PX_H)/2;
+  const SC = COURT_PX_W/CW;
+  const tx = mx => COURT_X + mx*SC;
+  const ty = my => COURT_Y + my*SC;
+
+  const drawCourt = useCallback((ctx) => {
+    // Surface
+    ctx.fillStyle='#0f3d1a';
+    ctx.fillRect(tx(0),ty(0),COURT_PX_W,COURT_PX_H);
+    // Boundary
+    ctx.strokeStyle='#86efac'; ctx.lineWidth=2;
+    ctx.strokeRect(tx(0),ty(0),COURT_PX_W,COURT_PX_H);
+    // Net
+    ctx.strokeStyle='#f1f5f9'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(tx(0),ty(NET)); ctx.lineTo(tx(CW),ty(NET)); ctx.stroke();
+    // Service lines
+    ctx.strokeStyle='#4ade8066'; ctx.lineWidth=1;
+    ctx.beginPath();
+    [[ty(NET-1.98),'h'],[ty(NET+1.98),'h'],[ty(0.76),'h'],[ty(CH-0.76),'h']].forEach(([y])=>{
+      ctx.moveTo(tx(0),y); ctx.lineTo(tx(CW),y);
+    });
+    ctx.moveTo(tx(CW/2),ty(NET-1.98)); ctx.lineTo(tx(CW/2),ty(NET+1.98));
+    ctx.stroke();
+    // Singles sidelines
+    ctx.setLineDash([3,3]); ctx.strokeStyle='#4ade8044';
+    const sl=0.46;
+    ctx.beginPath();
+    ctx.moveTo(tx(sl),ty(0)); ctx.lineTo(tx(sl),ty(CH));
+    ctx.moveTo(tx(CW-sl),ty(0)); ctx.lineTo(tx(CW-sl),ty(CH));
+    ctx.stroke(); ctx.setLineDash([]);
+    // Court label
+    ctx.fillStyle='#f1f5f930'; ctx.font=`7px ${M}`; ctx.textAlign='center';
+    ctx.fillText('P1',tx(CW/2),ty(2.5));
+    ctx.fillText('P2',tx(CW/2),ty(10.5));
+    ctx.fillStyle='#f1f5f944'; ctx.fillText('NET',tx(CW/2),ty(NET)-5);
+  }, [COURT_PX_W, COURT_PX_H, SC]);
+
+  const drawTopDownPlayer = useCallback((ctx, mx, my, color, isHitter, facingDown) => {
+    const px=tx(mx), py=ty(my);
+    const ps = SC*0.22; // player radius in px
+    const dir = facingDown?1:-1;
+    // Shadow
+    ctx.globalAlpha=0.18; ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.ellipse(px,py+3,ps*1.2,ps*0.5,0,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+    // Feet
+    ctx.fillStyle=color+'88';
+    [-0.55,0.55].forEach(side=>{
+      ctx.beginPath(); ctx.arc(px+side*ps,py+dir*0.65*ps,ps*0.32,0,Math.PI*2); ctx.fill();
+    });
+    // Body circle
+    ctx.beginPath(); ctx.arc(px,py,ps*0.62,0,Math.PI*2);
+    ctx.fillStyle=color+'cc'; ctx.fill();
+    ctx.strokeStyle=isHitter?'#f59e0b':color; ctx.lineWidth=isHitter?2:1.5; ctx.stroke();
+    // Racket arm
+    const rx = px+(isHitter?0.9:-0.6)*ps*Math.sin(0.4)*dir;
+    const ry = py - dir*0.7*ps;
+    ctx.strokeStyle=color; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(rx,ry); ctx.stroke();
+    if(isHitter){ // racket head
+      ctx.beginPath(); ctx.arc(rx,ry,ps*0.28,0,Math.PI*2);
+      ctx.strokeStyle='#f59e0b'; ctx.lineWidth=1.5; ctx.stroke();
+    }
+    // Label
+    ctx.fillStyle='#f1f5f9'; ctx.font=`bold 8px ${F}`; ctx.textAlign='center';
+    ctx.fillText(facingDown?'P2':'P1', px, py-ps*1.4);
+    if(isHitter){
+      ctx.fillStyle='#f59e0b'; ctx.font=`7px ${M}`;
+      ctx.fillText('●hit', px, py+ps*1.8);
+    }
+  }, [tx, ty, SC]);
+
+  const drawMiniSkel = useCallback((ctx, cx, cy, scale, pose, color) => {
+    const pts = pose.map(([x,y])=>[cx+x*scale, cy-y*scale]);
+    COCO_EDGES.forEach(([a,b],i)=>{
+      ctx.strokeStyle=GROUP_COLOR[EDGE_GROUP[i]]; ctx.lineWidth=1.5; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(pts[a][0],pts[a][1]); ctx.lineTo(pts[b][0],pts[b][1]); ctx.stroke();
+    });
+    pts.forEach(([x,y],i)=>{
+      ctx.beginPath(); ctx.arc(x,y,i===0?3.5:2,0,Math.PI*2);
+      ctx.fillStyle=i===0?'#f1f5f9':color; ctx.fill();
+    });
+  }, []);
+
+  const drawFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    if(!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W=canvas.width, H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+
+    const { shot:shotI, prog, trail } = stateRef.current;
+    const shot   = RALLY[shotI];
+    const next   = RALLY[(shotI+1)%RALLY.length];
+    const strInfo = STRAT[shot.strategy];
+
+    // Background
+    ctx.fillStyle='#0a0f1a'; ctx.fillRect(0,0,W,H);
+
+    // If video is loaded, draw video frame behind court
+    if(videoElemRef.current && videoElemRef.current.readyState>=2){
+      ctx.globalAlpha=0.35;
+      ctx.drawImage(videoElemRef.current,0,0,W,H);
+      ctx.globalAlpha=1;
+    }
+
+    drawCourt(ctx);
+
+    // Player positions (lerp during transition)
+    const tt = smoothstep(clamp(prog/0.28,0,1));
+    const p1 = lerpPt(shot.p1, next.p1, tt);
+    const p2 = lerpPt(shot.p2, next.p2, tt);
+
+    // Shuttle position (arc)
+    const FS=0.32, FE=0.72;
+    let sp;
+    if(prog<FS){ sp=shot.shuttle.from; }
+    else if(prog<=FE){
+      const ft=(prog-FS)/(FE-FS);
+      const arcH=-Math.abs(shot.shuttle.to[1]-shot.shuttle.from[1])*0.28;
+      sp=[lerp(shot.shuttle.from[0],shot.shuttle.to[0],ft),
+          lerp(shot.shuttle.from[1],shot.shuttle.to[1],ft)+arcH*4*ft*(1-ft)];
+    } else { sp=shot.shuttle.to; }
+
+    // Trail
+    if(prog>=FS && prog<=FE+0.06){ trail.push([...sp]); if(trail.length>14) trail.shift(); }
+    else if(prog<FS){ trail.length=0; }
+
+    // Draw trail
+    trail.forEach((p,i)=>{
+      ctx.globalAlpha=(i/trail.length)*0.55;
+      ctx.beginPath(); ctx.arc(tx(p[0]),ty(p[1]),2,0,Math.PI*2);
+      ctx.fillStyle='#fbbf24'; ctx.fill();
+    }); ctx.globalAlpha=1;
+
+    // Shuttle
+    const inFlight=prog>=FS && prog<=FE;
+    ctx.beginPath(); ctx.arc(tx(sp[0]),ty(sp[1]),inFlight?5:3.5,0,Math.PI*2);
+    ctx.fillStyle='#fbbf24'; ctx.fill();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.stroke();
+
+    // Players
+    drawTopDownPlayer(ctx,p1[0],p1[1],'#60a5fa',shot.hitter===1,true);
+    drawTopDownPlayer(ctx,p2[0],p2[1],'#f472b6',shot.hitter===2,false);
+
+    // ── Info panel (right of court) ──────────────────────────────────────────
+    const PX = COURT_X+COURT_PX_W+18;
+    const PW = W-PX-10;
+
+    // Strategy card
+    roundRect(ctx,PX,COURT_Y,PW,88,8);
+    ctx.fillStyle=strInfo.color+'18'; ctx.fill();
+    ctx.strokeStyle=strInfo.color+'55'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle=strInfo.color; ctx.font=`bold 14px ${F}`; ctx.textAlign='left';
+    ctx.fillText(`${strInfo.icon}  ${strInfo.label}`,PX+10,COURT_Y+22);
+    ctx.fillStyle='#94a3b8'; ctx.font=`10px ${M}`;
+    ctx.fillText(`Shot: ${shot.shot}`,PX+10,COURT_Y+40);
+    ctx.fillText(`Conf: ${(shot.conf*100).toFixed(0)}%  Margin: ${(shot.margin*100).toFixed(0)}%`,PX+10,COURT_Y+56);
+    ctx.fillText(`Hitter: Player ${shot.hitter}  (Shot ${shotI+1}/${RALLY.length})`,PX+10,COURT_Y+72);
+    // Conf bar
+    ctx.fillStyle='#1e293b'; ctx.fillRect(PX,COURT_Y+78,PW,7);
+    ctx.fillStyle=strInfo.color; ctx.fillRect(PX,COURT_Y+78,PW*shot.conf,7);
+
+    // Skeleton
+    const skelY = COURT_Y+108;
+    ctx.fillStyle='#0f172a'; roundRect(ctx,PX,skelY,PW,165,6); ctx.fill();
+    ctx.fillStyle='#1e293b'; ctx.strokeStyle='#1e293b'; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('POSE (Hitter)',PX+PW/2,skelY+12);
+    drawMiniSkel(ctx,PX+PW/2,skelY+130,55,getPose(shot.strategy),strInfo.color);
+
+    // Features
+    const featY = COURT_Y+282;
+    ctx.fillStyle='#64748b'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('NODE FEATURES (L2)',PX+PW/2,featY);
+    const feats=[['vel','2.3 m/s'],['dist_net','2.1 m'],['dist_opp','5.6 m'],['shoulder∠','138°'],['court_pos','Rear']];
+    feats.forEach(([k,v],i)=>{
+      const fy=featY+14+i*18;
+      ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+      ctx.fillText(k,PX+4,fy);
+      ctx.fillStyle='#cbd5e1'; ctx.textAlign='right';
+      ctx.fillText(v,PX+PW-4,fy);
+      // divider
+      ctx.strokeStyle='#1e293b44'; ctx.lineWidth=0.5;
+      ctx.beginPath(); ctx.moveTo(PX,fy+4); ctx.lineTo(PX+PW,fy+4); ctx.stroke();
+    });
+
+    // Prototype distances (mini bars)
+    const pbY = COURT_Y+380;
+    ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('PROTOTYPE DIST.',PX+PW/2,pbY);
+    Object.entries(STRAT).forEach(([k,{color,label,icon}],i)=>{
+      const by=pbY+12+i*20;
+      const isTop=k===shot.strategy;
+      ctx.fillStyle=isTop?'#e2e8f0':'#64748b'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+      ctx.fillText(`${icon}`,PX,by+8);
+      ctx.fillStyle='#1e293b'; ctx.fillRect(PX+14,by,PW-50,12);
+      // Stable fake probabilities – no Math.random in draw loop
+      const FAKE_P=[0.28,0.20,0.16,0.22,0.14];
+      const fakeSum=FAKE_P.reduce((a,b)=>a+b,0)-FAKE_P[STRAT[shot.strategy].idx];
+      const barVal2=isTop?shot.conf:FAKE_P[STRAT[k].idx]*(1-shot.conf)/fakeSum;
+      const barW=(PW-50)*barVal2;
+      ctx.fillStyle=isTop?color:'#334155'; ctx.fillRect(PX+14,by,barW,12);
+      if(isTop){
+        ctx.fillStyle=color; ctx.font=`bold 7px ${M}`; ctx.textAlign='right';
+        ctx.fillText(`${(shot.conf*100).toFixed(0)}%`,PX+PW,by+9);
+      }
+    });
+
+  }, [drawCourt, drawTopDownPlayer, drawMiniSkel, tx, ty]);
+
+  // Animation loop
+  useEffect(() => {
+    const s = stateRef.current;
+    s.playing = playing;
+    if(!playing){
+      if(rafRef.current) cancelAnimationFrame(rafRef.current);
+      drawFrame();
+      return;
+    }
+    let prev=null;
+    const loop = (ts) => {
+      if(!stateRef.current.playing) return;
+      if(prev===null) prev=ts;
+      const dt = Math.min((ts-prev)/1000,0.05)*speed;
+      prev=ts;
+      s.prog += dt/2.8;
+      if(s.prog>=1){
+        s.prog=0; s.trail=[];
+        s.shot=(s.shot+1)%RALLY.length;
+        setShotIdx(s.shot);
+      }
+      drawFrame();
+      rafRef.current=requestAnimationFrame(loop);
+    };
+    rafRef.current=requestAnimationFrame(loop);
+    return()=>{ if(rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [playing, speed, drawFrame]);
+
+  useEffect(()=>{ drawFrame(); }, [drawFrame]);
+
+  const handleFile = (e) => {
+    const f=e.target.files[0];
+    if(!f) return;
+    const url=URL.createObjectURL(f);
+    setVideoSrc(url);
+    if(videoElemRef.current){ videoElemRef.current.src=url; videoElemRef.current.load(); }
+  };
+
+  const btn = (label,onClick,active=false,extra={}) => (
+    <button onClick={onClick} style={{background:active?'#FF6B35':'#1e293b',border:'1px solid #334155',
+      color:active?'#fff':'#94a3b8',padding:'5px 12px',borderRadius:6,fontSize:11,cursor:'pointer',
+      fontFamily:M,...extra}}>{label}</button>
+  );
+
+  return (
+    <div style={{background:'#0c1222',borderRadius:12,border:'1px solid #1e293b',overflow:'hidden'}}>
+      {/* Controls */}
+      <div style={{padding:'10px 14px',borderBottom:'1px solid #1e293b',display:'flex',
+        alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <span style={{fontSize:10,color:'#64748b',fontFamily:M}}>COURT VIEW</span>
+        {btn(playing?'⏸ Pause':'▶ Play',()=>setPlaying(p=>!p),playing)}
+        <select value={speed} onChange={e=>setSpeed(Number(e.target.value))}
+          style={{background:'#1e293b',border:'1px solid #334155',color:'#94a3b8',
+            padding:'5px 8px',borderRadius:6,fontSize:11,fontFamily:M,cursor:'pointer'}}>
+          {[0.5,1,1.5,2].map(s=><option key={s} value={s}>{s}x speed</option>)}
+        </select>
+        <label style={{display:'flex',alignItems:'center',gap:6,background:'#1e293b',
+          border:'1px solid #334155',borderRadius:6,padding:'5px 10px',cursor:'pointer',fontSize:11,
+          color:'#94a3b8',fontFamily:M}}>
+          📹 Load Video
+          <input type="file" accept="video/*" onChange={handleFile} style={{display:'none'}}/>
+        </label>
+        {videoSrc && <span style={{fontSize:10,color:'#10b981',fontFamily:M}}>✓ Video loaded (overlay active)</span>}
+        <div style={{marginLeft:'auto',display:'flex',gap:6,alignItems:'center'}}>
+          {RALLY.map((_,i)=>(
+            <div key={i} onClick={()=>{ stateRef.current.shot=i; stateRef.current.prog=0;
+              stateRef.current.trail=[]; setShotIdx(i); drawFrame(); }}
+              style={{width:8,height:8,borderRadius:'50%',cursor:'pointer',
+                background:i===shotIdx?STRAT[RALLY[i].strategy].color:'#334155',
+                border:i===shotIdx?'none':'1px solid #475569'}}/>
+          ))}
+        </div>
+      </div>
+      <canvas ref={canvasRef} width={width} height={height}
+        style={{display:'block',maxWidth:'100%'}}/>
+      <video ref={videoElemRef} src={videoSrc} hidden muted loop
+        style={{display:'none'}} crossOrigin="anonymous"/>
+      {/* Shot strip */}
+      <div style={{display:'flex',borderTop:'1px solid #1e293b'}}>
+        {RALLY.map((s,i)=>(
+          <div key={i} onClick={()=>{ stateRef.current.shot=i; stateRef.current.prog=0;
+            stateRef.current.trail=[]; setShotIdx(i); setPlaying(false); drawFrame(); }}
+            style={{flex:1,padding:'6px 4px',textAlign:'center',cursor:'pointer',
+              background:i===shotIdx?'#1e293b':'transparent',
+              borderLeft:i===0?'none':'1px solid #1e293b22',
+              borderTop:i===shotIdx?`2px solid ${STRAT[s.strategy].color}`:'2px solid transparent',
+              transition:'all .15s'}}>
+            <div style={{fontSize:9,fontFamily:M,color:STRAT[s.strategy].color}}>{s.shot}</div>
+            <div style={{fontSize:8,color:'#475569',fontFamily:M}}>{(s.conf*100).toFixed(0)}%</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── REAL FRAME VIEWER ────────────────────────────────────────────────────────
+const SERVER = 'http://localhost:7860';
+
+function useRealFrames() {
+  const [online,   setOnline]   = useState(false);
+  const [shots,    setShots]    = useState([]);
+  const [loading,  setLoading]  = useState(true);
+
+  useEffect(() => {
+    fetch(`${SERVER}/api/shots`, { signal: AbortSignal.timeout(1500) })
+      .then(r => r.json())
+      .then(data => { setShots(data); setOnline(true); })
+      .catch(() => setOnline(false))
+      .finally(() => setLoading(false));
+  }, []);
+
+  return { online, shots, loading };
+}
+
+// Draw a skeleton onto canvas.
+// joints = [[x,y] × 17] for one player, in original pixel space.
+// Coords are scaled from (imgW × imgH) → (canvasW × canvasH).
+function drawRealSkeleton(ctx, joints, imgW, imgH, cW, cH, color) {
+  const pts = joints.map(([px, py]) => [
+    (px / imgW) * cW,
+    (py / imgH) * cH,
+  ]);
+  // Limbs
+  COCO_EDGES.forEach(([a,b],i) => {
+    if(pts[a][0]===0 && pts[a][1]===0) return; // skip missing joints
+    ctx.strokeStyle = GROUP_COLOR[EDGE_GROUP[i]];
+    ctx.lineWidth   = 2.5;
+    ctx.lineCap     = 'round';
+    ctx.beginPath(); ctx.moveTo(pts[a][0],pts[a][1]); ctx.lineTo(pts[b][0],pts[b][1]);
+    ctx.stroke();
+  });
+  // Joints
+  pts.forEach(([x,y],i) => {
+    if(x===0 && y===0) return;
+    ctx.beginPath(); ctx.arc(x, y, i===0?6:3.5, 0, Math.PI*2);
+    ctx.fillStyle = i===0 ? '#fff' : color;
+    ctx.strokeStyle = '#00000066'; ctx.lineWidth = 1;
+    ctx.fill(); ctx.stroke();
+  });
+}
+
+// frameNum: the absolute frame number to display (defaults to shot.hit_frame).
+// rallyMeta: { frame_min } needed to convert frameNum → skeleton frame_idx.
+// skelMode: 'original' | 'gdino'
+function RealFrameCanvas({ shot, frameNum, rallyMeta, skelMode='original', hitterOverride=null, width=720, height=405 }) {
+  const canvasRef    = useRef(null);
+  const [skelData,    setSkelData]    = useState(null);
+  const [shuttleData, setShuttleData] = useState(null);
+  const [frameLoaded, setFrameLoaded] = useState(false);
+  const [skelSource,  setSkelSource]  = useState(null); // 'original'|'gdino'|'gdino-fallback'
+
+  const displayFrame = frameNum ?? shot?.hit_frame;
+  const isHitFrame   = displayFrame === shot?.hit_frame;
+
+  // Fetch skeleton — respects skelMode, falls back to original if GDINO not available
+  useEffect(() => {
+    if(!shot) return;
+    setSkelData(null); setSkelSource(null); setFrameLoaded(false);
+    const frameIdx = rallyMeta
+      ? displayFrame - rallyMeta.frame_min
+      : shot.frame_idx;
+    if(frameIdx == null || frameIdx < 0) return;
+
+    if(skelMode === 'gdino') {
+      fetch(`${SERVER}/api/skeleton_gdino/${shot.video}/${frameIdx}`)
+        .then(r=>r.json())
+        .then(d => {
+          if(d.has_gdino) { setSkelData(d.skeleton); setSkelSource('gdino'); }
+          else {
+            // Not yet extracted → fall back to original silently
+            fetch(`${SERVER}/api/skeleton/${shot.video}/${frameIdx}`)
+              .then(r=>r.json())
+              .then(d2=>{ setSkelData(d2.skeleton); setSkelSource('gdino-fallback'); })
+              .catch(()=>{ setSkelData(null); setSkelSource(null); });
+          }
+        }).catch(()=>setSkelData(null));
+    } else {
+      // Original mode
+      if(isHitFrame) {
+        fetch(`${SERVER}/api/shot/${shot.id}`)
+          .then(r=>r.json())
+          .then(d=>{ setSkelData(d.skeleton); setSkelSource('original'); })
+          .catch(()=>setSkelData(null));
+      } else {
+        fetch(`${SERVER}/api/skeleton/${shot.video}/${frameIdx}`)
+          .then(r=>r.json())
+          .then(d=>{ setSkelData(d.has_skeleton?d.skeleton:null); setSkelSource('original'); })
+          .catch(()=>setSkelData(null));
+      }
+    }
+  }, [shot?.id, displayFrame, skelMode]);
+
+  // Fetch shuttle position (relative frame idx from rally start)
+  useEffect(() => {
+    if(!shot || !rallyMeta) { setShuttleData(null); return; }
+    const frameIdx = displayFrame - rallyMeta.frame_min;
+    if(frameIdx < 0) { setShuttleData(null); return; }
+    fetch(`${SERVER}/api/shuttle/${shot.video}/${frameIdx}`)
+      .then(r=>r.json()).then(d=>setShuttleData(d)).catch(()=>setShuttleData(null));
+  }, [shot?.id, displayFrame, rallyMeta?.frame_min]);
+
+  // Draw frame + skeleton overlay
+  useEffect(() => {
+    if(!shot || !canvasRef.current) return;
+    let cancelled = false;  // prevents stale image callbacks from overwriting newer draws
+    const canvas = canvasRef.current;
+    const ctx    = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+
+    ctx.fillStyle = '#0a0f1a'; ctx.fillRect(0,0,W,H);
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if(cancelled) return;  // stale — a newer draw effect has already taken over
+      ctx.drawImage(img, 0, 0, W, H);
+      setFrameLoaded(true);
+
+      // hitterOverride = annotation window hitter for the current scrub frame.
+      // Falls back to shot.hitter when not scrubbing (i.e. showing the hit frame itself).
+      const hitter   = hitterOverride ?? shot.hitter;
+      const hitIsTop = hitter === 'top';
+      const p0color  = hitIsTop ? '#60a5fa' : '#f472b6';
+      const p1color  = hitIsTop ? '#f472b6' : '#60a5fa';
+
+      if(skelData) {
+        // ── Bounding boxes from skeleton joints (before drawing skeleton on top) ──
+        [[skelData[0], p0color, hitIsTop?'Hitter (top)':'Opp (top)'],
+         [skelData[1], p1color, hitIsTop?'Opp (bot)':'Hitter (bot)']].forEach(([joints, col, lbl])=>{
+          // Filter joints where BOTH x>0 and y>0 to avoid Math.min/max returning Infinity
+          const valid = joints.filter(j=>j[0]>0 && j[1]>0);
+          if(!valid.length) return;
+          const xs = valid.map(j=>j[0]);
+          const ys = valid.map(j=>j[1]);
+          const sx1 = (Math.min(...xs)/shot.img_w)*W - 6;
+          const sy1 = (Math.min(...ys)/shot.img_h)*H - 10;
+          const sx2 = (Math.max(...xs)/shot.img_w)*W + 6;
+          const sy2 = (Math.max(...ys)/shot.img_h)*H + 6;
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+          ctx.setLineDash([4,3]);
+          ctx.strokeRect(sx1, sy1, sx2-sx1, sy2-sy1);
+          ctx.setLineDash([]);
+          // Label above box
+          ctx.fillStyle = col+'cc'; roundRect(ctx,sx1,sy1-14,ctx.measureText(lbl).width+8,13,3); ctx.fill();
+          ctx.fillStyle='#0a0f1a'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+          ctx.fillText(lbl, sx1+4, sy1-4);
+        });
+        drawRealSkeleton(ctx, skelData[0], shot.img_w, shot.img_h, W, H, p0color);
+        drawRealSkeleton(ctx, skelData[1], shot.img_w, shot.img_h, W, H, p1color);
+      }
+
+      // ── Strategy overlay (top-left) ──────────────────────────────────────
+      const strInfo = STRAT[shot.strategy];
+      ctx.fillStyle = '#00000088';
+      ctx.beginPath(); roundRect(ctx,8,8,220,isHitFrame?64:46,6); ctx.fill();
+      ctx.fillStyle = strInfo.color;
+      ctx.font = `bold 15px ${F}`; ctx.textAlign='left';
+      ctx.fillText(`${strInfo.icon}  ${strInfo.label}`, 16, 30);
+      ctx.fillStyle='#e2e8f0'; ctx.font=`11px ${M}`;
+      ctx.fillText(`${shot.hit_type}  ·  ${hitter} hitter`, 16, 47);
+      if(isHitFrame && !shot.excluded) {
+        ctx.fillText(`conf ${(shot.conf*100).toFixed(0)}%  margin ${(shot.margin*100).toFixed(0)}%`, 16, 62);
+      }
+
+      // ── Confidence bar (hit frame only) ──────────────────────────────────
+      if(isHitFrame && !shot.excluded) {
+        ctx.fillStyle='#00000066'; ctx.fillRect(0, H-8, W, 8);
+        ctx.fillStyle=strInfo.color; ctx.fillRect(0, H-8, W*shot.conf, 8);
+      }
+
+      // ── Shuttle overlay ───────────────────────────────────────────────────
+      if(shuttleData && (shuttleData.visible || shuttleData.trail?.length)) {
+        // Trail (fading yellow dots)
+        (shuttleData.trail || []).forEach(pt => {
+          const sx = (pt.x / shot.img_w) * W;
+          const sy = (pt.y / shot.img_h) * H;
+          ctx.beginPath(); ctx.arc(sx, sy, 4, 0, Math.PI*2);
+          ctx.fillStyle = `rgba(250,204,21,${(pt.alpha || 0.3) * 0.55})`;
+          ctx.fill();
+        });
+        // Current position
+        if(shuttleData.visible) {
+          const sx = (shuttleData.x / shot.img_w) * W;
+          const sy = (shuttleData.y / shot.img_h) * H;
+          ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI*2);
+          ctx.fillStyle = '#facc15';
+          ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2;
+          ctx.fill(); ctx.stroke();
+          // Crosshair tick marks
+          ctx.strokeStyle = '#facc1599'; ctx.lineWidth = 1;
+          [[sx-12,sy,sx-9,sy],[sx+9,sy,sx+12,sy],[sx,sy-12,sx,sy-9],[sx,sy+9,sx,sy+12]]
+            .forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});
+        }
+      }
+
+      // ── Skeleton legend ───────────────────────────────────────────────────
+      const legendH = skelData ? (shuttleData ? 60 : 42) : 28;
+      if(skelData) {
+        ctx.fillStyle='#00000088'; roundRect(ctx, W-110, H-legendH-8, 105, legendH, 4); ctx.fill();
+        // Legend colors: cyan (#60a5fa) is always the hitter; pink (#f472b6) always the opponent.
+        // p0color/p1color assign those colors to the correct court player, but the legend
+        // must show the ROLE colour, not the player-index colour.
+        const hitterColor   = hitIsTop ? p0color : p1color;
+        const opponentColor = hitIsTop ? p1color : p0color;
+        [['●','Hitter',hitterColor], ['●','Opponent',opponentColor]].forEach(([dot,lbl,c],i)=>{
+          ctx.fillStyle=c; ctx.font=`11px ${M}`; ctx.textAlign='left';
+          ctx.fillText(dot, W-105, H-legendH+10+i*16);
+          ctx.fillStyle='#e2e8f0'; ctx.font=`10px ${F}`;
+          ctx.fillText(lbl, W-92, H-legendH+10+i*16);
+        });
+        if(shuttleData) {
+          const hasSh = shuttleData.visible || shuttleData.trail?.length > 0;
+          ctx.fillStyle = hasSh ? '#facc15' : '#64748b';
+          ctx.font=`11px ${M}`; ctx.fillText('●', W-105, H-legendH+42);
+          ctx.fillStyle='#e2e8f0'; ctx.font=`10px ${F}`;
+          ctx.fillText(hasSh ? 'Shuttle' : 'Shuttle (n/d)', W-92, H-legendH+42);
+        }
+      } else {
+        ctx.fillStyle='#f59e0b88'; roundRect(ctx, W-160, H-28, 155, 22, 4); ctx.fill();
+        ctx.fillStyle='#f59e0b'; ctx.font=`9px ${M}`; ctx.textAlign='left';
+        ctx.fillText('⚠ No skeleton file for this rally', W-156, H-14);
+      }
+
+      // ── Skeleton source badge (top-right) ────────────────────────────────
+      const srcLabel = skelSource==='gdino' ? '🎯 GDINO'
+                     : skelSource==='gdino-fallback' ? '⚠ GDINO→orig'
+                     : 'YOLOv8';
+      const srcColor = skelSource==='gdino' ? '#10b981'
+                     : skelSource==='gdino-fallback' ? '#f59e0b'
+                     : '#64748b';
+      const srcW = ctx.measureText(srcLabel).width + 10;
+      ctx.fillStyle='#00000099'; roundRect(ctx, W-srcW-6,6,srcW+2,16,4); ctx.fill();
+      ctx.fillStyle=srcColor; ctx.font=`9px ${M}`; ctx.textAlign='right';
+      ctx.fillText(srcLabel, W-8, 18);
+
+      // ── Frame watermark ───────────────────────────────────────────────────
+      ctx.fillStyle='#ffffff44'; ctx.font=`8px ${M}`; ctx.textAlign='right';
+      ctx.fillText(`${shot.video} · f${displayFrame}${isHitFrame?' [HIT]':''}`, W-6, H-14);
+    };
+    img.onerror = () => {
+      if(cancelled) return;
+      ctx.fillStyle='#1e293b'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#475569'; ctx.font=`12px ${M}`; ctx.textAlign='center';
+      ctx.fillText('Frame not found', W/2, H/2);
+    };
+    img.src = `${SERVER}/frame/${shot.video}/${displayFrame}`;
+    return () => { cancelled = true; };  // cancel on re-run or unmount
+  }, [shot?.id, displayFrame, skelData, shuttleData]);
+
+  // Compute hitter validation metrics from skelData
+  const hitterCheck = useMemo(() => {
+    if(!skelData || !shot) return null;
+    const p0x = skelData[0].reduce((s,j)=>s+j[0],0)/17;
+    const p0y = skelData[0].reduce((s,j)=>s+j[1],0)/17;
+    const p1x = skelData[1].reduce((s,j)=>s+j[0],0)/17;
+    const p1y = skelData[1].reduce((s,j)=>s+j[1],0)/17;
+    const umpireThresh = 200;
+    const p0Suspect = p0x < umpireThresh;   // x too far left → likely chair umpire
+    // Hitter annotation: "top"→P0 should be hitter (smaller Y), "bottom"→P1
+    const hitter = shot.hitter;
+    const hitterIsP0 = hitter === 'top';
+    // Verify Y-sort is correct: P0 should have smaller Y than P1
+    const ySortOk = p0y < p1y;
+    return { p0x, p0y, p1x, p1y, p0Suspect, hitter, hitterIsP0, ySortOk };
+  }, [skelData, shot?.id]);
+
+  return (
+    <div>
+      <div style={{position:'relative',borderRadius:8,overflow:'hidden',background:'#0a0f1a',
+        border:`1px solid ${hitterCheck?.p0Suspect?'#ef444466':'#1e293b'}`}}>
+        <canvas ref={canvasRef} width={width} height={height}
+          style={{display:'block',maxWidth:'100%'}}/>
+        {!frameLoaded && (
+          <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',
+            justifyContent:'center',pointerEvents:'none'}}>
+            <div style={{fontSize:11,color:'#475569',fontFamily:M}}>Loading frame…</div>
+          </div>
+        )}
+      </div>
+      {/* ── Hitter validation panel ── */}
+      {hitterCheck && (
+        <div style={{marginTop:5,padding:'7px 10px',borderRadius:6,
+          background: hitterCheck.p0Suspect ? '#ef444411' : '#0f172a',
+          border:`1px solid ${hitterCheck.p0Suspect?'#ef444433':'#1e293b'}`}}>
+          <div style={{display:'flex',flexWrap:'wrap',gap:10,alignItems:'center'}}>
+            {/* Warning badge */}
+            {hitterCheck.p0Suspect ? (
+              <span style={{fontSize:9,fontFamily:M,color:'#ef4444',fontWeight:600,
+                background:'#ef444422',padding:'2px 7px',borderRadius:3,whiteSpace:'nowrap'}}>
+                ⚠ P0.x={hitterCheck.p0x.toFixed(0)}px — chair umpire likely as P0
+              </span>
+            ) : (
+              <span style={{fontSize:9,fontFamily:M,color:'#10b981',
+                background:'#10b98111',padding:'2px 7px',borderRadius:3,whiteSpace:'nowrap'}}>
+                ✓ P0 position ok ({hitterCheck.p0x.toFixed(0)}px)
+              </span>
+            )}
+            {/* Y-sort check */}
+            <span style={{fontSize:9,fontFamily:M,
+              color:hitterCheck.ySortOk?'#64748b':'#f59e0b',whiteSpace:'nowrap'}}>
+              Y-sort: {hitterCheck.ySortOk?'✓':'⚠'} P0.y={hitterCheck.p0y.toFixed(0)} P1.y={hitterCheck.p1y.toFixed(0)}
+            </span>
+            {/* Hitter annotation */}
+            <span style={{fontSize:9,fontFamily:M,color:'#64748b',whiteSpace:'nowrap'}}>
+              Annotation: hitter=<span style={{
+                color:hitterCheck.hitter==='top'?'#60a5fa':'#f472b6',fontWeight:600}}>
+                {hitterCheck.hitter||'?'}
+              </span>
+              {' → '}
+              <span style={{color:hitterCheck.hitter==='top'?'#60a5fa':'#f472b6'}}>
+                {hitterCheck.hitter==='top'?'P0 (cyan)':hitterCheck.hitter==='bottom'?'P1 (pink)':'unknown'}
+              </span>
+              {' should be hitter'}
+            </span>
+            {/* Source */}
+            <span style={{marginLeft:'auto',fontSize:8,fontFamily:M,color:'#334155',whiteSpace:'nowrap'}}>
+              {skelSource==='gdino'?'GDINO-guided':skelSource==='gdino-fallback'?'GDINO→original fallback':'Original YOLOv8'}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Rally scrubber ───────────────────────────────────────────────────────────
+function RallyScrubber({ rallyMeta, currentShot, scrubFrame, onScrub, onShotJump }) {
+  const barRef = useRef(null);
+  if(!rallyMeta || !currentShot) return null;
+
+  const { frame_min, frame_max, shots: rallyShots } = rallyMeta;
+  const range  = frame_max - frame_min || 1;
+  const frac   = fn => Math.max(0, Math.min(1, (fn - frame_min) / range));
+  const active = scrubFrame ?? currentShot.hit_frame;
+
+  const seekTo = e => {
+    if(!barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const x    = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onScrub(Math.round(frame_min + x * range));
+  };
+
+  const elapsed = active - frame_min;
+  const total   = frame_max - frame_min;
+
+  return (
+    <div style={{marginTop:8,userSelect:'none'}}>
+      {/* Info row */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+        marginBottom:4,padding:'0 2px'}}>
+        <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+          f<span style={{color:'#e2e8f0'}}>{active}</span>
+          &nbsp;·&nbsp;t=<span style={{color:'#e2e8f0'}}>{elapsed}</span>
+          {active===currentShot.hit_frame &&
+            <span style={{color:STRAT[currentShot.strategy].color,marginLeft:4}}> [HIT]</span>}
+        </span>
+        <span style={{fontSize:9,fontFamily:M,color:'#475569'}}>
+          {elapsed} / {total} frames &nbsp;·&nbsp; {rallyShots.length} shots in rally
+        </span>
+      </div>
+
+      {/* Timeline bar */}
+      <div ref={barRef}
+        style={{position:'relative',height:32,background:'#0f172a',borderRadius:6,
+          cursor:'crosshair',border:'1px solid #1e293b'}}
+        onPointerDown={e=>{ e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
+        onPointerMove={e=>{ if(e.buttons&1) seekTo(e); }}>
+
+        {/* Played region */}
+        <div style={{position:'absolute',left:0,top:0,bottom:0,
+          width:`${frac(active)*100}%`,background:'#1e293b',borderRadius:'6px 0 0 6px'}}/>
+
+        {/* Unlabeled hit ticks (from annotation windows, no strategy) */}
+        {(rallyMeta.windows||[]).filter(w => !rallyShots.some(s=>s.hit_frame===w.hit_frame)).map((w,i) => (
+          <div key={`w${i}`}
+            title={`${w.hitter} hitter · f${w.hit_frame} (unlabeled)`}
+            style={{position:'absolute',left:`${frac(w.hit_frame)*100}%`,top:'25%',bottom:'25%',
+              width:1,marginLeft:-0.5,background:'#475569',opacity:0.6,pointerEvents:'none',zIndex:0}}/>
+        ))}
+
+        {/* Labeled shot tick marks */}
+        {rallyShots.map(s => {
+          const x    = frac(s.hit_frame)*100;
+          const isAct= s.id === currentShot.id;
+          const col  = STRAT[s.strategy].color;
+          return (
+            <div key={s.id}
+              onClick={()=>onShotJump(s)}
+              onPointerDown={e=>e.stopPropagation()}
+              title={`${STRAT[s.strategy].label} · f${s.hit_frame}`}
+              style={{position:'absolute',left:`${x}%`,top:0,bottom:0,
+                width: isAct?3:2,marginLeft:isAct?-1.5:-1,
+                background: col,
+                opacity: isAct?1:0.7,
+                cursor:'pointer',
+                boxShadow: isAct?`0 0 6px ${col}`:'none',
+                zIndex: isAct?2:1}}>
+              {/* Strategy icon above the tick for the active shot */}
+              {isAct && (
+                <div style={{position:'absolute',bottom:'calc(100% + 3px)',
+                  left:'50%',transform:'translateX(-50%)',
+                  fontSize:10,lineHeight:1,pointerEvents:'none'}}>
+                  {STRAT[s.strategy].icon}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Playhead */}
+        <div style={{position:'absolute',left:`${frac(active)*100}%`,
+          top:-4,width:2,height:'calc(100% + 8px)',marginLeft:-1,
+          background:'#f8fafc',borderRadius:1,pointerEvents:'none',zIndex:3,
+          boxShadow:'0 0 4px #fff8'}}/>
+      </div>
+
+      {/* Legend */}
+      <div style={{display:'flex',gap:12,marginTop:4,flexWrap:'wrap'}}>
+        {rallyShots.reduce((seen,s)=>{
+          if(!seen.has(s.strategy)){
+            seen.set(s.strategy, rallyShots.filter(x=>x.strategy===s.strategy).length);
+          }
+          return seen;
+        }, new Map()).entries().toArray().map(([k,n])=>(
+          <span key={k} style={{fontSize:8,fontFamily:M,color:STRAT[k].color,display:'flex',alignItems:'center',gap:3}}>
+            <span style={{display:'inline-block',width:8,height:8,background:STRAT[k].color,borderRadius:1}}/>
+            {STRAT[k].label} ×{n}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── TAB: VIDEO OVERLAY ────────────────────────────────────────────────────────
+function VideoOverlayTab() {
+  const { online, shots, loading } = useRealFrames();
+  const [view,        setView]       = useState('real');
+  const [selMatch,    setSelMatch]   = useState(null);
+  const [selRally,    setSelRally]   = useState(null);
+  const [selShotIdx,  setSelShotIdx] = useState(0);
+  const [stratFilter, setStratFilter]= useState('all');
+  const [scrubFrame,   setScrubFrame]  = useState(null);  // null = show hit frame
+  const [rallyMeta,    setRallyMeta]   = useState(null);  // /api/rally response
+  const [skelMode,     setSkelMode]    = useState('original');  // 'original' | 'gdino'
+  const [gdinoRallies, setGdinoRallies]= useState([]);
+
+  // Build match → rally → shots hierarchy
+  const matchGroups = useMemo(() => {
+    const g = {};
+    shots.forEach(s => {
+      const m = s.video.split('_')[0];
+      if (!g[m]) g[m] = {};
+      if (!g[m][s.video]) g[m][s.video] = [];
+      g[m][s.video].push(s);
+    });
+    return g;
+  }, [shots]);
+
+  const matches = useMemo(() => Object.keys(matchGroups).sort(), [matchGroups]);
+
+  // Auto-select first match + rally when data loads
+  useEffect(() => {
+    if (matches.length > 0 && !selMatch) {
+      const m = matches[0];
+      const r = Object.keys(matchGroups[m]).sort()[0];
+      setSelMatch(m); setSelRally(r); setSelShotIdx(0);
+    }
+  }, [matches]);
+
+  const rallies      = selMatch ? Object.keys(matchGroups[selMatch]).sort() : [];
+  const rallyShotsRaw= (selMatch && selRally && matchGroups[selMatch]?.[selRally]) || [];
+  const rallyShots   = stratFilter==='all'
+    ? rallyShotsRaw : rallyShotsRaw.filter(s=>s.strategy===stratFilter);
+  const currentShot  = rallyShots[selShotIdx] || null;
+
+  const stratCounts = useMemo(()=>{
+    const c={};
+    rallyShotsRaw.forEach(s=>{ c[s.strategy]=(c[s.strategy]||0)+1; });
+    return c;
+  }, [rallyShotsRaw]);
+
+  const selectMatch = m => {
+    const r = Object.keys(matchGroups[m]).sort()[0];
+    setSelMatch(m); setSelRally(r); setSelShotIdx(0); setStratFilter('all');
+    setScrubFrame(null); setRallyMeta(null);
+  };
+  const selectRally = r => {
+    setSelRally(r); setSelShotIdx(0); setStratFilter('all');
+    setScrubFrame(null); setRallyMeta(null);
+  };
+
+  // Fetch rally metadata whenever rally changes
+  useEffect(() => {
+    if(!selRally) return;
+    fetch(`${SERVER}/api/rally/${selRally}`)
+      .then(r=>r.json()).then(setRallyMeta).catch(()=>setRallyMeta(null));
+  }, [selRally]);
+
+  // Fetch which rallies have GDINO skeletons (once on mount)
+  useEffect(() => {
+    fetch(`${SERVER}/api/gdino_rallies`)
+      .then(r=>r.json()).then(d=>setGdinoRallies(d.rallies||[])).catch(()=>{});
+  }, []);
+
+  // Reset scrubber to hit frame when selected shot changes
+  useEffect(() => {
+    setScrubFrame(null);
+  }, [currentShot?.id]);
+
+  // Per-frame hitter: find the most recent hit that has already occurred
+  // (hit_frame <= scrubFrame) and use that window's hitter.
+  // Switching on hit_frame means the label changes exactly when the ball is struck,
+  // not at the start of the annotation window (which is before the actual hit).
+  // When not scrubbing (scrubFrame=null), frameHitter=null → RealFrameCanvas uses shot.hitter.
+  const frameHitter = useMemo(() => {
+    if (!scrubFrame || !rallyMeta?.windows?.length) return null;
+    let result = null;
+    for (const w of rallyMeta.windows) {
+      if (w.hit_frame <= scrubFrame) result = w.hitter;
+    }
+    return result;
+  }, [scrubFrame, rallyMeta]);
+
+  return (
+    <div style={{padding:20}}>
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:8}}>
+        <div>
+          <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+            PHASE C · VIDEO FRAME + SKELETON OVERLAY</div>
+          <div style={{fontSize:22,fontFamily:IS,fontStyle:'italic'}}>Match Video Analysis</div>
+        </div>
+        <div style={{display:'flex',gap:6}}>
+          {[['real','📷 Real Frames'],['court','🗺 Court View']].map(([v,l])=>(
+            <button key={v} onClick={()=>setView(v)}
+              style={{background:view===v?'#1e293b':'transparent',
+                border:`1px solid ${view===v?'#FF6B35':'#334155'}`,
+                color:view===v?'#f8fafc':'#64748b',padding:'6px 14px',
+                borderRadius:8,fontSize:11,cursor:'pointer'}}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Court View */}
+      {view==='court' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:16,alignItems:'start'}}>
+          <CourtCanvas width={700} height={500}/>
+          <InfoCard title="PIPELINE STAGES">
+            {['ffmpeg 30fps','Court detect (RANSAC)','TrackNetV3 shuttle','Hit detect (>90°)',
+              'YOLOv8-Pose','T=16 segment','Feature eng. L2','ST-GCN 256-d','ProtoNet 5-way'].map((s,i)=>(
+              <div key={i} style={{display:'flex',alignItems:'center',gap:6,padding:'3px 0',
+                borderBottom:'1px solid #1e293b22'}}>
+                <div style={{width:14,height:14,borderRadius:'50%',background:'#10b981',fontSize:7,
+                  color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>✓</div>
+                <span style={{fontSize:9,fontFamily:M,color:'#94a3b8'}}>{s}</span>
+              </div>
+            ))}
+          </InfoCard>
+        </div>
+      )}
+
+      {/* Real Frames View */}
+      {view==='real' && (
+        <>
+          {/* Server status banner */}
+          {loading ? (
+            <div style={{padding:'10px 14px',background:'#1e293b',borderRadius:8,
+              marginBottom:14,fontSize:11,color:'#64748b',fontFamily:M}}>
+              Connecting to local server…</div>
+          ) : !online ? (
+            <div style={{padding:'12px 16px',background:'#7f1d1d22',border:'1px solid #ef444433',
+              borderRadius:8,marginBottom:14}}>
+              <div style={{fontSize:12,color:'#ef4444',fontFamily:M,fontWeight:600,marginBottom:4}}>
+                ⚠ Server not running</div>
+              <div style={{fontSize:11,color:'#fca5a5',lineHeight:1.7}}>
+                Start the local frame server:<br/>
+                <code style={{fontFamily:M,color:'#f87171',background:'#450a0a',
+                  padding:'2px 8px',borderRadius:4}}>python badminton_server.py</code>
+                &nbsp; then refresh.
+              </div>
+            </div>
+          ) : (
+            <div style={{padding:'6px 12px',background:'#10b98111',border:'1px solid #10b98133',
+              borderRadius:8,marginBottom:14,display:'flex',alignItems:'center',gap:8}}>
+              <span style={{color:'#10b981',fontSize:12}}>●</span>
+              <span style={{fontSize:11,color:'#10b981',fontFamily:M}}>
+                Server online · {shots.length} labeled shots · {matches.length} matches
+              </span>
+            </div>
+          )}
+
+          {online && (
+            <div style={{display:'grid',gridTemplateColumns:'150px 210px 1fr',gap:12}}>
+
+              {/* ── Col 1: Match + Rally browser ── */}
+              <div style={{display:'flex',flexDirection:'column',gap:10}}>
+
+                {/* Match list */}
+                <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+                  <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',
+                    fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+                    MATCHES ({matches.length})</div>
+                  <div style={{overflowY:'auto',maxHeight:180}}>
+                    {matches.map(m => {
+                      const rallyCount = Object.keys(matchGroups[m]).length;
+                      const shotCount  = Object.values(matchGroups[m]).reduce((a,v)=>a+v.length,0);
+                      const isSel = m === selMatch;
+                      return (
+                        <div key={m} onClick={()=>selectMatch(m)}
+                          style={{padding:'7px 10px',cursor:'pointer',
+                            background:isSel?'#1e293b':'transparent',
+                            borderLeft:`3px solid ${isSel?'#FF6B35':'transparent'}`,
+                            borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                          <span style={{fontSize:11,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400}}>
+                            Match {m}</span>
+                          <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                            {rallyCount} rall{rallyCount===1?'y':'ies'} · {shotCount} shots</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Rally list */}
+                {selMatch && (
+                  <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+                    <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',
+                      fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+                      RALLIES — {selMatch}</div>
+                    <div style={{overflowY:'auto',maxHeight:280}}>
+                      {rallies.map(r => {
+                        const rshots = matchGroups[selMatch][r];
+                        const isSel  = r === selRally;
+                        // Strategy colour mix: dominant strategy
+                        const domStrat = Object.entries(
+                          rshots.reduce((acc,s)=>{acc[s.strategy]=(acc[s.strategy]||0)+1;return acc;},{})
+                        ).sort((a,b)=>b[1]-a[1])[0]?.[0];
+                        const rallyNum = r.split('_').slice(1).join('_');
+                        return (
+                          <div key={r} onClick={()=>selectRally(r)}
+                            style={{padding:'7px 10px',cursor:'pointer',
+                              background:isSel?'#1e293b':'transparent',
+                              borderLeft:`3px solid ${isSel?(domStrat?STRAT[domStrat].color:'#60a5fa'):'transparent'}`,
+                              borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                            <span style={{fontSize:11,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400}}>
+                              Rally {rallyNum}</span>
+                            <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                              {rshots.length} shot{rshots.length!==1?'s':''}</span>
+                            {/* Mini strategy bar */}
+                            <div style={{display:'flex',height:3,borderRadius:2,overflow:'hidden',gap:1,marginTop:2}}>
+                              {Object.entries(STRAT).map(([k,{color}])=>{
+                                const n=rshots.filter(s=>s.strategy===k).length;
+                                return n>0 ? <div key={k} style={{flex:n,background:color,opacity:.7}}/> : null;
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ── Col 2: Shot list within rally ── */}
+              <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',
+                display:'flex',flexDirection:'column',maxHeight:600,overflow:'hidden'}}>
+                {/* Header + strategy filter */}
+                <div style={{padding:'6px 8px',borderBottom:'1px solid #1e293b',flexShrink:0}}>
+                  <div style={{fontSize:8,color:'#64748b',fontFamily:M,marginBottom:5}}>
+                    {selRally ? `${selRally.replace('_','.')} · ${rallyShotsRaw.length} shots` : 'SELECT A RALLY'}</div>
+                  <div style={{display:'flex',flexWrap:'wrap',gap:3}}>
+                    <button onClick={()=>{setStratFilter('all');setSelShotIdx(0);}}
+                      style={{fontSize:7,padding:'2px 6px',borderRadius:4,cursor:'pointer',fontFamily:M,
+                        background:stratFilter==='all'?'#334155':'#1e293b',
+                        border:'1px solid #334155',color:'#94a3b8'}}>
+                      All ({rallyShotsRaw.length})
+                    </button>
+                    {Object.entries(STRAT).filter(([,{excluded}])=>!excluded).map(([k,{color,icon}])=> stratCounts[k] ? (
+                      <button key={k} onClick={()=>{setStratFilter(k);setSelShotIdx(0);}}
+                        style={{fontSize:7,padding:'2px 6px',borderRadius:4,cursor:'pointer',fontFamily:M,
+                          background:stratFilter===k?`${color}33`:'#1e293b',
+                          border:`1px solid ${stratFilter===k?color:'#334155'}`,
+                          color:stratFilter===k?color:'#64748b'}}>
+                        {icon} {stratCounts[k]}
+                      </button>
+                    ) : null)}
+                    {/* Excluded-strategy filters — only shown if rally has some */}
+                    {Object.entries(STRAT).filter(([,{excluded}])=>excluded).some(([k])=>stratCounts[k]) && (
+                      <span style={{fontSize:7,color:'#475569',fontFamily:M,alignSelf:'center',padding:'0 2px'}}>|</span>
+                    )}
+                    {Object.entries(STRAT).filter(([,{excluded}])=>excluded).map(([k,{color,icon}])=> stratCounts[k] ? (
+                      <button key={k} onClick={()=>{setStratFilter(k);setSelShotIdx(0);}}
+                        title="Annotation-only — not used in model"
+                        style={{fontSize:7,padding:'2px 6px',borderRadius:4,cursor:'pointer',fontFamily:M,
+                          background:stratFilter===k?`${color}33`:'#1e293b',
+                          border:`1px dashed ${stratFilter===k?color:'#334155'}`,
+                          color:stratFilter===k?color:'#64748b'}}>
+                        {icon} {stratCounts[k]}
+                      </button>
+                    ) : null)}
+                  </div>
+                </div>
+                {/* Shot rows */}
+                <div style={{flex:1,overflowY:'auto'}}>
+                  {rallyShots.map((shot, i) => {
+                    const st = STRAT[shot.strategy];
+                    const isSel = i===selShotIdx;
+                    return (
+                    <div key={shot.id} onClick={()=>{ setSelShotIdx(i); setScrubFrame(null); }}
+                      style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',
+                        cursor:'pointer',opacity:shot.excluded?0.7:1,
+                        background:isSel?'#1e293b':'transparent',
+                        borderLeft:`3px ${shot.excluded?'dashed':'solid'} ${isSel?st.color:'transparent'}`,
+                        borderBottom:'1px solid #1e293b22'}}>
+                      <div style={{width:20,height:20,borderRadius:3,flexShrink:0,fontSize:10,
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        background:`${st.color}22`}}>
+                        {st.icon}
+                      </div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:'flex',alignItems:'center',gap:3}}>
+                          <span style={{fontSize:9,color:st.color,fontFamily:M,
+                            whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                            {st.label}</span>
+                          {shot.excluded && (
+                            <span style={{fontSize:6,fontFamily:M,color:'#f59e0b',
+                              background:'#f59e0b18',border:'1px solid #f59e0b44',
+                              borderRadius:3,padding:'0 3px',flexShrink:0}}>ANNOT</span>
+                          )}
+                        </div>
+                        <div style={{fontSize:7,color:'#475569',fontFamily:M,marginTop:1}}>
+                          {shot.hitter} · f{shot.hit_frame} · {shot.hit_type}</div>
+                      </div>
+                      {!shot.excluded && (
+                        <div style={{width:24,height:3,background:'#1e293b',borderRadius:2,overflow:'hidden',flexShrink:0}}>
+                          <div style={{width:`${shot.conf*100}%`,height:'100%',background:st.color}}/>
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })}
+                  {rallyShots.length===0 && (
+                    <div style={{padding:16,textAlign:'center',color:'#475569',fontSize:10}}>
+                      {selRally ? 'No shots match filter' : 'Select a rally'}</div>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Col 3: Frame canvas ── */}
+              <div>
+                {currentShot ? (
+                  <>
+                    {/* ── Skeleton source toggle ── */}
+                    <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+                      <span style={{fontSize:9,color:'#475569',fontFamily:M}}>Skeleton:</span>
+                      {['original','gdino'].map(mode=>{
+                        const hasGdino = gdinoRallies.includes(selRally);
+                        const disabled = mode==='gdino' && !hasGdino;
+                        const active   = skelMode===mode;
+                        return (
+                          <button key={mode}
+                            onClick={()=>!disabled && setSkelMode(mode)}
+                            title={disabled?'Run Section 7 of notebook 02 to extract GDINO skeletons for this rally':''}
+                            style={{padding:'4px 10px',borderRadius:4,fontSize:9,fontFamily:M,
+                              cursor:disabled?'not-allowed':'pointer',border:'none',
+                              background:active?'#3b82f6':'#1e293b',
+                              color:active?'#fff':disabled?'#334155':'#94a3b8',
+                              opacity:disabled?0.5:1,transition:'all 0.15s'}}>
+                            {mode==='original'?'Original YOLOv8':`GDINO-guided${!hasGdino?' (not extracted)':''}`}
+                          </button>
+                        );
+                      })}
+                      {skelMode==='gdino' && gdinoRallies.includes(selRally) && (
+                        <span style={{fontSize:8,color:'#10b981',fontFamily:M}}>
+                          ● GDINO filter active — chair umpire excluded
+                        </span>
+                      )}
+                    </div>
+                    <RealFrameCanvas shot={currentShot} width={760} height={427}
+                      frameNum={scrubFrame} rallyMeta={rallyMeta} skelMode={skelMode}
+                      hitterOverride={frameHitter}/>
+                    <RallyScrubber
+                      rallyMeta={rallyMeta}
+                      currentShot={currentShot}
+                      scrubFrame={scrubFrame}
+                      onScrub={fn => setScrubFrame(fn)}
+                      onShotJump={s => {
+                        const idx = rallyShots.findIndex(x=>x.id===s.id);
+                        if(idx >= 0) { setSelShotIdx(idx); setScrubFrame(null); }
+                      }}/>
+
+                    {/* Excluded disclaimer banner */}
+                    {currentShot.excluded && (
+                      <div style={{marginTop:8,padding:'8px 12px',
+                        background:'#f59e0b11',border:'1px solid #f59e0b44',borderRadius:6,
+                        display:'flex',alignItems:'flex-start',gap:8}}>
+                        <span style={{fontSize:14,flexShrink:0}}>⚠</span>
+                        <div>
+                          <div style={{fontSize:10,color:'#f59e0b',fontFamily:M,fontWeight:600,marginBottom:2}}>
+                            Annotation-only strategy — not used in the model</div>
+                          <div style={{fontSize:9,color:'#92400e',fontFamily:M,lineHeight:1.6}}>
+                            <strong style={{color:'#fbbf24'}}>{STRAT[currentShot.strategy].label}</strong> cannot be
+                            reliably inferred from skeleton kinematics alone — it requires intent/context beyond
+                            what 2D joint positions encode. It is present in the raw annotations for reference
+                            but is excluded from ProtoNet training and evaluation.
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Metadata row */}
+                    <div style={{display:'grid',gridTemplateColumns:`repeat(${currentShot.excluded?3:5},1fr)`,gap:8,marginTop:8}}>
+                      {[
+                        ['Strategy',  STRAT[currentShot.strategy].label, STRAT[currentShot.strategy].color],
+                        ['Shot type', currentShot.hit_type, '#e2e8f0'],
+                        ['Hitter',    currentShot.hitter,   '#e2e8f0'],
+                        ...(!currentShot.excluded ? [
+                          ['Confidence',`${(currentShot.conf*100).toFixed(0)}%`, currentShot.conf>.75?'#10b981':'#f59e0b'],
+                          ['Margin',   `${(currentShot.margin*100).toFixed(0)}%`,currentShot.margin>.15?'#10b981':'#ef4444'],
+                        ] : []),
+                      ].map(([l,v,c])=>(
+                        <div key={l} style={{background:'#0f172a',borderRadius:6,padding:'8px 10px',
+                          border:'1px solid #1e293b',textAlign:'center'}}>
+                          <div style={{fontSize:7,color:'#64748b',fontFamily:M,marginBottom:3}}>{l}</div>
+                          <div style={{fontSize:12,fontWeight:600,fontFamily:M,color:c}}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Pipeline note */}
+                    <div style={{marginTop:8,padding:'8px 12px',background:'#1e293b',borderRadius:6,
+                      fontSize:9,color:'#64748b',fontFamily:M,lineHeight:1.7}}>
+                      {currentShot.excluded
+                        ? <>Frame → YOLOv8-Pose (17 joints × 2 players) → skeleton extracted for visualisation only ·
+                          &nbsp;<span style={{color:'#f59e0b'}}>strategy label from annotation, not predicted by model</span></>
+                        : <>Frame → YOLOv8-Pose (17 joints × 2 players) → hitter-first reorder → T=16 window →
+                          Feature eng. L2 → ST-GCN (34 nodes) → ProtoNet 5-way →&nbsp;
+                          <span style={{color:STRAT[currentShot.strategy].color}}>
+                            {STRAT[currentShot.strategy].label}
+                          </span></>
+                      }
+                    </div>
+                  </>
+                ) : (
+                  <div style={{background:'#0f172a',borderRadius:10,border:'1px solid #1e293b',
+                    padding:40,textAlign:'center',color:'#475569',fontSize:12}}>
+                    Select a shot from the list</div>
+                )}
+              </div>
+
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB: PREPROCESSING ───────────────────────────────────────────────────────
+function PreprocessingTab() {
+  const [step, setStep] = useState(0);
+  const [showInterPlayer, setShowInterPlayer] = useState(true);
+  const [featureLayer, setFeatureLayer] = useState('L2');
+
+  const steps = [
+    { id:'pose',   label:'Pose Extraction',      icon:'🦴' },
+    { id:'hitter', label:'Hitter Identification', icon:'🎯' },
+    { id:'features',label:'Feature Engineering', icon:'🔧' },
+    { id:'graph',  label:'Graph Construction',   icon:'🕸' },
+  ];
+
+  const FDIMS = {L0:2,L1:6,L2:9,L3:12};
+  const FLABELS = {
+    L0:['x','y'],
+    L1:['x','y','vx','vy','ax','ay'],
+    L2:['x','y','vx','vy','ax','ay','dist_net','dist_center','dist_opp'],
+    L3:['x','y','vx','vy','ax','ay','dist_net','dist_center','dist_opp','elbow_ang','sho_ang','knee_ang'],
+  };
+
+  return (
+    <div style={{padding:20}}>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+          DATA PIPELINE · PHASE B</div>
+        <div style={{fontSize:22,fontFamily:IS,fontStyle:'italic'}}>Preprocessing Pipeline</div>
+      </div>
+      {/* Step nav */}
+      <div style={{display:'flex',gap:8,marginBottom:20,flexWrap:'wrap'}}>
+        {steps.map((s,i)=>(
+          <button key={i} onClick={()=>setStep(i)}
+            style={{background:step===i?'#1e293b':'transparent',
+              border:`1px solid ${step===i?'#FF6B35':'#334155'}`,
+              color:step===i?'#f8fafc':'#94a3b8',padding:'7px 14px',borderRadius:8,
+              fontSize:12,cursor:'pointer',display:'flex',alignItems:'center',gap:6}}>
+            <span>{s.icon}</span><span>{s.label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Step 0: Pose Extraction */}
+      {step===0 && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+          <Panel title="YOLOv8-Pose Output (17 COCO Joints × 2 Players)">
+            <div style={{display:'flex',gap:20,justifyContent:'center',marginTop:8}}>
+              <div style={{textAlign:'center'}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>PLAYER 1</div>
+                <SkelSVG pose={POSES.smash} color="#60a5fa" w={130} h={160} showLabels={true}/>
+                <div style={{fontSize:9,color:'#475569',fontFamily:M,marginTop:4}}>conf: 0.94</div>
+              </div>
+              <div style={{textAlign:'center'}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>PLAYER 2</div>
+                <SkelSVG pose={POSES.defensive} color="#f472b6" w={130} h={160} showLabels={true}/>
+                <div style={{fontSize:9,color:'#475569',fontFamily:M,marginTop:4}}>conf: 0.91</div>
+              </div>
+            </div>
+            <div style={{marginTop:12,padding:'8px 12px',background:'#0a0f1a',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>RAW KEYPOINTS (sample, joint 5 = L_Shoulder)</div>
+              <CodeBlock>{`# (2, T, 34) numpy array
+# shape: (num_players, frames, joints)
+skel[0, 8, 5]  → [0.34, 0.22]  # P1, frame 8, L_Shoulder (x,y)
+skel[1, 8, 5]  → [0.68, 0.71]  # P2, frame 8, L_Shoulder (x,y)
+# Normalized to [0,1] in frame coords`}</CodeBlock>
+            </div>
+          </Panel>
+          <Panel title="Extraction Config (src/data/pose_extractor.py)">
+            <ConfigTable rows={[
+              ['Model','yolov8x-pose'],['Conf threshold','0.30'],
+              ['Batch size','32 frames'],['Kalman smoothing','✓ enabled'],
+              ['Top-2 detect','by confidence'],['Sort players','by Y position (top/bottom)'],
+              ['Output shape','(2, T, 34)'],['Coords','normalized [0,1]'],
+            ]}/>
+            <div style={{marginTop:10,padding:'8px 10px',background:'#0a0f1a',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>LIMB COLOR KEY</div>
+              <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+                {[['Head','#f59e0b'],['L-side','#3b82f6'],['R-side','#ef4444'],['Torso','#94a3b8']].map(([l,c])=>(
+                  <div key={l} style={{display:'flex',alignItems:'center',gap:4}}>
+                    <div style={{width:14,height:3,background:c,borderRadius:2}}/>
+                    <span style={{fontSize:9,color:'#64748b',fontFamily:M}}>{l}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* Step 1: Hitter Identification */}
+      {step===1 && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+          <Panel title="Hitter Detection Logic">
+            <div style={{fontSize:11,color:'#94a3b8',lineHeight:1.8,marginBottom:12}}>
+              FineBadminton provides explicit hitter annotations. ShuttleSet uses shuttle
+              trajectory direction to infer which player struck last.
+            </div>
+            <CodeBlock>{`# dataset.py → _reorder_hitter_first()
+# Ensures hitter's joints are always nodes 0–16
+
+if hitter_id == 1:
+    # P1 is hitter: nodes [0..16]=P1, [17..33]=P2
+    skel_ordered = skel  # no change
+else:
+    # P2 is hitter: swap player order
+    skel_ordered = np.concatenate([
+        skel[1:2, ...],   # P2 → nodes 0–16
+        skel[0:1, ...],   # P1 → nodes 17–33
+    ], axis=0)
+
+# ShuttleSet fallback: use Y-position
+# top player (smaller y) = player 1
+# bottom player (larger y) = player 2`}</CodeBlock>
+            <div style={{marginTop:10,padding:'8px 10px',background:'#FF6B3511',
+              border:'1px solid #FF6B3533',borderRadius:6}}>
+              <div style={{fontSize:10,color:'#FF6B35',fontFamily:M,marginBottom:4}}>⚡ SENSE-CHECK</div>
+              <div style={{fontSize:11,color:'#fca5a5',lineHeight:1.6}}>
+                Verify that after reordering, nodes 0–16 always correspond to the hitting player.
+                ST-GCN exploits this positional consistency.
+              </div>
+            </div>
+          </Panel>
+          <Panel title="Visual: Before vs After Reorder">
+            <div style={{display:'flex',gap:12,justifyContent:'center',marginBottom:8}}>
+              <div style={{textAlign:'center'}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>BEFORE (raw order)</div>
+                <div style={{position:'relative'}}>
+                  <SkelSVG pose={POSES.neutral} color="#64748b" w={100} h={120}/>
+                  <div style={{position:'absolute',top:4,left:4,fontSize:7,color:'#ef4444',fontFamily:M}}>
+                    P1 (non-hitter)</div>
+                </div>
+                <div style={{position:'relative',marginTop:4}}>
+                  <SkelSVG pose={POSES.smash} color="#64748b" w={100} h={120}/>
+                  <div style={{position:'absolute',top:4,left:4,fontSize:7,color:'#10b981',fontFamily:M}}>
+                    P2 (hitter)</div>
+                </div>
+              </div>
+              <div style={{display:'flex',alignItems:'center',fontSize:20,color:'#FF6B35'}}>→</div>
+              <div style={{textAlign:'center'}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>AFTER (hitter-first)</div>
+                <div style={{position:'relative'}}>
+                  <SkelSVG pose={POSES.smash} color="#10b981" w={100} h={120}/>
+                  <div style={{position:'absolute',top:4,left:4,fontSize:7,color:'#10b981',fontFamily:M}}>
+                    nodes 0–16 ✓</div>
+                </div>
+                <div style={{position:'relative',marginTop:4}}>
+                  <SkelSVG pose={POSES.neutral} color="#475569" w={100} h={120}/>
+                  <div style={{position:'absolute',top:4,left:4,fontSize:7,color:'#475569',fontFamily:M}}>
+                    nodes 17–33</div>
+                </div>
+              </div>
+            </div>
+            <ConfigTable rows={[
+              ['FineBadminton','Explicit annotation (100% accurate)'],
+              ['ShuttleSet','Trajectory direction inference'],
+              ['Shot window','T=16 frames centered on hit'],
+              ['Temporal offset','hit event at frame 8 (center)'],
+            ]}/>
+          </Panel>
+        </div>
+      )}
+
+      {/* Step 2: Feature Engineering */}
+      {step===2 && (
+        <div>
+          <div style={{display:'flex',gap:8,marginBottom:14,alignItems:'center'}}>
+            <span style={{fontSize:10,color:'#64748b',fontFamily:M}}>FEATURE LAYER:</span>
+            {['L0','L1','L2','L3'].map(l=>(
+              <button key={l} onClick={()=>setFeatureLayer(l)}
+                style={{background:featureLayer===l?'#FF6B35':'#1e293b',
+                  border:`1px solid ${featureLayer===l?'#FF6B35':'#334155'}`,
+                  color:featureLayer===l?'#fff':'#94a3b8',padding:'4px 12px',
+                  borderRadius:6,fontSize:11,fontFamily:M,cursor:'pointer'}}>
+                {l} <span style={{fontSize:9,opacity:0.7}}>({FDIMS[l]}-d)</span>
+              </button>
+            ))}
+          </div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+            <Panel title={`${featureLayer} Features (${FDIMS[featureLayer]}-dim per joint)`}>
+              <div style={{display:'flex',flexDirection:'column',gap:3,marginBottom:10}}>
+                {FLABELS[featureLayer].map((f,i)=>(
+                  <div key={f} style={{display:'flex',alignItems:'center',gap:8,padding:'4px 8px',
+                    borderRadius:4,background:i<2?'#10b98122':i<6?'#3b82f622':i<9?'#A855F722':'#FFE66D22',
+                    border:`1px solid ${i<2?'#10b98133':i<6?'#3b82f633':i<9?'#A855F733':'#FFE66D33'}`}}>
+                    <span style={{width:16,height:16,borderRadius:3,display:'flex',
+                      alignItems:'center',justifyContent:'center',fontSize:8,fontFamily:M,
+                      color:'#fff',background:i<2?'#10b981':i<6?'#3b82f6':i<9?'#A855F7':'#FFE66D'}}>
+                      {i}</span>
+                    <span style={{fontSize:10,fontFamily:M,color:'#e2e8f0'}}>{f}</span>
+                    <span style={{marginLeft:'auto',fontSize:9,color:'#475569',fontFamily:M}}>
+                      {i<2?'raw coord':i<4?'1st deriv':i<6?'2nd deriv':i<9?'court-rel':'angle (°)'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div style={{padding:'8px 10px',background:'#0a0f1a',borderRadius:6,marginTop:8}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>
+                  TENSOR SHAPE: (B, {FDIMS[featureLayer]}, T, V)</div>
+                <div style={{fontSize:9,color:'#94a3b8',fontFamily:M}}>
+                  B=batch · {FDIMS[featureLayer]}=channels · T=16 frames · V=34 joints
+                  <br/>Total params per shot: {FDIMS[featureLayer]*16*34} values
+                </div>
+              </div>
+            </Panel>
+            <Panel title="Feature Engineering (src/data/feature_eng.py)">
+              <CodeBlock>{`class FeatureEngineer:
+  def compute(self, skel, layer='${featureLayer}'):
+    # skel: (2, T, 34) raw coords [0,1]
+
+    # L0: raw normalized coords
+    feats = skel  # (2, T, 34, 2)
+
+    ${featureLayer>='L1'?`# L1: add velocity + acceleration
+    vel = np.diff(skel, axis=1, prepend=skel[:,0:1])
+    acc = np.diff(vel,  axis=1, prepend=vel[:,0:1])
+    feats = concat([feats, vel, acc], axis=-1)`:''}
+    ${featureLayer>='L2'?`
+    # L2: add court-relative distances
+    dist_net    = joint_y_dist_to_net(skel)
+    dist_center = joint_dist_to_center(skel)
+    dist_opp    = dist_to_opponent_joints(skel)
+    feats = concat([feats, dist_net, dist_center, dist_opp])`:''}
+    ${featureLayer>='L3'?`
+    # L3: add joint angles (biomechanics)
+    elbow_ang = angle_triplet(shoulder, elbow, wrist)
+    sho_ang   = angle_triplet(neck, shoulder, elbow)
+    knee_ang  = angle_triplet(hip, knee, ankle)
+    feats = concat([feats, elbow_ang, sho_ang, knee_ang])`:''}
+
+    # → (B, ${FDIMS[featureLayer]}, T, V) for ST-GCN
+    return feats.transpose(0,3,1,2)`}</CodeBlock>
+            </Panel>
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Graph Construction */}
+      {step===3 && (
+        <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16}}>
+          <div>
+            <Panel title="34-Node Dual-Player Graph">
+              <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+                <label style={{fontSize:10,color:'#94a3b8',display:'flex',gap:6,alignItems:'center',cursor:'pointer'}}>
+                  <input type="checkbox" checked={showInterPlayer} onChange={e=>setShowInterPlayer(e.target.checked)}
+                    style={{accentColor:'#A855F7'}}/>
+                  Show inter-player edges
+                </label>
+              </div>
+              <GraphViz showInterPlayer={showInterPlayer} size={340}/>
+              <div style={{marginTop:8,display:'flex',gap:10,flexWrap:'wrap'}}>
+                {[['Intra (COCO)','#3b82f6','─'],['Torso','#94a3b8','─'],['Inter-player','#a78bfa','···']].map(([l,c,d])=>(
+                  <div key={l} style={{display:'flex',alignItems:'center',gap:4}}>
+                    <span style={{color:c,fontFamily:M,fontSize:12}}>{d}</span>
+                    <span style={{fontSize:9,color:'#64748b',fontFamily:M}}>{l}</span>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+          </div>
+          <Panel title="Graph Builder (src/data/graph_builder.py)">
+            <ConfigTable rows={[
+              ['Total nodes','34 (17×2 players)'],
+              ['Intra edges','16 COCO edges × 2 = 32 directed'],
+              ['Inter edges','17 corresponding joint pairs'],
+              ['Partitions','3 (identity / centripetal / centrifugal)'],
+              ['Root node','Nose (joint 0)'],
+              ['Adjacency','(3, 34, 34) tensor'],
+              ['Normalisation','D⁻½ A D⁻½ per partition'],
+            ]}/>
+            <CodeBlock>{`# build_adjacency() → (3, V, V) tensor
+#
+# Partition 0: Identity (self-loops)
+#   A[i,i] = 1  for all i
+#
+# Partition 1: Centripetal (inward edges)
+#   A[i,j]=1 if dist[j] < dist[i]
+#   (j is closer to nose root)
+#
+# Partition 2: Centrifugal (outward edges)
+#   A[i,j]=1 if dist[j] >= dist[i]
+#
+# ST-GCN learns separate edge weights
+# for each partition → Theta_k matrices`}</CodeBlock>
+            <div style={{marginTop:8,padding:'6px 10px',background:'#A855F711',border:'1px solid #A855F733',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#A855F7',fontFamily:M}}>ABLATION: No inter-player edges</div>
+              <div style={{fontSize:10,color:'#94a3b8',marginTop:2}}>
+                Drops 17 inter-player edges → 34-node graph becomes 2 disconnected 17-node subgraphs.
+                Macro-F1 drops from 68.2% → 64.1% (see Ablations tab).
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB: TRAINING ────────────────────────────────────────────────────────────
+function TrainingTab() {
+  const [activeView, setActiveView] = useState('ssl');
+  const maxF1 = Math.max(...ABLATIONS.map(a=>a.f1));
+
+  // Per-fold data (macro-F1 per epoch for 5 folds)
+  const foldCurves = FOLD_ACC.map((f,fi)=>{
+    const base = 35;
+    return Array.from({length:50},(_,i)=>{
+      const t=i/49;
+      const final = Object.values(f).slice(1).reduce((a,b)=>a+b,0)/5;
+      return base+(final-base)*Math.pow(t,0.45)+Math.sin(i*0.7+fi)*(1-t)*3;
+    });
+  });
+
+  const views = [
+    {id:'ssl',   label:'SSL Pre-Training'},
+    {id:'fewshot',label:'Few-Shot Training'},
+    {id:'ablations',label:'Ablations'},
+    {id:'matrix', label:'Confusion Matrix'},
+  ];
+
+  return (
+    <div style={{padding:20}}>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+          TRAINING · NOTEBOOKS 03 + 04 + 05</div>
+        <div style={{fontSize:22,fontFamily:IS,fontStyle:'italic'}}>Model Training</div>
+      </div>
+      <div style={{display:'flex',gap:8,marginBottom:20}}>
+        {views.map(v=>(
+          <button key={v.id} onClick={()=>setActiveView(v.id)}
+            style={{background:activeView===v.id?'#1e293b':'transparent',
+              border:`1px solid ${activeView===v.id?'#FF6B35':'#334155'}`,
+              color:activeView===v.id?'#f8fafc':'#94a3b8',padding:'7px 16px',
+              borderRadius:8,fontSize:12,cursor:'pointer'}}>
+            {v.label}
+          </button>
+        ))}
+      </div>
+
+      {/* SSL Pre-training */}
+      {activeView==='ssl' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+          <Panel title="SimCLR NT-Xent Loss (notebook 03)">
+            <LineChart data={SSL_LOSS} color="#FF6B35" label="NT-Xent loss (τ=0.07)"
+              w={380} h={180} yLabel="Loss" xLabel="Epoch" yMin={0.4} yMax={3.0}/>
+            <div style={{marginTop:8,display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+              {[['Epochs','100'],['Batch','64'],['Temp τ','0.07'],['Proj dim','128'],
+                ['LR','1e-3'],['Warmup','10 ep'],['Augments','jitter+mask+crop+rot'],['Dataset','ShuttleSet']].map(([k,v])=>(
+                <div key={k} style={{padding:'4px 8px',background:'#0a0f1a',borderRadius:4}}>
+                  <div style={{fontSize:8,color:'#64748b',fontFamily:M}}>{k}</div>
+                  <div style={{fontSize:10,color:'#e2e8f0',fontFamily:M}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+          <Panel title="Augmentation Pipeline">
+            <div style={{display:'flex',gap:8,justifyContent:'space-around',marginBottom:12}}>
+              {['jitter\n±0.01','mask\n15%','t-crop\n80%min','rotate\n±15°'].map((a,i)=>(
+                <div key={i} style={{textAlign:'center',padding:'8px 12px',background:'#0a0f1a',
+                  borderRadius:6,border:'1px solid #1e293b',minWidth:70}}>
+                  <div style={{fontSize:10,color:'#FF6B35',fontFamily:M,whiteSpace:'pre-line',lineHeight:1.4}}>{a}</div>
+                </div>
+              ))}
+            </div>
+            <CodeBlock>{`# simclr_loss.py
+# Two augmented views of same skeleton
+view_1 = augment(skel)  # jitter+mask+crop
+view_2 = augment(skel)  # different seed
+
+z1 = projhead(encoder(view_1))  # (B, 128)
+z2 = projhead(encoder(view_2))  # (B, 128)
+
+loss = NT_Xent(z1, z2, temperature=0.07)
+# Positives: (z1[i], z2[i]) same skeleton
+# Negatives: all other pairs in batch`}</CodeBlock>
+            <div style={{marginTop:8,padding:'6px 10px',background:'#10b98111',
+              border:'1px solid #10b98133',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#10b981',fontFamily:M}}>SSL saves to: models/ssl_pretrained.pt</div>
+              <div style={{fontSize:10,color:'#94a3b8',marginTop:2}}>
+                Contains encoder_state_dict + projection_head. ProtoNet training loads this → +6.7% macro-F1 vs. random init.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* Few-shot training */}
+      {activeView==='fewshot' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+          <Panel title="K-Shot Accuracy Curve (5-way, 5-fold CV)">
+            <LineChart data={KSHOT_ACC.map(d=>d.acc)} color="#4ECDC4"
+              label="Macro-F1 (%)" w={380} h={180} yLabel="Macro-F1 %" xLabel="K (support per class)"
+              yMin={40} yMax={78}/>
+            <div style={{marginTop:4,display:'flex',gap:4,flexWrap:'wrap'}}>
+              {KSHOT_ACC.map(d=>(
+                <div key={d.k} style={{padding:'3px 8px',background:'#0a0f1a',borderRadius:4,
+                  border:'1px solid #1e293b',textAlign:'center'}}>
+                  <div style={{fontSize:8,color:'#64748b',fontFamily:M}}>K={d.k}</div>
+                  <div style={{fontSize:10,color:'#4ECDC4',fontFamily:M}}>{d.acc.toFixed(1)}%</div>
+                  <div style={{fontSize:7,color:'#475569',fontFamily:M}}>±{d.std}</div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+          <Panel title="5-Fold Cross-Validation Results (K=10)">
+            <div style={{marginBottom:8}}>
+              {FOLD_ACC.map((fold,fi)=>(
+                <div key={fi} style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
+                  <span style={{fontSize:9,color:'#64748b',fontFamily:M,width:30}}>F{fold.fold}</span>
+                  <div style={{flex:1,height:18,background:'#1e293b',borderRadius:3,overflow:'hidden',position:'relative'}}>
+                    {Object.entries(STRAT).map(([k,{color}],i)=>{
+                      const vals=Object.entries(fold).slice(1);
+                      const wFrac=1/vals.length;
+                      return (
+                        <div key={k} style={{position:'absolute',left:`${i*wFrac*100}%`,
+                          top:0,width:`${wFrac*100}%`,height:'100%',
+                          background:`${color}${Math.round(fold[k]*2.55).toString(16).padStart(2,'0')}`}}>
+                          <div style={{height:`${fold[k]/100*100}%`,background:color,marginTop:`${(100-fold[k])/100*100}%`}}/>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <span style={{fontSize:9,color:'#94a3b8',fontFamily:M,width:40,textAlign:'right'}}>
+                    {(Object.values(fold).slice(1).reduce((a,b)=>a+b,0)/5).toFixed(1)}%
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:6}}>
+              {Object.entries(STRAT).map(([k,{color,label}])=>(
+                <div key={k} style={{display:'flex',alignItems:'center',gap:4}}>
+                  <div style={{width:8,height:8,borderRadius:'50%',background:color}}/>
+                  <span style={{fontSize:8,color:'#94a3b8',fontFamily:M}}>{label}</span>
+                </div>
+              ))}
+            </div>
+            <ConfigTable rows={[['N-way','5'],['K-shot','10'],['N-query','5 per class'],['Optimizer','Adam 1e-4'],
+              ['Enc LR scale','×0.1 (fine-tune)'],['Episodes','100/epoch'],['Epochs','50'],
+              ['Distance','Euclidean']]} mt={10}/>
+          </Panel>
+        </div>
+      )}
+
+      {/* Ablations */}
+      {activeView==='ablations' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:16}}>
+          <Panel title="Ablation Study — Macro-F1 (%) on FineBadminton (K=10, 5-fold)">
+            <div style={{display:'flex',flexDirection:'column',gap:8,marginTop:8}}>
+              {ABLATIONS.map((a,i)=>(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:10}}>
+                  <div style={{width:220,fontSize:10,color:i===0?'#f8fafc':'#94a3b8',
+                    fontFamily:M,textAlign:'right',flexShrink:0}}>{a.name}</div>
+                  <div style={{flex:1,height:22,background:'#1e293b',borderRadius:4,overflow:'hidden',
+                    position:'relative'}}>
+                    <div style={{width:`${(a.f1/maxF1)*100}%`,height:'100%',
+                      background:i===0?`linear-gradient(90deg,${a.color}99,${a.color})`:a.color,
+                      borderRadius:4,transition:'width .6s'}}/>
+                    <div style={{position:'absolute',left:'50%',top:'50%',transform:'translate(-50%,-50%)',
+                      fontSize:9,fontFamily:M,color:i===0?'#fff':'#e2e8f0',whiteSpace:'nowrap'}}>
+                      F1: {a.f1}%
+                    </div>
+                  </div>
+                  <div style={{width:80,display:'flex',gap:4}}>
+                    <span style={{fontSize:9,color:'#64748b',fontFamily:M}}>P:{a.prec}</span>
+                    <span style={{fontSize:9,color:'#64748b',fontFamily:M}}>R:{a.rec}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{marginTop:12,padding:'8px 10px',background:'#0a0f1a',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:4}}>READING GUIDE</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:4}}>
+                {[['SSL ablation','Row 1 vs Row 3: +6.7% from SSL pre-training'],
+                  ['Inter-player','Row 1 vs Row 4: +4.1% from cross-player edges'],
+                  ['Architecture','Row 1 vs Row 5: ST-GCN > Transformer by 2.9%'],
+                  ['Feature layer','Row 1 vs Rows 6-7: richer features = +13%']].map(([k,v])=>(
+                  <div key={k} style={{padding:'4px 6px',background:'#1e293b',borderRadius:4}}>
+                    <div style={{fontSize:8,color:'#FF6B35',fontFamily:M}}>{k}</div>
+                    <div style={{fontSize:9,color:'#94a3b8'}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+          <div style={{width:180}}>
+            <Panel title="Config Reference">
+              <CodeBlock>{`# config.py
+AblationConfig(
+  use_spatial=True,
+  use_temporal=True,
+  use_inter_player=True,
+  use_pretrained=True,
+  use_auxiliary=True,
+  encoder='stgcn',
+  feature_layer='L2',
+  classifier='protonet',
+)`}</CodeBlock>
+            </Panel>
+          </div>
+        </div>
+      )}
+
+      {/* Confusion Matrix */}
+      {activeView==='matrix' && (
+        <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:16}}>
+          <Panel title="Confusion Matrix (K=10, 5-fold avg, ~20 shots/strategy/fold)">
+            <ConfusionMatrix/>
+          </Panel>
+          <Panel title="Per-Strategy Performance">
+            <div style={{display:'flex',flexDirection:'column',gap:8}}>
+              {CM_CLASSES.map((s,i)=>{
+                const tp=CM_DATA[i][i];
+                const fp=CM_DATA.reduce((a,r,ri)=>ri!==i?a+r[i]:a,0);
+                const fn=CM_DATA[i].reduce((a,v,j)=>j!==i?a+v:a,0);
+                const prec=tp/(tp+fp)||0, rec=tp/(tp+fn)||0;
+                const f1=2*prec*rec/(prec+rec)||0;
+                return (
+                  <div key={s} style={{background:'#0a0f1a',borderRadius:6,padding:'8px 10px',
+                    border:`1px solid ${STRAT[s].color}33`}}>
+                    <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}>
+                      <span style={{fontSize:13}}>{STRAT[s].icon}</span>
+                      <span style={{fontSize:10,color:STRAT[s].color,fontFamily:M,fontWeight:600}}>{STRAT[s].label}</span>
+                      <span style={{marginLeft:'auto',fontSize:11,fontFamily:M,color:f1>0.75?'#10b981':'#f59e0b'}}>
+                        F1: {(f1*100).toFixed(0)}%</span>
+                    </div>
+                    <div style={{display:'flex',gap:4}}>
+                      {[['Prec',(prec*100).toFixed(0)+'%','#3b82f6'],['Rec',(rec*100).toFixed(0)+'%','#f59e0b'],
+                        ['TP',tp,'#10b981'],['FP',fp,'#ef4444'],['FN',fn,'#ef4444']].map(([l,v,c])=>(
+                        <div key={l} style={{background:'#1e293b',borderRadius:3,padding:'2px 6px',
+                          fontSize:9,fontFamily:M}}>
+                          <span style={{color:'#64748b'}}>{l}: </span><span style={{color:c}}>{v}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{marginTop:10,padding:'6px 10px',background:'#FFE66D11',border:'1px solid #FFE66D33',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#FFE66D',fontFamily:M}}>NOTE: "passive" has lowest F1</div>
+              <div style={{fontSize:10,color:'#94a3b8',marginTop:2}}>
+                Passive shots overlap with defensive/create_depth in embedding space — player
+                position ambiguous. Margin scores below 0.15 should trigger human review.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB: PREDICTIONS ────────────────────────────────────────────────────────
+function PredictionsTab() {
+  const [sel, setSel] = useState(0);
+  const d = RALLY[sel];
+  const sc = {};
+  RALLY.forEach(s=>{ sc[s.strategy]=(sc[s.strategy]||0)+1; });
+  const dom = Object.entries(sc).sort((a,b)=>b[1]-a[1])[0][0];
+  const avgC = RALLY.reduce((a,s)=>a+s.conf,0)/RALLY.length;
+
+  return (
+    <div style={{display:'flex',height:'calc(100vh - 160px)'}}>
+      {/* Left: shot list */}
+      <div style={{width:280,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column',flexShrink:0}}>
+        <div style={{padding:'10px 12px',borderBottom:'1px solid #1e293b'}}>
+          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:6}}>RALLY SUMMARY</div>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:4,marginBottom:8}}>
+            {[{v:RALLY.length,l:'shots',c:'#e2e8f0'},
+              {v:`${(avgC*100).toFixed(0)}%`,l:'avg conf',c:avgC>.75?'#10b981':'#f59e0b'},
+              {v:RALLY.filter(s=>s.margin<0.15).length,l:'flagged',c:'#ef4444'},
+            ].map(({v,l,c},i)=>(
+              <div key={i} style={{background:'#0f172a',borderRadius:6,padding:'6px 8px',border:'1px solid #1e293b'}}>
+                <div style={{fontSize:16,fontWeight:700,fontFamily:M,color:c}}>{v}</div>
+                <div style={{fontSize:7,color:'#64748b'}}>{l}</div>
+              </div>
+            ))}
+          </div>
+          {/* Strategy distribution bar */}
+          <div style={{display:'flex',height:5,borderRadius:3,overflow:'hidden'}}>
+            {Object.entries(sc).sort((a,b)=>b[1]-a[1]).map(([s,c])=>(
+              <div key={s} style={{width:`${(c/RALLY.length)*100}%`,background:STRAT[s].color}}/>
+            ))}
+          </div>
+        </div>
+        <div style={{flex:1,overflowY:'auto'}}>
+          {RALLY.map((s,i)=>(
+            <div key={i} onClick={()=>setSel(i)}
+              style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',cursor:'pointer',
+                background:sel===i?'#1e293b':'transparent',
+                borderLeft:sel===i?`3px solid ${STRAT[s.strategy].color}`:'3px solid transparent',
+                borderBottom:'1px solid #1e293b22',transition:'all .15s'}}>
+              <div style={{width:26,height:26,borderRadius:5,flexShrink:0,display:'flex',
+                alignItems:'center',justifyContent:'center',fontSize:13,
+                background:`${STRAT[s.strategy].color}22`}}>
+                {STRAT[s.strategy].icon}
+              </div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:'flex',alignItems:'center',gap:4,flexWrap:'wrap'}}>
+                  <span style={{fontSize:11,fontWeight:500}}>Shot {i+1}</span>
+                  <span style={{fontSize:10,color:STRAT[s.strategy].color,fontFamily:M}}>
+                    {STRAT[s.strategy].label}</span>
+                  <span style={{fontSize:9,color:'#64748b',fontFamily:M,background:'#1e293b',
+                    padding:'1px 4px',borderRadius:3}}>{s.shot}</span>
+                  {s.margin<0.15&&<span style={{fontSize:8,background:'#ef444433',color:'#fca5a5',
+                    padding:'1px 4px',borderRadius:3,fontFamily:M}}>LOW</span>}
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:4,marginTop:2}}>
+                  <div style={{flex:1,height:3,background:'#1e293b',borderRadius:2,overflow:'hidden'}}>
+                    <div style={{width:`${s.conf*100}%`,height:'100%',background:STRAT[s.strategy].color}}/>
+                  </div>
+                  <span style={{fontSize:9,color:'#64748b',fontFamily:M,width:28,textAlign:'right'}}>
+                    {(s.conf*100).toFixed(0)}%</span>
+                </div>
+              </div>
+              <span style={{fontSize:9,color:'#475569',fontFamily:M}}>P{s.hitter}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Right: details */}
+      <div style={{flex:1,overflowY:'auto',padding:18}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
+          <div>
+            <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+              SHOT {d.shotNumber||sel+1} OF {RALLY.length} · PLAYER {d.hitter} · T=16 FRAMES</div>
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              <span style={{fontSize:28,fontFamily:IS,fontStyle:'italic',color:STRAT[d.strategy].color}}>
+                {STRAT[d.strategy].label}</span>
+              <span style={{fontSize:24}}>{STRAT[d.strategy].icon}</span>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6,marginTop:4}}>
+              <div style={{background:'#1e293b',border:'1px solid #334155',borderRadius:6,
+                padding:'3px 10px',fontSize:11,fontFamily:M}}>
+                <span style={{color:'#94a3b8'}}>Shot type: </span>
+                <span style={{color:'#f8fafc',fontWeight:500}}>{d.shot}</span>
+              </div>
+            </div>
+          </div>
+          {d.margin<0.15&&(
+            <div style={{background:'#ef444422',border:'1px solid #ef444444',borderRadius:8,
+              padding:'8px 12px',fontSize:11,color:'#fca5a5',maxWidth:200,lineHeight:1.5}}>
+              ⚠ Low margin ({(d.margin*100).toFixed(0)}%). Flag for human review.
+            </div>
+          )}
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+          {/* Prototype distances */}
+          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
+            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+              PROTOTYPE DISTANCES (ProtoNet)</div>
+            {Object.entries(STRAT).map(([k,{color,label,icon}])=>{
+              const isTop=k===d.strategy;
+              const PKEYS=Object.keys(STRAT);
+              const PFAKE=[0.28,0.20,0.16,0.22,0.14];
+              const pfSum=PFAKE.reduce((a,b)=>a+b,0)-PFAKE[PKEYS.indexOf(d.strategy)];
+              const barVal=isTop?d.conf:PFAKE[PKEYS.indexOf(k)]*(1-d.conf)/pfSum;
+              return (
+                <div key={k} style={{display:'flex',alignItems:'center',gap:6,marginBottom:5}}>
+                  <span style={{width:16,fontSize:11}}>{icon}</span>
+                  <span style={{width:88,fontSize:10,color:isTop?'#f8fafc':'#64748b',fontFamily:M,textAlign:'right'}}>
+                    {label}</span>
+                  <div style={{flex:1,height:13,background:'#1e293b',borderRadius:3,overflow:'hidden'}}>
+                    <div style={{width:`${barVal*100}%`,height:'100%',
+                      background:isTop?`linear-gradient(90deg,${color}99,${color})`:'#334155',
+                      borderRadius:3,transition:'width .6s'}}/>
+                  </div>
+                  <span style={{width:36,fontSize:10,color:isTop?'#f8fafc':'#475569',fontFamily:M}}>
+                    {(barVal*100).toFixed(0)}%</span>
+                </div>
+              );
+            })}
+            <div style={{marginTop:6,display:'flex',justifyContent:'space-between',fontSize:10,fontFamily:M}}>
+              <span style={{color:'#64748b'}}>Conf: <span style={{color:'#e2e8f0'}}>{(d.conf*100).toFixed(1)}%</span></span>
+              <span style={{color:'#64748b'}}>Margin: <span style={{color:d.margin<.15?'#ef4444':'#10b981'}}>
+                {(d.margin*100).toFixed(1)}%</span></span>
+            </div>
+          </div>
+
+          {/* Skeleton + features */}
+          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
+            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+              SKELETON · PLAYER {d.hitter} (Hitter-first reorder)</div>
+            <div style={{display:'flex',gap:10,alignItems:'flex-start'}}>
+              <div style={{background:'#0a0f1a',borderRadius:6,padding:4,border:'1px solid #1e293b',flexShrink:0}}>
+                <SkelSVG pose={getPose(d.strategy)} color={STRAT[d.strategy].color} w={100} h={120}/>
+              </div>
+              <div style={{flex:1}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+                  NODE FEATURES (L2)</div>
+                {[['Velocity','2.3 m/s'],['Dist to net','2.1 m'],['Dist to opp.','5.6 m'],
+                  ['Shoulder ∠','138°'],['Court pos.','Rear']].map(([l,v])=>(
+                  <div key={l} style={{display:'flex',justifyContent:'space-between',padding:'2px 0',
+                    borderBottom:'1px solid #1e293b33',fontSize:10}}>
+                    <span style={{color:'#64748b'}}>{l}</span>
+                    <span style={{fontFamily:M,color:'#e2e8f0'}}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* t-SNE embedding space */}
+          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
+            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+              EMBEDDING SPACE (t-SNE · 256→2d)</div>
+            <div style={{fontSize:9,color:'#475569',fontFamily:M,marginBottom:6}}>
+              Hover to highlight. Each point = one shot embedding. Clusters = strategy prototypes.</div>
+            <TSNEPlot highlighted={STRAT[d.strategy]?d.strategy:null} w={290} h={240}/>
+          </div>
+
+          {/* Rally flow */}
+          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b',
+            gridColumn:'span 2'}}>
+            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+              RALLY STRATEGY FLOW</div>
+            <div style={{display:'flex',gap:2,alignItems:'flex-end',height:50}}>
+              {RALLY.map((s,i)=>(
+                <div key={i} onClick={()=>setSel(i)}
+                  style={{flex:1,height:`${s.conf*100}%`,minHeight:6,borderRadius:'2px 2px 0 0',
+                    cursor:'pointer',transition:'all .2s',
+                    background:sel===i?STRAT[s.strategy].color:`${STRAT[s.strategy].color}88`}}
+                  title={`Shot ${i+1}: ${STRAT[s.strategy].label} (${s.shot})`}/>
+              ))}
+            </div>
+            <div style={{display:'flex',justifyContent:'space-between',marginTop:4,
+              fontSize:8,color:'#475569',fontFamily:M}}>
+              <span>1</span><span>Rally →</span><span>{RALLY.length}</span>
+            </div>
+            <div style={{marginTop:6,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <span style={{fontSize:10,color:'#64748b'}}>
+                Dominant: <span style={{color:STRAT[dom].color,fontWeight:600}}>
+                  {STRAT[dom].label}</span> ({sc[dom]}/{RALLY.length})
+              </span>
+              <span style={{fontSize:10,color:'#64748b'}}>
+                Avg conf: <span style={{color:avgC>.75?'#10b981':'#f59e0b',fontWeight:600}}>
+                  {(avgC*100).toFixed(0)}%</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SHARED COMPONENTS ────────────────────────────────────────────────────────
+function Panel({ title, children, mt=0 }) {
+  return (
+    <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b',marginTop:mt}}>
+      <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:10}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+function InfoCard({ title, children, mt=0 }) {
+  return (
+    <div style={{background:'#0f172a',borderRadius:8,padding:12,border:'1px solid #1e293b',marginTop:mt}}>
+      <div style={{fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+function CodeBlock({ children }) {
+  return (
+    <pre style={{background:'#020917',borderRadius:6,padding:'8px 10px',
+      fontSize:9,fontFamily:M,color:'#94a3b8',overflowX:'auto',lineHeight:1.6,
+      border:'1px solid #0f172a',whiteSpace:'pre-wrap',wordBreak:'break-all'}}>
+      {children}
+    </pre>
+  );
+}
+function ConfigTable({ rows, mt=0 }) {
+  return (
+    <div style={{marginTop:mt}}>
+      {rows.map(([k,v],i)=>(
+        <div key={i} style={{display:'flex',justifyContent:'space-between',padding:'4px 0',
+          borderBottom:'1px solid #1e293b22',fontSize:10}}>
+          <span style={{color:'#64748b',fontFamily:M}}>{k}</span>
+          <span style={{color:'#e2e8f0',fontFamily:M,textAlign:'right',maxWidth:'55%'}}>{v}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── PIPELINE FLOW DIAGRAM ────────────────────────────────────────────────────
+function PipelineFlow() {
+  const steps = [
+    { label:'Video', sub:'mp4/avi/mov', color:'#60a5fa', icon:'🎬' },
+    { label:'Court\nDetect', sub:'RANSAC homography', color:'#4ECDC4', icon:'📐' },
+    { label:'Shuttle\nTrack', sub:'TrackNetV3', color:'#f59e0b', icon:'🏸' },
+    { label:'Hit\nDetect', sub:'>90° trajectory', color:'#FF6B35', icon:'💥' },
+    { label:'Pose\nEstimate', sub:'YOLOv8-Pose', color:'#a78bfa', icon:'🦴' },
+    { label:'T=16\nSegment', sub:'±8 frames / hit', color:'#f472b6', icon:'✂' },
+    { label:'Feature\nEng.', sub:'L0→L3', color:'#FFE66D', icon:'🔧' },
+    { label:'ST-GCN\n256-d', sub:'9 blocks, 34 nodes', color:'#FF6B35', icon:'🧠' },
+    { label:'ProtoNet\n5-way', sub:'Euclidean dist.', color:'#10b981', icon:'🎯' },
+  ];
+  return (
+    <div style={{borderBottom:'1px solid #1e293b',padding:'10px 20px',overflowX:'auto',
+      background:'#0c1222'}}>
+      <div style={{display:'flex',alignItems:'center',gap:0,minWidth:700}}>
+        {steps.map((s,i)=>(
+          <React.Fragment key={i}>
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:3,
+              padding:'4px 8px',flexShrink:0}}>
+              <div style={{width:30,height:30,borderRadius:6,background:`${s.color}22`,
+                border:`1px solid ${s.color}55`,display:'flex',alignItems:'center',
+                justifyContent:'center',fontSize:14}}>{s.icon}</div>
+              <div style={{fontSize:8,color:s.color,fontFamily:M,textAlign:'center',
+                lineHeight:1.3,whiteSpace:'pre-line'}}>{s.label}</div>
+              <div style={{fontSize:7,color:'#475569',fontFamily:M,textAlign:'center',
+                maxWidth:60,lineHeight:1.2}}>{s.sub}</div>
+            </div>
+            {i<steps.length-1&&<div style={{flex:'0 0 16px',height:1,background:'#334155',
+              marginBottom:12}}><div style={{textAlign:'center',fontSize:8,color:'#334155',marginTop:-6}}>→</div></div>}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+// ─── t-SNE SCATTER PLOT ───────────────────────────────────────────────────────
+function TSNEPlot({ w=310, h=268, highlighted=null, onHover=null }) {
+  const pad={l:24,r:10,t:14,b:20};
+  const iw=w-pad.l-pad.r, ih=h-pad.t-pad.b;
+  const px=x=>pad.l+x*iw, py=y=>pad.t+y*ih;
+  return (
+    <svg width={w} height={h} style={{background:'#0a0f1a',borderRadius:8,border:'1px solid #1e293b',display:'block'}}>
+      {[0.25,0.5,0.75].map(t=>(
+        <g key={t}>
+          <line x1={px(t)} y1={pad.t} x2={px(t)} y2={pad.t+ih} stroke="#1e293b" strokeWidth={1}/>
+          <line x1={pad.l} y1={py(t)} x2={pad.l+iw} y2={py(t)} stroke="#1e293b" strokeWidth={1}/>
+        </g>
+      ))}
+      {TSNE_PTS.map((p,i)=>(
+        <circle key={i} cx={px(p.x)} cy={py(p.y)} r={highlighted===p.strat?5.5:3.5}
+          fill={p.color} opacity={!highlighted||highlighted===p.strat?0.82:0.18}
+          style={{cursor:'pointer',transition:'r .15s,opacity .15s'}}
+          onMouseEnter={()=>onHover&&onHover(p.strat)}
+          onMouseLeave={()=>onHover&&onHover(null)}/>
+      ))}
+      {Object.entries(TSNE_CLUSTERS).map(([s,{cx,cy,color}])=>(
+        <g key={s}>
+          <ellipse cx={px(cx)} cy={py(cy)} rx={iw*0.075} ry={ih*0.075}
+            fill="none" stroke={color} strokeWidth={1} strokeDasharray="3,2"
+            opacity={!highlighted||highlighted===s?0.5:0.1}/>
+          <text x={px(cx)} y={py(cy)-ih*0.085} textAnchor="middle"
+            fontSize={8} fill={color} fontFamily={M} fontWeight="600"
+            opacity={!highlighted||highlighted===s?1:0.3}>{STRAT[s].label}</text>
+        </g>
+      ))}
+      <text x={pad.l+iw/2} y={h-4} textAnchor="middle" fontSize={8} fill="#475569" fontFamily={M}>t-SNE dim 1</text>
+      <text x={10} y={pad.t+ih/2} textAnchor="middle" fontSize={8} fill="#475569" fontFamily={M}
+        transform={`rotate(-90,10,${pad.t+ih/2})`}>dim 2</text>
+    </svg>
+  );
+}
+
+// ─── CONFUSION MATRIX ─────────────────────────────────────────────────────────
+function ConfusionMatrix() {
+  const LABELS=['Intercept','Defensive','Move Net','Cr.Depth','Passive'];
+  const diagonalSum = CM_DATA.reduce((a,r,i)=>a+r[i],0);
+  const total       = CM_DATA.flat().reduce((a,b)=>a+b,0);
+  const maxOff = Math.max(...CM_DATA.flatMap((r,i)=>r.filter((_,j)=>j!==i)));
+  return (
+    <div>
+      <div style={{display:'flex',marginBottom:6,marginLeft:76}}>
+        {LABELS.map(l=>(
+          <div key={l} style={{width:52,fontSize:8,color:'#64748b',fontFamily:M,textAlign:'center',
+            writingMode:'vertical-rl',transform:'rotate(180deg)',height:44,paddingBottom:4}}>{l}</div>
+        ))}
+        <div style={{fontSize:8,color:'#475569',fontFamily:M,paddingLeft:6,alignSelf:'flex-end',paddingBottom:4}}>
+          ← predicted
+        </div>
+      </div>
+      {CM_DATA.map((row,i)=>(
+        <div key={i} style={{display:'flex',alignItems:'center',gap:2,marginBottom:2}}>
+          <div style={{width:72,fontSize:8,color:STRAT[CM_CLASSES[i]].color,fontFamily:M,
+            textAlign:'right',paddingRight:6,flexShrink:0}}>{LABELS[i]}</div>
+          {row.map((v,j)=>{
+            const isDiag=i===j;
+            const intens=isDiag?v/20:maxOff>0?v/maxOff:0;
+            return (
+              <div key={j} title={`Actual: ${LABELS[i]}\nPredicted: ${LABELS[j]}\nN=${v}`}
+                style={{width:50,height:30,borderRadius:3,
+                  background:isDiag?`rgba(16,185,129,${0.12+intens*0.55})`:`rgba(239,68,68,${intens*0.45+0.02})`,
+                  border:`1px solid ${isDiag?'#10b98133':'#1e293b'}`,
+                  display:'flex',alignItems:'center',justifyContent:'center',
+                  fontSize:11,fontFamily:M,color:v>0?'#f1f5f9':'#334155',fontWeight:isDiag?600:400}}>
+                {v}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      <div style={{marginTop:8,display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+        <span style={{display:'flex',alignItems:'center',gap:4}}>
+          <div style={{width:10,height:10,background:'rgba(16,185,129,0.45)',borderRadius:2}}/>
+          <span style={{fontSize:8,color:'#64748b',fontFamily:M}}>Correct</span>
+        </span>
+        <span style={{display:'flex',alignItems:'center',gap:4}}>
+          <div style={{width:10,height:10,background:'rgba(239,68,68,0.3)',borderRadius:2}}/>
+          <span style={{fontSize:8,color:'#64748b',fontFamily:M}}>Error</span>
+        </span>
+        <span style={{marginLeft:'auto',fontSize:9,fontFamily:M,color:'#94a3b8'}}>
+          Acc: {diagonalSum}/{total} = {(diagonalSum/total*100).toFixed(1)}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── ARCHITECTURE TAB ─────────────────────────────────────────────────────────
+function ArchitectureTab() {
+  const [view, setView] = useState('stgcn');
+  const BLOCK_CH = [64,64,64,128,128,128,256,256,256];
+  const BLOCK_STRIDE = [1,1,1,2,1,1,2,1,1];
+  const IN_CH = BLOCK_CH.map((_,i)=>i===0?9:BLOCK_CH[i-1]);
+
+  const views = [{id:'stgcn',label:'ST-GCN Encoder'},{id:'proto',label:'ProtoNet Episode'},{id:'compare',label:'Arch Comparison'}];
+
+  return (
+    <div style={{padding:20}}>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
+          MODEL ARCHITECTURE · src/models/</div>
+        <div style={{fontSize:22,fontFamily:IS,fontStyle:'italic'}}>Architecture Reference</div>
+      </div>
+      <div style={{display:'flex',gap:8,marginBottom:20}}>
+        {views.map(v=>(
+          <button key={v.id} onClick={()=>setView(v.id)}
+            style={{background:view===v.id?'#1e293b':'transparent',
+              border:`1px solid ${view===v.id?'#FF6B35':'#334155'}`,
+              color:view===v.id?'#f8fafc':'#94a3b8',padding:'7px 16px',
+              borderRadius:8,fontSize:12,cursor:'pointer'}}>{v.label}</button>
+        ))}
+      </div>
+
+      {view==='stgcn' && (
+        <div>
+          {/* Input tensor */}
+          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:16,flexWrap:'wrap'}}>
+            <div style={{background:'#0c1222',border:'1px solid #1e293b',borderRadius:8,padding:'8px 14px'}}>
+              <div style={{fontSize:9,color:'#64748b',fontFamily:M}}>INPUT TENSOR</div>
+              <div style={{fontSize:14,fontFamily:M,color:'#60a5fa',marginTop:2}}>
+                (B, <span style={{color:'#FF6B35'}}>9</span>, <span style={{color:'#f59e0b'}}>16</span>, <span style={{color:'#10b981'}}>34</span>)</div>
+              <div style={{fontSize:8,color:'#475569',fontFamily:M,marginTop:2}}>
+                B=batch · <span style={{color:'#FF6B35'}}>C=L2 features</span> · <span style={{color:'#f59e0b'}}>T=frames</span> · <span style={{color:'#10b981'}}>V=joints</span>
+              </div>
+            </div>
+            <div style={{fontSize:18,color:'#334155'}}>→</div>
+            {/* 9 blocks */}
+            {BLOCK_CH.map((ch,i)=>{
+              const isDown=BLOCK_STRIDE[i]===2;
+              const grp=Math.floor(i/3);
+              const gc=['#3b82f6','#f59e0b','#FF6B35'][grp];
+              return (
+                <React.Fragment key={i}>
+                  <div style={{background:'#0f172a',border:`1px solid ${gc}44`,borderRadius:6,padding:'6px 10px',
+                    position:'relative',minWidth:80,textAlign:'center'}}>
+                    <div style={{fontSize:8,color:gc,fontFamily:M,marginBottom:2}}>Block {i+1}</div>
+                    <div style={{fontSize:9,fontFamily:M,color:'#e2e8f0'}}>{IN_CH[i]}→{ch}</div>
+                    <div style={{fontSize:7,color:'#475569',fontFamily:M,marginTop:2}}>
+                      SpatialGCN<br/>TempConv(9×1)<br/>+Residual
+                    </div>
+                    {isDown&&<div style={{position:'absolute',top:-8,right:2,fontSize:7,
+                      background:'#f59e0b22',color:'#f59e0b',padding:'1px 4px',borderRadius:3,
+                      border:'1px solid #f59e0b44',fontFamily:M}}>↓T/2</div>}
+                  </div>
+                  {i<8&&<div style={{fontSize:14,color:'#334155',flexShrink:0}}>→</div>}
+                </React.Fragment>
+              );
+            })}
+            <div style={{fontSize:18,color:'#334155'}}>→</div>
+            {/* Global avg pool */}
+            <div style={{background:'#10b98111',border:'1px solid #10b98133',borderRadius:8,padding:'8px 14px',textAlign:'center'}}>
+              <div style={{fontSize:8,color:'#10b981',fontFamily:M}}>GAP + FC</div>
+              <div style={{fontSize:14,fontFamily:M,color:'#10b981',marginTop:2}}>(B, 256)</div>
+              <div style={{fontSize:7,color:'#475569',fontFamily:M,marginTop:2}}>embedding</div>
+            </div>
+          </div>
+          {/* Detail panel */}
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+            <Panel title="ST-GCN Block Detail (stgcn_model.py)">
+              <svg width="100%" height={160} viewBox="0 0 440 160">
+                {/* Block box */}
+                <rect x={10} y={10} width={420} height={140} rx={8} fill="#0a0f1a" stroke="#1e293b" strokeWidth={1}/>
+                {/* Input arrow */}
+                <text x={30} y={55} fontSize={9} fill="#64748b" fontFamily={M}>x: (B,C_in,T,V)</text>
+                <line x1={20} y1={65} x2={60} y2={65} stroke="#475569" strokeWidth={1.5} markerEnd="url(#arr)"/>
+                {/* SpatialGCN box */}
+                <rect x={65} y={45} width={95} height={40} rx={5} fill="#3b82f622" stroke="#3b82f655" strokeWidth={1}/>
+                <text x={112} y={60} textAnchor="middle" fontSize={8} fill="#3b82f6" fontFamily={M}>SpatialGCN</text>
+                <text x={112} y={73} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>Σ_k A_k · X · Θ_k</text>
+                {/* Arrow */}
+                <line x1={160} y1={65} x2={185} y2={65} stroke="#475569" strokeWidth={1.5}/>
+                {/* TemporalConv box */}
+                <rect x={190} y={45} width={100} height={40} rx={5} fill="#f59e0b22" stroke="#f59e0b55" strokeWidth={1}/>
+                <text x={240} y={60} textAnchor="middle" fontSize={8} fill="#f59e0b" fontFamily={M}>TemporalConv</text>
+                <text x={240} y={73} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>kernel=9, BN+ReLU</text>
+                {/* Arrow */}
+                <line x1={290} y1={65} x2={310} y2={65} stroke="#475569" strokeWidth={1.5}/>
+                {/* Add residual */}
+                <circle cx={330} cy={65} r={14} fill="#1e293b" stroke="#475569" strokeWidth={1}/>
+                <text x={330} y={69} textAnchor="middle" fontSize={12} fill="#e2e8f0">+</text>
+                {/* Residual branch */}
+                <path d="M 65 55 Q 30 55 30 100 Q 30 130 100 130 Q 300 130 330 80" fill="none" stroke="#94a3b855" strokeWidth={1} strokeDasharray="3,2"/>
+                <text x={150} y={145} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>residual (1×1 conv if dim changes)</text>
+                {/* Output */}
+                <line x1={344} y1={65} x2={410} y2={65} stroke="#475569" strokeWidth={1.5}/>
+                <text x={415} y={55} fontSize={9} fill="#64748b" fontFamily={M}>x: (B,C_out,T',V)</text>
+                {/* Arrow marker def */}
+                <defs><marker id="arr" markerWidth="6" markerHeight="6" refX="6" refY="3" orient="auto">
+                  <path d="M0,0 L0,6 L6,3 Z" fill="#475569"/>
+                </marker></defs>
+              </svg>
+              <ConfigTable rows={[
+                ['Partitions','3 (identity/centripetal/centrifugal)'],
+                ['Edge importance','Learnable Λ_k per partition'],
+                ['Temporal kernel','9 frames (config: temporal_kernel)'],
+                ['Dropout','0.30'],
+                ['Blocks','9 (channel progression: 64×3→128×3→256×3)'],
+                ['Temporal strides','Block 4 (×½), Block 7 (×½) → T: 16→8→4'],
+              ]} mt={8}/>
+            </Panel>
+            <Panel title="Spatial GCN Formula">
+              <div style={{background:'#020917',borderRadius:6,padding:12,fontFamily:M,fontSize:10,color:'#94a3b8',lineHeight:2}}>
+                <div style={{color:'#60a5fa'}}>{'# 3-partition aggregation (Yan et al. 2018)'}</div>
+                <div>{'y = Σ_k  (D_k^{-½} A_k D_k^{½}) · x · W_k · Λ_k'}</div>
+                <div style={{fontSize:8,color:'#475569',marginTop:4}}>
+                  k ∈ {'{'}<span style={{color:'#10b981'}}>identity</span>, <span style={{color:'#3b82f6'}}>centripetal</span>, <span style={{color:'#FF6B35'}}>centrifugal</span>{'}'}<br/>
+                  A_k = normalised partition adjacency (34×34)<br/>
+                  Λ_k = learnable edge importance weights<br/>
+                  W_k = channel projection weights (1×1 conv)<br/>
+                  D_k = diagonal degree matrix of A_k
+                </div>
+              </div>
+              <div style={{marginTop:10}}>
+                <div style={{fontSize:9,color:'#64748b',fontFamily:M,marginBottom:6}}>CHANNEL PROGRESSION</div>
+                {[0,1,2].map(grp=>{
+                  const gc=['#3b82f6','#f59e0b','#FF6B35'][grp];
+                  const chs=BLOCK_CH.slice(grp*3,grp*3+3);
+                  return (
+                    <div key={grp} style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
+                      <div style={{width:60,fontSize:8,fontFamily:M,color:gc}}>
+                        Blocks {grp*3+1}–{grp*3+3}</div>
+                      {chs.map((c,i)=>(
+                        <div key={i} style={{height:Math.round(c/4),width:32,background:`${gc}55`,
+                          border:`1px solid ${gc}88`,borderRadius:2,display:'flex',alignItems:'flex-end',
+                          justifyContent:'center',padding:'2px 0'}}>
+                          <span style={{fontSize:7,fontFamily:M,color:gc}}>{c}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            </Panel>
+          </div>
+        </div>
+      )}
+
+      {view==='proto' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+          <Panel title="Episodic Meta-Learning Setup (proto_net.py)">
+            <svg width="100%" height={300} viewBox="0 0 480 300">
+              {/* Support set */}
+              <text x={10} y={18} fontSize={9} fill="#64748b" fontFamily={M}>SUPPORT SET (5-way, K=10)</text>
+              {Object.entries(STRAT).map(([s,{color,label}],si)=>(
+                <g key={s}>
+                  {Array.from({length:3},(_,ki)=>(
+                    <rect key={ki} x={10+ki*28} y={26+si*36} width={24} height={28} rx={4}
+                      fill={color+'33'} stroke={color+'66'} strokeWidth={1}/>
+                  ))}
+                  <text x={108} y={44+si*36} fontSize={7} fill={color} fontFamily={M}>{label}</text>
+                  <text x={90} y={44+si*36} fontSize={8} fill={color}>…×K</text>
+                </g>
+              ))}
+              {/* Encoder arrow */}
+              <rect x={130} y={60} width={60} height={160} rx={6} fill="#1e293b" stroke="#334155" strokeWidth={1}/>
+              <text x={160} y={135} textAnchor="middle" fontSize={8} fill="#60a5fa" fontFamily={M}>ST-GCN</text>
+              <text x={160} y={148} textAnchor="middle" fontSize={8} fill="#60a5fa" fontFamily={M}>Encoder</text>
+              <text x={160} y={162} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>256-d</text>
+              <line x1={94} y1={140} x2={130} y2={140} stroke="#475569" strokeWidth={1.5}/>
+              {/* Mean per class */}
+              <rect x={200} y={60} width={60} height={160} rx={6} fill="#1e293b" stroke="#A855F766" strokeWidth={1}/>
+              <text x={230} y={135} textAnchor="middle" fontSize={8} fill="#A855F7" fontFamily={M}>mean()</text>
+              <text x={230} y={148} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>per class</text>
+              <line x1={190} y1={140} x2={200} y2={140} stroke="#475569" strokeWidth={1.5}/>
+              {/* Prototypes */}
+              {Object.entries(STRAT).map(([s,{color}],si)=>(
+                <circle key={s} cx={295} cy={80+si*36} r={10} fill={color+'55'} stroke={color} strokeWidth={1.5}/>
+              ))}
+              <text x={295} y={270} textAnchor="middle" fontSize={8} fill="#64748b" fontFamily={M}>Prototypes</text>
+              <line x1={260} y1={140} x2={285} y2={140} stroke="#475569" strokeWidth={1.5}/>
+              {/* Query */}
+              <text x={310} y={18} fontSize={9} fill="#64748b" fontFamily={M}>QUERY</text>
+              <rect x={310} y={26} width={24} height={28} rx={4} fill="#f59e0b33" stroke="#f59e0b66" strokeWidth={1}/>
+              <line x1={334} y1={40} x2={360} y2={140} stroke="#f59e0b44" strokeWidth={1} strokeDasharray="3,2"/>
+              {/* Distances */}
+              {Object.entries(STRAT).map(([s,{color}],si)=>(
+                <line key={s} x1={305} cy={140} x1={305} y1={80+si*36} x2={380} y2={80+si*36}
+                  stroke={color+'55'} strokeWidth={1} strokeDasharray="2,2"/>
+              ))}
+              <rect x={360} y={60} width={80} height={160} rx={6} fill="#1e293b" stroke="#10b98133" strokeWidth={1}/>
+              <text x={400} y={128} textAnchor="middle" fontSize={8} fill="#10b981" fontFamily={M}>softmax(</text>
+              <text x={400} y={140} textAnchor="middle" fontSize={8} fill="#10b981" fontFamily={M}>-dist²)</text>
+              <text x={400} y={154} textAnchor="middle" fontSize={7} fill="#475569" fontFamily={M}>→ probs</text>
+              <text x={440} y={280} textAnchor="middle" fontSize={8} fill="#10b981" fontFamily={M}>Prediction</text>
+            </svg>
+            <ConfigTable rows={[
+              ['N-way','5 (one per strategy)'],
+              ['K-shot','10 support examples / class'],
+              ['N-query','5 query examples / class per episode'],
+              ['Distance','Euclidean in 256-d embedding space'],
+              ['Confidence','softmax score of nearest prototype'],
+              ['Margin','top-1 prob − top-2 prob'],
+            ]}/>
+          </Panel>
+          <Panel title="ProtoNet Forward Pass Code">
+            <CodeBlock>{`# proto_net.py
+class PrototypicalNetwork(nn.Module):
+  def forward(self, support, query, y_support):
+    # support: (N*K, 256) embeddings
+    # query:   (N*Q, 256) embeddings
+
+    # Step 1: compute class prototypes
+    prototypes = self.compute_prototypes(support, y_support)
+    # prototypes: (N, 256) — one per class
+
+    # Step 2: pairwise Euclidean distances
+    # query (N*Q, 1, 256) vs prototypes (1, N, 256)
+    dists = torch.cdist(query.unsqueeze(0),
+                        prototypes.unsqueeze(0)).squeeze(0)
+    # dists: (N*Q, N)
+
+    # Step 3: convert to log-probs
+    log_probs = F.log_softmax(-dists**2, dim=-1)
+
+    # Step 4: pick best + compute scores
+    pred = log_probs.argmax(-1)
+    probs = log_probs.exp()
+    top2, _ = probs.topk(2, dim=-1)
+    confidence = top2[:, 0]
+    margin     = top2[:, 0] - top2[:, 1]
+
+    return { 'pred': pred,
+             'confidence': confidence,
+             'margin': margin,
+             'all_probs': probs }`}</CodeBlock>
+          </Panel>
+        </div>
+      )}
+
+      {view==='compare' && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+          <Panel title="ST-GCN vs Transformer (RQ: Architecture)">
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+              {[
+                { name:'ST-GCN', color:'#FF6B35', f1:68.2, items:[
+                  'Explicit skeleton graph (34 nodes)',
+                  '3-partition spatial adjacency',
+                  'Temporal conv (9-frame kernel)',
+                  'Learns joint-pair relationships',
+                  'O(V²) spatial complexity',
+                ]},
+                { name:'Transformer', color:'#A855F7', f1:65.3, items:[
+                  'Flattened joints per frame (68-d)',
+                  'Self-attention across T=16 frames',
+                  'No explicit graph structure',
+                  'Global temporal dependencies',
+                  'O(T²) temporal complexity',
+                ]},
+              ].map(m=>(
+                <div key={m.name} style={{background:'#0a0f1a',borderRadius:8,padding:12,border:`1px solid ${m.color}44`}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                    <div style={{fontSize:12,fontWeight:600,color:m.color,fontFamily:M}}>{m.name}</div>
+                    <div style={{fontSize:13,fontFamily:M,color:m.color}}>F1: {m.f1}%</div>
+                  </div>
+                  {m.items.map((t,i)=>(
+                    <div key={i} style={{fontSize:9,color:'#94a3b8',padding:'2px 0',
+                      borderBottom:'1px solid #1e293b22',display:'flex',gap:4}}>
+                      <span style={{color:m.color}}>•</span>{t}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+            <div style={{padding:'8px 10px',background:'#FF6B3511',border:'1px solid #FF6B3533',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#FF6B35',fontFamily:M,marginBottom:4}}>
+                WHY ST-GCN WINS (+2.9% F1)</div>
+              <div style={{fontSize:10,color:'#fca5a5',lineHeight:1.6}}>
+                Badminton strategy is driven by <em>spatial relationships</em> between joints (elbow angle, opponent distance).
+                ST-GCN captures these via explicit graph topology, while Transformer treats all joints equally through attention.
+              </div>
+            </div>
+          </Panel>
+          <Panel title="Parameter Count + Complexity">
+            <ConfigTable rows={[
+              ['ST-GCN encoder params','~2.1M (9 blocks, 3 partitions each)'],
+              ['Transformer encoder params','~1.8M (4 layers, d_model=256, 8 heads)'],
+              ['Projection head (SSL)','128K (256→256→128)'],
+              ['ProtoNet (no extra params)','5 prototypes × 256-d (stored, not learned)'],
+              ['Total trainable (full)','~2.3M'],
+              ['SSL pre-training data','~4,200 shots (ShuttleSet22)'],
+              ['Few-shot train data','40 labeled rallies (FineBadminton)'],
+              ['Test data','40 rallies × 5-fold = 8 test per fold'],
+            ]}/>
+            <div style={{marginTop:10,padding:'6px 10px',background:'#10b98111',border:'1px solid #10b98133',borderRadius:6}}>
+              <div style={{fontSize:9,color:'#10b981',fontFamily:M}}>ENCODER LR SCALE = 0.1</div>
+              <div style={{fontSize:10,color:'#94a3b8',marginTop:2}}>
+                SSL pre-trained weights fine-tuned at 10× lower LR than ProtoNet head.
+                Prevents catastrophic forgetting while allowing adaptation.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+const TABS = [
+  { id:'overlay',   label:'Video Overlay',    icon:'🎥' },
+  { id:'preproc',   label:'Preprocessing',    icon:'⚙' },
+  { id:'training',  label:'Training',         icon:'📈' },
+  { id:'predict',   label:'Predictions',      icon:'🎯' },
+  { id:'arch',      label:'Architecture',     icon:'🏗' },
+];
+
+function App() {
+  const [tab, setTab] = useState('overlay');
+  return (
+    <div style={{minHeight:'100vh',background:'#0a0f1a',color:'#e2e8f0',
+      fontFamily:"'DM Sans','Helvetica Neue',sans-serif"}}>
+      {/* Header */}
+      <div style={{borderBottom:'1px solid #1e293b',padding:'10px 20px',
+        display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <div style={{width:30,height:30,borderRadius:6,
+            background:'linear-gradient(135deg,#FF6B35,#A855F7)',
+            display:'flex',alignItems:'center',justifyContent:'center',fontSize:15}}>🏸</div>
+          <div>
+            <div style={{fontSize:14,fontWeight:600,letterSpacing:'-.02em'}}>Badminton Pipeline Demo</div>
+            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:.5}}>
+              SENSE-CHECK TOOL · COURT→SKELETON→ST-GCN→PROTONET</div>
+          </div>
+        </div>
+        <div style={{display:'flex',gap:2}}>
+          {TABS.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              style={{background:tab===t.id?'#1e293b':'transparent',
+                border:`1px solid ${tab===t.id?'#FF6B35':'transparent'}`,
+                color:tab===t.id?'#f8fafc':'#64748b',padding:'6px 12px',
+                borderRadius:6,fontSize:11,cursor:'pointer',
+                display:'flex',alignItems:'center',gap:5}}>
+              <span style={{fontSize:12}}>{t.icon}</span>{t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Pipeline flow */}
+      <PipelineFlow/>
+
+      {/* Tab content */}
+      {tab==='overlay'  && <VideoOverlayTab/>}
+      {tab==='preproc'  && <PreprocessingTab/>}
+      {tab==='training' && <TrainingTab/>}
+      {tab==='predict'  && <PredictionsTab/>}
+      {tab==='arch'     && <ArchitectureTab/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
