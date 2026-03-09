@@ -10,3 +10,4 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/datasets_preprocessing/ShuttleSet/skeletons/
 .DS_Store
+notebooks/*_FULL.ipynb

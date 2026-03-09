@@ -124,6 +124,23 @@ const ABLATIONS = [
 
 const SKEL_DIR = 'datasets/finebadminton_skeletons';
 
+// ─── ShuttleSet shot-type translations ────────────────────────────────────────
+const SS_SHOT_TYPE_EN = {
+  '發短球':'Short serve','發長球':'Long serve','推撲球':'Push/Rush',
+  '殺球':'Smash','過渡球':'Drop','防守回挑':'Def. lob',
+  '切球':'Cut','接殺防守':'Block','長球':'Clear','平球':'Drive',
+  '擋小球':'Net def.','挑球':'Lob','放小球':'Net shot',
+  '勾球':'Cross-net','網前球':'Net shot','點扣':'Push smash',
+  '推球':'Push','未知':'Unknown',
+};
+function ssMatchLabel(name) {
+  // Fallback: condense long match folder name to player-pair for sidebar display
+  const clean = name.replace(/_/g, ' ');
+  const m = clean.match(/^(.+?)\s+\w[\w ]*\s+\d{4}/);
+  const s = m ? m[1] : clean;
+  return s.length > 34 ? s.slice(0, 32) + '…' : s;
+}
+
 // Pre-generated stable t-SNE 2-D embeddings (seeded LCG, no Math.random at render)
 const TSNE_CLUSTERS = {
   intercept:    { cx:0.72, cy:0.25, color:'#FF6B35' },
@@ -181,7 +198,7 @@ const FOLD_ACC = [
   { fold:5, intercept:73, defensive:69, move_to_net:69, create_depth:65, passive:59 },
 ];
 
-// ─── UTILITIES ────────────────────────────────────────────────────────────────
+// ─── UTILITIES ────────��───────────────────────────────────────────────────────
 const lerp = (a,b,t) => a+(b-a)*t;
 const lerpPt = (a,b,t) => [lerp(a[0],b[0],t), lerp(a[1],b[1],t)];
 const smoothstep = t => t*t*(3-2*t);
@@ -313,6 +330,125 @@ function LineChart({ data, color='#FF6B35', label='', w=400, h=160, yLabel='', x
       {/* Label */}
       <text x={pad.l+8} y={pad.t+10} fontSize={9} fill={color} fontFamily={M}>{label}</text>
     </svg>
+  );
+}
+
+// ─── COURT BIRD'S-EYE PANEL (real-time player positions in metres) ────────────
+function CourtBirdseyePanel({ shot, frameNum, rallyMeta, hitterOverride=null }) {
+  const canvasRef  = useRef(null);
+  const [courtData, setCourtData] = useState(null);
+
+  const displayFrame = frameNum ?? shot?.hit_frame;
+
+  useEffect(() => {
+    if (!shot) { setCourtData(null); return; }
+    const frameIdx = rallyMeta
+      ? displayFrame - rallyMeta.frame_min
+      : shot.frame_idx;
+    if (frameIdx == null || frameIdx < 0) { setCourtData(null); return; }
+    fetch(`${SERVER}/api/court_coords/${shot.video}/${frameIdx}`)
+      .then(r => r.json())
+      .then(d => setCourtData(d.error ? null : d))
+      .catch(() => setCourtData(null));
+  }, [shot?.id, displayFrame, rallyMeta?.frame_min]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Court constants (metres)
+    const CW = 6.1, CL = 13.4, NET = 6.7, SVC = 1.98;
+    // Padding + scale
+    const PAD = 18, SC = (W - PAD*2) / CW;
+    const CH_PX = CL * SC;
+    const offY  = (H - CH_PX) / 2;
+    const tx = mx => PAD + mx * SC;
+    const ty = my => offY + my * SC;
+
+    // Background
+    ctx.fillStyle = '#0a1a0e'; ctx.fillRect(0, 0, W, H);
+
+    // Court surface
+    ctx.fillStyle = '#0f3520';
+    ctx.fillRect(tx(0), ty(0), CW*SC, CL*SC);
+
+    // Court lines
+    const lines = [
+      [[0,0],[CW,0]], [[0,CL],[CW,CL]],
+      [[0,0],[0,CL]], [[CW,0],[CW,CL]],
+      [[CW/2,0],[CW/2,CL]],
+      [[0,SVC],[CW,SVC]], [[0,CL-SVC],[CW,CL-SVC]],
+    ];
+    ctx.strokeStyle = '#4ade8066'; ctx.lineWidth = 1;
+    lines.forEach(([[x1,y1],[x2,y2]]) => {
+      ctx.beginPath(); ctx.moveTo(tx(x1),ty(y1)); ctx.lineTo(tx(x2),ty(y2)); ctx.stroke();
+    });
+    // Net
+    ctx.strokeStyle = '#f1f5f9'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(tx(0),ty(NET)); ctx.lineTo(tx(CW),ty(NET)); ctx.stroke();
+
+    if (!courtData) {
+      ctx.fillStyle = '#64748b'; ctx.font = `9px 'JetBrains Mono',monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('No homography', W/2, H/2 - 8);
+      ctx.fillText('Run notebook 07', W/2, H/2 + 8);
+      return;
+    }
+
+    const hitter   = hitterOverride ?? shot?.hitter;
+    const hitIsTop = hitter === 'top';
+    const p0color  = hitIsTop ? '#60a5fa' : '#f472b6';
+    const p1color  = hitIsTop ? '#f472b6' : '#60a5fa';
+    const playerR  = SC * 0.18;
+
+    const drawPlayer = (pos, color, label, isHitter) => {
+      if (!pos) return;
+      const [mx, my] = pos;
+      const px = tx(Math.max(0, Math.min(CW, mx)));
+      const py = ty(Math.max(0, Math.min(CL, my)));
+      // Shadow
+      ctx.globalAlpha = 0.2; ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(px, py+3, playerR*1.3, playerR*0.5, 0, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+      // Body
+      ctx.beginPath(); ctx.arc(px, py, playerR, 0, Math.PI*2);
+      ctx.fillStyle = color + 'cc'; ctx.fill();
+      ctx.strokeStyle = isHitter ? '#f59e0b' : color;
+      ctx.lineWidth = isHitter ? 2 : 1.5; ctx.stroke();
+      // Label
+      ctx.fillStyle = '#f1f5f9'; ctx.font = `bold 7px 'DM Sans',sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(label, px, py - playerR - 3);
+    };
+
+    drawPlayer(courtData.p0, p0color, hitIsTop ? 'Hitter' : 'Opp', hitIsTop);
+    drawPlayer(courtData.p1, p1color, hitIsTop ? 'Opp' : 'Hitter', !hitIsTop);
+
+    // Stats overlay (bottom)
+    const stats = [];
+    if (courtData.p0_dist_net   != null) stats.push(`P0→net: ${courtData.p0_dist_net.toFixed(1)}m`);
+    if (courtData.p1_dist_net   != null) stats.push(`P1→net: ${courtData.p1_dist_net.toFixed(1)}m`);
+    if (courtData.player_separation != null) stats.push(`sep: ${courtData.player_separation.toFixed(1)}m`);
+    if (stats.length) {
+      ctx.fillStyle = '#00000099';
+      ctx.fillRect(0, H - 22, W, 22);
+      ctx.fillStyle = '#94a3b8'; ctx.font = `8px 'JetBrains Mono',monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(stats.join('  ·  '), W/2, H - 8);
+    }
+  }, [courtData, shot?.hitter, hitterOverride]);
+
+  return (
+    <div style={{background:'#0a1a0e',borderRadius:6,border:'1px solid #1e293b',overflow:'hidden'}}>
+      <div style={{padding:'4px 8px',borderBottom:'1px solid #1e293b22',
+        fontSize:7,color:'#4ade80',fontFamily:"'JetBrains Mono',monospace",letterSpacing:.8}}>
+        COURT VIEW (metres)</div>
+      <canvas ref={canvasRef} width={160} height={352}
+        style={{display:'block',width:'100%',height:'auto'}}/>
+    </div>
   );
 }
 
@@ -658,6 +794,7 @@ function useRealFrames() {
 
   return { online, shots, loading };
 }
+
 
 // Draw a skeleton onto canvas.
 // joints = [[x,y] × 17] for one player, in original pixel space.
@@ -1079,9 +1216,680 @@ function RallyScrubber({ rallyMeta, currentShot, scrubFrame, onScrub, onShotJump
   );
 }
 
+// ─── SS SCRUBBER ─────────────────────────────────────────────────────────────
+// Simpler scrubber for ShuttleSet — no strategy colours, uses shot_type ticks.
+function SSScrubber({ rallyMeta, hitFrame, scrubFrame, onScrub, onShotJump }) {
+  const barRef = useRef(null);
+  if (!rallyMeta) return null;
+
+  const { frame_min, frame_max, shots } = rallyMeta;
+  const range   = frame_max - frame_min || 1;
+  const frac    = fn => Math.max(0, Math.min(1, (fn - frame_min) / range));
+  const active  = scrubFrame ?? hitFrame;
+  const elapsed = active - frame_min;
+
+  const seekTo = e => {
+    if (!barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const x    = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onScrub(Math.round(frame_min + x * range));
+  };
+
+  return (
+    <div style={{marginTop:8,userSelect:'none',background:'#0f172a',borderRadius:8,
+      border:'1px solid #1e293b',padding:'8px 12px'}}>
+      {/* Info row */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+        <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+          f<span style={{color:'#e2e8f0',fontWeight:600}}>{active}</span>
+          &nbsp;·&nbsp;t=<span style={{color:'#60a5fa',fontWeight:600}}>{elapsed}</span>
+          {active === hitFrame && <span style={{color:'#10b981',marginLeft:6}}>● HIT</span>}
+        </span>
+        <span style={{fontSize:9,fontFamily:M,color:'#475569'}}>
+          {elapsed} / {frame_max - frame_min} frames · {shots.length} shots
+        </span>
+      </div>
+
+      {/* Timeline bar */}
+      <div ref={barRef}
+        style={{position:'relative',height:28,background:'#0a0f1a',borderRadius:5,
+          cursor:'crosshair',border:'1px solid #1e293b22'}}
+        onPointerDown={e=>{ e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
+        onPointerMove={e=>{ if (e.buttons & 1) seekTo(e); }}>
+
+        {/* Played region */}
+        <div style={{position:'absolute',left:0,top:0,bottom:0,
+          width:`${frac(active)*100}%`,background:'#1e293b55',borderRadius:'5px 0 0 5px'}}/>
+
+        {/* Shot tick marks */}
+        {shots.map((s, i) => {
+          const isHit = s.hit_frame === hitFrame;
+          const isNear = !isHit && Math.abs(s.hit_frame - (scrubFrame ?? hitFrame)) < range * 0.02;
+          return (
+            <div key={i}
+              onClick={()=>onShotJump(s)}
+              onPointerDown={e=>e.stopPropagation()}
+              title={`${SS_SHOT_TYPE_EN[s.shot_type]||s.shot_type} · P${s.player} · f${s.hit_frame}`}
+              style={{position:'absolute',left:`${frac(s.hit_frame)*100}%`,top:0,bottom:0,
+                width: isHit ? 3 : 2, marginLeft: isHit ? -1.5 : -1,
+                background: isHit ? '#10b981' : '#60a5fa88',
+                cursor:'pointer',zIndex: isHit ? 2 : 1,
+                boxShadow: isHit ? '0 0 5px #10b981' : 'none'}}/>
+          );
+        })}
+
+        {/* Playhead */}
+        <div style={{position:'absolute',left:`${frac(active)*100}%`,
+          top:-3,width:2,height:'calc(100% + 6px)',marginLeft:-1,
+          background:'#f8fafc',borderRadius:1,pointerEvents:'none',zIndex:3,
+          boxShadow:'0 0 4px #fff8'}}/>
+      </div>
+    </div>
+  );
+}
+
+// ─── SS FRAME CANVAS ─────────────────────────────────────────────────────────
+// frameNum: absolute frame to display. null = show shot.frame_num (hit frame).
+function SSFrameCanvas({ shot, frameNum=null, rallyShots=[], skelMode='original', width=760, height=427 }) {
+  const canvasRef = useRef(null);
+  const [skelData,    setSkelData]    = useState(null);
+  const [skelSource,  setSkelSource]  = useState(null); // 'original'|'gdino'|'gdino-fallback'
+  const [shuttleData, setShuttleData] = useState(null);
+  const [frameLoaded, setFrameLoaded] = useState(false);
+
+  const displayFrame = frameNum ?? shot?.frame_num;
+  const isHitFrame   = displayFrame === shot?.frame_num;
+
+  // Fetch shuttle position for the current display frame
+  useEffect(() => {
+    if (!shot || !displayFrame) { setShuttleData(null); return; }
+    const enc = encodeURIComponent(shot.match);
+    fetch(`${SERVER}/api/ss/shuttle/${enc}/${displayFrame}`)
+      .then(r => r.json())
+      .then(d => setShuttleData(d))
+      .catch(() => setShuttleData(null));
+  }, [shot?.match, displayFrame]);
+
+  // Fetch skeleton for the current displayFrame.
+  // GDINO: per-rally array — server indexes by absolute frame_num, covers every frame.
+  // Original: per-shot 16-frame windows — only show at hit frame.
+  useEffect(() => {
+    if (!shot || !displayFrame) { setSkelData(null); setSkelSource(null); return; }
+    setSkelData(null); setSkelSource(null);
+    const enc = encodeURIComponent(shot.match);
+    if (skelMode === 'gdino') {
+      fetch(`${SERVER}/api/ss/skeleton_gdino/${enc}/${shot.rally}/${displayFrame}`)
+        .then(r => r.json())
+        .then(d => {
+          if (!d.has_skeleton) { setSkelData(null); return; }
+          setSkelData(d.skeleton);
+          setSkelSource(d.has_gdino ? 'gdino' : 'gdino-fallback');
+        })
+        .catch(() => setSkelData(null));
+    } else {
+      // Original skeletons are per-shot; only meaningful at the hit frame
+      if (!isHitFrame) { setSkelData(null); return; }
+      fetch(`${SERVER}/api/ss/skeleton/${enc}/${shot.rally}/${shot.ball_round}`)
+        .then(r => r.json())
+        .then(d => { setSkelData(d.has_skeleton ? d.skeleton : null); setSkelSource('original'); })
+        .catch(() => setSkelData(null));
+    }
+  }, [shot?.match, shot?.rally, shot?.ball_round, skelMode, displayFrame]);
+
+  // Draw
+  useEffect(() => {
+    if (!shot || !canvasRef.current) return;
+    let cancelled = false;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    // Don't clear here — keep previous frame while next loads (avoids black flash on scrub).
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      ctx.fillStyle = '#0a0f1a'; ctx.fillRect(0, 0, W, H);
+      ctx.drawImage(img, 0, 0, W, H);
+      setFrameLoaded(true);
+
+      // Determine hitter: use centroid proximity when skelData available (handles net shots);
+      // fall back to midpoint threshold; null player_location_y = unknown.
+      let hitIsTop = null;
+      const ply = shot.player_location_y;
+      if (ply != null && skelData) {
+        const p0y = skelData[0].reduce((s,j) => s + j[1], 0) / skelData[0].length;
+        const p1y = skelData[1].reduce((s,j) => s + j[1], 0) / skelData[1].length;
+        hitIsTop = Math.abs(ply - p0y) <= Math.abs(ply - p1y);
+      } else if (ply != null) {
+        hitIsTop = ply < shot.img_h / 2;
+      }
+      const p0color = hitIsTop === null ? '#a78bfa' : (hitIsTop ? '#60a5fa' : '#f472b6');
+      const p1color = hitIsTop === null ? '#a78bfa' : (hitIsTop ? '#f472b6' : '#60a5fa');
+
+      if (skelData) {
+        const p0lbl = hitIsTop === null ? 'P0 (top)' : (hitIsTop ? 'Hitter (top)' : 'Opp (top)');
+        const p1lbl = hitIsTop === null ? 'P1 (bot)' : (hitIsTop ? 'Opp (bot)'   : 'Hitter (bot)');
+        [[skelData[0], p0color, p0lbl],
+         [skelData[1], p1color, p1lbl]].forEach(([joints, col, lbl]) => {
+          const valid = joints.filter(j => j[0] > 0 && j[1] > 0);
+          if (!valid.length) return;
+          const xs = valid.map(j => j[0]), ys = valid.map(j => j[1]);
+          const sx1 = (Math.min(...xs)/shot.img_w)*W - 6, sy1 = (Math.min(...ys)/shot.img_h)*H - 10;
+          const sx2 = (Math.max(...xs)/shot.img_w)*W + 6, sy2 = (Math.max(...ys)/shot.img_h)*H + 6;
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+          ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          ctx.setLineDash([]);
+          ctx.fillStyle = col + 'cc'; roundRect(ctx, sx1, sy1-14, ctx.measureText(lbl).width+8, 13, 3); ctx.fill();
+          ctx.fillStyle = '#0a0f1a'; ctx.font = `8px ${M}`; ctx.textAlign = 'left';
+          ctx.fillText(lbl, sx1+4, sy1-4);
+        });
+        drawRealSkeleton(ctx, skelData[0], shot.img_w, shot.img_h, W, H, p0color);
+        drawRealSkeleton(ctx, skelData[1], shot.img_w, shot.img_h, W, H, p1color);
+      }
+
+      // Shuttle overlay
+      if (shuttleData && shuttleData.visible) {
+        const sx = (shuttleData.x / shot.img_w) * W;
+        const sy = (shuttleData.y / shot.img_h) * H;
+        // Glow ring
+        ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI*2);
+        ctx.strokeStyle = '#FFE66D88'; ctx.lineWidth = 3; ctx.stroke();
+        // Dot
+        ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI*2);
+        ctx.fillStyle = '#FFE66D'; ctx.fill();
+        ctx.strokeStyle = '#FF6B35'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+
+      // Shot-type info overlay (top-left)
+      const typeEn = SS_SHOT_TYPE_EN[shot.shot_type] || shot.shot_type;
+      ctx.fillStyle = '#00000088';
+      ctx.beginPath(); roundRect(ctx, 8, 8, 220, 52, 6); ctx.fill();
+      ctx.fillStyle = '#60a5fa'; ctx.font = `bold 15px ${F}`; ctx.textAlign = 'left';
+      ctx.fillText(typeEn, 16, 30);
+      ctx.fillStyle = '#e2e8f0'; ctx.font = `11px ${M}`;
+      ctx.fillText(`${shot.shot_type}  ·  Player ${shot.player}  ·  Rally ${shot.rally}`, 16, 48);
+
+      // Legend (bottom-right)
+      const hasSh = shuttleData && shuttleData.visible;
+      const legendRows = (skelData ? 2 : 0) + (hasSh ? 1 : 0);
+      const legendH = legendRows > 0 ? legendRows * 16 + 10 : 0;
+      if (legendH > 0) {
+        const hitterColor   = hitIsTop === null ? '#a78bfa' : (hitIsTop ? '#60a5fa' : '#f472b6');
+        const opponentColor = hitIsTop === null ? '#a78bfa' : (hitIsTop ? '#f472b6' : '#60a5fa');
+        const skelLegend    = hitIsTop === null
+          ? [['●','P0 (top)', hitterColor], ['●','P1 (bot)', opponentColor]]
+          : [['●','Hitter', hitterColor], ['●','Opponent', opponentColor]];
+        ctx.fillStyle = '#00000088'; roundRect(ctx, W-120, H-legendH-8, 115, legendH, 4); ctx.fill();
+        const rows = [
+          ...(skelData ? skelLegend : []),
+          ...(hasSh ? [['●','Shuttle', '#FFE66D']] : []),
+        ];
+        rows.forEach(([dot, lbl, c], i) => {
+          ctx.fillStyle = c; ctx.font = `11px ${M}`; ctx.textAlign = 'left';
+          ctx.fillText(dot, W-115, H-legendH+10+i*16);
+          ctx.fillStyle = '#e2e8f0'; ctx.font = `10px ${F}`;
+          ctx.fillText(lbl, W-102, H-legendH+10+i*16);
+        });
+      }
+      if (!skelData) {
+        ctx.fillStyle = '#f59e0b88'; roundRect(ctx, W-185, H-legendH-34, 180, 22, 4); ctx.fill();
+        ctx.fillStyle = '#f59e0b'; ctx.font = `9px ${M}`; ctx.textAlign = 'left';
+        ctx.fillText('⚠ Skeleton not extracted for this match', W-181, H-legendH-20);
+      }
+
+      // Skeleton source badge (top-right)
+      if (skelData && skelSource) {
+        const srcLabel = skelSource==='gdino' ? '🎯 GDINO'
+                       : skelSource==='gdino-fallback' ? '⚠ GDINO→orig'
+                       : 'YOLOv8';
+        const srcColor = skelSource==='gdino' ? '#10b981'
+                       : skelSource==='gdino-fallback' ? '#f59e0b'
+                       : '#60a5fa';
+        const bw = ctx.measureText(srcLabel).width + 16;
+        ctx.fillStyle = srcColor + '33'; roundRect(ctx, W-bw-6, 6, bw, 20, 4); ctx.fill();
+        ctx.fillStyle = srcColor; ctx.font = `bold 9px ${M}`; ctx.textAlign = 'right';
+        ctx.fillText(srcLabel, W-10, 19);
+      }
+
+      // Watermark — show current display frame + rally_t offset
+      ctx.fillStyle = '#ffffff44'; ctx.font = `8px ${M}`; ctx.textAlign = 'right';
+      const tOffset = displayFrame - (shot.rally_frame_start ?? shot.frame_num);
+      ctx.fillText(`${ssMatchLabel(shot.match)} · f${displayFrame} · t=${tOffset}`, W-6, H-6);
+    };
+    img.onerror = () => { if (cancelled) return; setFrameLoaded(true); };
+    const enc = encodeURIComponent(shot.match);
+    img.src = `${SERVER}/ss/frame/${enc}/${displayFrame}`;
+    return () => { cancelled = true; };
+  }, [shot?.match, displayFrame, shot?.rally, shot?.ball_round, skelData, shuttleData]);
+
+  return (
+    <div style={{position:'relative',borderRadius:8,overflow:'hidden',background:'#0a0f1a',border:'1px solid #1e293b'}}>
+      <canvas ref={canvasRef} width={width} height={height} style={{display:'block',maxWidth:'100%'}}/>
+      {!frameLoaded && (
+        <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',
+          justifyContent:'center',pointerEvents:'none'}}>
+          <div style={{fontSize:11,color:'#475569',fontFamily:M}}>Loading frame…</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SS BROWSER ───────────────────────────────────────────────────────────────
+function SSBrowser() {
+  // ── Lazy-load: match list on mount, shots per match on selection ──────────
+  const [ssMatches,    setSSMatches]    = useState(null);   // null = not yet loaded
+  const [ssOnline,     setSSOnline]     = useState(false);
+  const [matchShots,   setMatchShots]   = useState([]);
+  const [shotsLoading, setShotsLoading] = useState(false);
+  // Fetch match summaries once
+  useEffect(() => {
+    fetch(`${SERVER}/api/ss/matches`, { signal: AbortSignal.timeout(5000) })
+      .then(r => r.json())
+      .then(data => { setSSMatches(data); setSSOnline(true); })
+      .catch(() => { setSSMatches([]); setSSOnline(false); });
+  }, []);
+
+  const [selMatch,   setSelMatch]   = useState(null);
+  const [selRally,   setSelRally]   = useState(null);
+  const [selShotIdx, setSelShotIdx] = useState(0);
+  const [scrubFrame,   setScrubFrame]   = useState(null);  // null = show hit frame
+  const [rallyMeta,    setRallyMeta]    = useState(null);  // /api/ss/rally response
+
+  // Fetch shots when a match is selected
+  useEffect(() => {
+    if (!selMatch) return;
+    setShotsLoading(true);
+    fetch(`${SERVER}/api/ss/match/${encodeURIComponent(selMatch)}`)
+      .then(r => r.json())
+      .then(data => setMatchShots(data.shots || []))
+      .catch(() => setMatchShots([]))
+      .finally(() => setShotsLoading(false));
+  }, [selMatch]);
+
+  // Group loaded shots by rally_uid (unique per set+rally, avoids set1-rally1 = set2-rally1)
+  const rallyGroups = useMemo(() => {
+    const g = {};
+    matchShots.forEach(s => {
+      const key = s.rally_uid || String(s.rally);
+      if (!g[key]) g[key] = [];
+      g[key].push(s);
+    });
+    return g;
+  }, [matchShots]);
+
+  // Auto-select first rally when shots load
+  useEffect(() => {
+    if (matchShots.length > 0) {
+      const r = Object.keys(rallyGroups).sort()[0];
+      setSelRally(r); setSelShotIdx(0);
+    }
+  }, [matchShots]);
+
+  // Fetch rally frame range whenever rally changes (enables scrubber)
+  useEffect(() => {
+    if (!selMatch || !selRally) { setRallyMeta(null); return; }
+    const enc = encodeURIComponent(selMatch);
+    fetch(`${SERVER}/api/ss/rally/${enc}/${selRally}`)
+      .then(r => r.json()).then(setRallyMeta).catch(() => setRallyMeta(null));
+  }, [selMatch, selRally]);
+
+  // Reset scrubber when shot changes
+  useEffect(() => { setScrubFrame(null); }, [selShotIdx]);
+
+  const rallies    = Object.keys(rallyGroups).sort();
+  const rallyShots = (selRally != null && rallyGroups[selRally]) || [];
+  const currentShot = rallyShots[selShotIdx] || null;
+
+  const selectMatch = m => {
+    setSelMatch(m); setSelRally(null); setSelShotIdx(0); setMatchShots([]);
+  };
+
+  if (ssMatches === null) return (
+    <div style={{padding:'10px 14px',background:'#1e293b',borderRadius:8,fontSize:11,color:'#64748b',fontFamily:M}}>
+      Loading ShuttleSet matches…</div>
+  );
+  if (!ssOnline) return (
+    <div style={{padding:'12px 16px',background:'#7f1d1d22',border:'1px solid #ef444433',borderRadius:8}}>
+      <div style={{fontSize:12,color:'#ef4444',fontFamily:M,fontWeight:600,marginBottom:4}}>⚠ Server not running</div>
+      <div style={{fontSize:11,color:'#fca5a5',lineHeight:1.7}}>
+        Start: <code style={{fontFamily:M,color:'#f87171',background:'#450a0a',padding:'2px 8px',borderRadius:4}}>python badminton_server.py</code>
+      </div>
+    </div>
+  );
+
+  const totalShots = ssMatches.reduce((a,m) => a + m.shot_count, 0);
+  const totalSkel  = ssMatches.reduce((a,m) => a + m.skeleton_count, 0);
+
+  return (
+    <>
+      <div style={{padding:'6px 12px',background:'#10b98111',border:'1px solid #10b98133',
+        borderRadius:8,marginBottom:10,display:'flex',alignItems:'center',gap:8}}>
+        <span style={{color:'#10b981',fontSize:12}}>●</span>
+        <span style={{fontSize:11,color:'#10b981',fontFamily:M}}>
+          Server online · {totalShots.toLocaleString()} shots · {ssMatches.length} matches
+          · {totalSkel} with skeleton
+        </span>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'160px 200px 1fr',gap:12}}>
+
+        {/* Col 1: Match + Rally */}
+        <div style={{display:'flex',flexDirection:'column',gap:10}}>
+          <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+            <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+              MATCHES ({ssMatches.length})</div>
+            <div style={{overflowY:'auto',maxHeight:200}}>
+              {ssMatches.map(entry => {
+                const {match:m, ss_num, winner, loser, rally_count, shot_count} = entry;
+                const isSel = m === selMatch;
+                const label = winner && loser ? `${winner} vs ${loser}` : ssMatchLabel(m);
+                return (
+                  <div key={m} onClick={()=>selectMatch(m)}
+                    style={{padding:'6px 10px',cursor:'pointer',
+                      background:isSel?'#1e293b':'transparent',
+                      borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                      borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                    <div style={{display:'flex',alignItems:'center',gap:5}}>
+                      {ss_num && (
+                        <span style={{fontSize:8,fontFamily:M,color:'#60a5fa',fontWeight:700,
+                          background:'#60a5fa18',borderRadius:3,padding:'1px 4px',flexShrink:0}}>
+                          {ss_num}</span>
+                      )}
+                      <span style={{fontSize:9,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400,
+                        whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',flex:1}}
+                        title={m}>{label}</span>
+                    </div>
+                    <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                      {rally_count} rall{rally_count===1?'y':'ies'} · {shot_count} shots</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {selMatch && (
+            <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+              <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+                {shotsLoading ? 'LOADING…' : `RALLIES — ${rallies.length}`}</div>
+              <div style={{overflowY:'auto',maxHeight:300}}>
+                {rallies.map(r => {
+                  const isSel  = r === selRally;
+                  const rshots = rallyGroups[r];
+                  const s0 = rshots[0];
+                  // rally_uid = "s1r3" → "Set 1 · R3"
+                  const uid = s0?.rally_uid || r;
+                  const uidLabel = uid.replace(/^s(\d+)r(\d+)$/, 'Set $1 · R$2');
+                  return (
+                    <div key={r} onClick={()=>{ setSelRally(r); setSelShotIdx(0); setScrubFrame(null); }}
+                      style={{padding:'6px 10px',cursor:'pointer',
+                        background:isSel?'#1e293b':'transparent',
+                        borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                        borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                      <span style={{fontSize:11,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400}}>
+                        {uidLabel}</span>
+                      <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                        {rshots.length} shot{rshots.length!==1?'s':''}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Col 2: Shot list */}
+        <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',
+          display:'flex',flexDirection:'column',maxHeight:600,overflow:'hidden'}}>
+          <div style={{padding:'6px 8px',borderBottom:'1px solid #1e293b',flexShrink:0,
+            fontSize:8,color:'#64748b',fontFamily:M}}>
+            {selRally != null ? `Rally ${selRally}  ·  ${rallyShots.length} shots` : 'SELECT A RALLY'}
+          </div>
+          <div style={{flex:1,overflowY:'auto'}}>
+            {rallyShots.map((shot, i) => {
+              const typeEn = SS_SHOT_TYPE_EN[shot.shot_type] || shot.shot_type;
+              const isSel  = i === selShotIdx;
+              return (
+                <div key={shot.id} onClick={()=>setSelShotIdx(i)}
+                  style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',
+                    cursor:'pointer',background:isSel?'#1e293b':'transparent',
+                    borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                    borderBottom:'1px solid #1e293b22'}}>
+                  <div style={{width:20,height:20,borderRadius:3,flexShrink:0,fontSize:9,
+                    display:'flex',alignItems:'center',justifyContent:'center',
+                    background:'#60a5fa22',color:'#60a5fa',fontFamily:M,fontWeight:600}}>
+                    {shot.ball_round}
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:9,color:isSel?'#f8fafc':'#94a3b8',fontFamily:M,
+                      whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{typeEn}</div>
+                    <div style={{fontSize:7,color:'#475569',fontFamily:M,marginTop:1}}>
+                      {shot.shot_type} · P{shot.player} · f{shot.frame_num}</div>
+                  </div>
+                  {shot.has_skeleton && (
+                    <div style={{width:6,height:6,borderRadius:'50%',background:'#10b981',flexShrink:0}}
+                      title="Skeleton extracted"/>
+                  )}
+                </div>
+              );
+            })}
+            {rallyShots.length === 0 && (
+              <div style={{padding:16,textAlign:'center',color:'#475569',fontSize:10}}>
+                {selMatch ? 'Select a rally' : 'Select a match'}</div>
+            )}
+          </div>
+        </div>
+
+        {/* Col 3: Frame canvas */}
+        <div>
+          {/* Match info card */}
+          {selMatch && ssMatches && (() => {
+            const info = ssMatches.find(x => x.match === selMatch);
+            if (!info || !info.winner) return null;
+            return (
+              <div style={{marginBottom:8,padding:'7px 12px',background:'#0f172a',borderRadius:8,
+                border:'1px solid #1e293b',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                {info.ss_num && (
+                  <span style={{fontSize:9,fontFamily:M,color:'#60a5fa',fontWeight:700,
+                    background:'#60a5fa18',borderRadius:3,padding:'2px 6px',flexShrink:0}}>
+                    {info.ss_num}</span>
+                )}
+                <span style={{fontSize:12,color:'#f8fafc',fontWeight:600,fontFamily:F}}>{info.winner}</span>
+                <span style={{fontSize:10,color:'#475569',fontFamily:M}}>vs</span>
+                <span style={{fontSize:12,color:'#f8fafc',fontWeight:600,fontFamily:F}}>{info.loser}</span>
+                <span style={{fontSize:9,color:'#64748b',fontFamily:M,marginLeft:'auto',textAlign:'right'}}>
+                  {info.tournament}{info.year?` ${info.year}`:''}{info.round?` · ${info.round}`:''}</span>
+              </div>
+            );
+          })()}
+          {currentShot ? (
+            <>
+              <SSFrameCanvas shot={currentShot} frameNum={scrubFrame} rallyShots={rallyShots} skelMode='gdino' width={760} height={427}/>
+
+              {/* ── Rally frame scrubber (only when consecutive frames available) ── */}
+              {rallyMeta && rallyMeta.frame_max > rallyMeta.frame_min && (
+                <SSScrubber
+                  rallyMeta={rallyMeta}
+                  hitFrame={currentShot.frame_num}
+                  scrubFrame={scrubFrame}
+                  onScrub={setScrubFrame}
+                  onShotJump={s => {
+                    const idx = rallyShots.findIndex(r => r.frame_num === s.hit_frame);
+                    if (idx >= 0) { setSelShotIdx(idx); setScrubFrame(null); }
+                  }}
+                />
+              )}
+
+              {/* ── Shot slider ── */}
+              {rallyShots.length > 1 && (
+                <div style={{marginTop:8,background:'#0f172a',borderRadius:8,
+                  border:'1px solid #1e293b',padding:'8px 12px'}}>
+                  {/* Info row */}
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+                    <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+                      Shot&nbsp;
+                      <span style={{color:'#e2e8f0',fontWeight:600}}>{selShotIdx+1}</span>
+                      &nbsp;/&nbsp;{rallyShots.length}
+                      &nbsp;·&nbsp;
+                      <span style={{color:'#60a5fa'}}>
+                        {SS_SHOT_TYPE_EN[currentShot.shot_type]||currentShot.shot_type}
+                      </span>
+                      &nbsp;·&nbsp;f{currentShot.frame_num}
+                      {currentShot.has_shuttle && (
+                        <span style={{color:'#FFE66D',marginLeft:6}}>● shuttle</span>
+                      )}
+                    </span>
+                    <div style={{display:'flex',gap:6}}>
+                      <button
+                        onClick={()=>setSelShotIdx(i=>Math.max(0,i-1))}
+                        disabled={selShotIdx===0}
+                        style={{padding:'2px 10px',borderRadius:4,border:'1px solid #334155',
+                          background:'#1e293b',color:selShotIdx===0?'#334155':'#94a3b8',
+                          fontFamily:M,fontSize:11,cursor:selShotIdx===0?'default':'pointer'}}>←</button>
+                      <button
+                        onClick={()=>setSelShotIdx(i=>Math.min(rallyShots.length-1,i+1))}
+                        disabled={selShotIdx===rallyShots.length-1}
+                        style={{padding:'2px 10px',borderRadius:4,border:'1px solid #334155',
+                          background:'#1e293b',
+                          color:selShotIdx===rallyShots.length-1?'#334155':'#94a3b8',
+                          fontFamily:M,fontSize:11,
+                          cursor:selShotIdx===rallyShots.length-1?'default':'pointer'}}>→</button>
+                    </div>
+                  </div>
+                  {/* Slider */}
+                  <input type="range" min={0} max={rallyShots.length-1} value={selShotIdx}
+                    onChange={e=>setSelShotIdx(Number(e.target.value))}
+                    style={{width:'100%',accentColor:'#60a5fa'}}/>
+                  {/* Shot-type tick labels (evenly sampled, max 12) */}
+                  <div style={{position:'relative',height:14,marginTop:2}}>
+                    {rallyShots.filter((_,i)=>
+                      rallyShots.length<=12 || i%(Math.ceil(rallyShots.length/12))===0
+                    ).map((s,_,arr)=>{
+                      const idx = rallyShots.indexOf(s);
+                      const pct  = idx/(rallyShots.length-1||1)*100;
+                      const typeShort = (SS_SHOT_TYPE_EN[s.shot_type]||s.shot_type).slice(0,6);
+                      return (
+                        <span key={idx} style={{position:'absolute',left:`${pct}%`,
+                          transform:'translateX(-50%)',fontSize:7,fontFamily:M,
+                          color: idx===selShotIdx?'#60a5fa':'#334155',
+                          whiteSpace:'nowrap',cursor:'pointer'}}
+                          onClick={()=>setSelShotIdx(idx)}>
+                          {typeShort}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Stats row ── */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginTop:8}}>
+                {[
+                  ['Shot type', SS_SHOT_TYPE_EN[currentShot.shot_type]||currentShot.shot_type, '#60a5fa'],
+                  ['Player',    `Player ${currentShot.player}`, '#e2e8f0'],
+                  ['Skeleton',  currentShot.has_skeleton?'✓ extracted':'pending',
+                                currentShot.has_skeleton?'#10b981':'#f59e0b'],
+                  ['Frame',     `#${currentShot.frame_num}`, '#94a3b8'],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{background:'#0f172a',borderRadius:6,padding:'8px 10px',
+                    border:'1px solid #1e293b',textAlign:'center'}}>
+                    <div style={{fontSize:7,color:'#64748b',fontFamily:M,marginBottom:3}}>{l}</div>
+                    <div style={{fontSize:11,fontWeight:600,fontFamily:M,color:c}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* ── Strategy prediction panel ── */}
+              {currentShot.predicted_strategy ? (()=>{
+                const strat     = currentShot.predicted_strategy;
+                const conf      = currentShot.strategy_confidence || 0;
+                const probs     = currentShot.strategy_probs || {};
+                const si        = STRAT[strat] || {};
+                const confPct   = Math.round(conf * 100);
+                const confColor = conf >= 0.7 ? '#10b981' : conf >= 0.5 ? '#f59e0b' : '#ef4444';
+                const stratKeys = Object.keys(STRAT).filter(k => !STRAT[k].excluded);
+                return (
+                  <div style={{marginTop:8,background:'#0f172a',borderRadius:8,
+                    border:`1px solid ${si.color||'#334155'}44`,padding:'10px 14px'}}>
+                    <div style={{display:'flex',alignItems:'center',
+                      justifyContent:'space-between',marginBottom:8}}>
+                      <span style={{fontSize:9,fontFamily:M,color:'#64748b',letterSpacing:1}}>
+                        PREDICTED STRATEGY</span>
+                      <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+                        {currentShot.hit_type_pred &&
+                          <span style={{color:'#a78bfa'}}>{currentShot.hit_type_pred} · </span>}
+                        conf <span style={{color:confColor,fontWeight:700}}>{confPct}%</span>
+                      </span>
+                    </div>
+                    <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+                      <span style={{fontSize:20}}>{si.icon||'?'}</span>
+                      <div>
+                        <div style={{fontSize:14,fontWeight:700,fontFamily:F,
+                          color:si.color||'#e2e8f0'}}>{si.label||strat}</div>
+                        <div style={{width:200,height:4,background:'#1e293b',
+                          borderRadius:2,marginTop:4}}>
+                          <div style={{width:`${confPct}%`,height:'100%',
+                            background:confColor,borderRadius:2,transition:'width 0.3s'}}/>
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:4}}>
+                      {stratKeys.map(s=>{
+                        const p   = probs[s] || 0;
+                        const pct = Math.round(p * 100);
+                        const si2 = STRAT[s];
+                        const top = s === strat;
+                        return (
+                          <div key={s} style={{textAlign:'center',borderRadius:4,padding:'4px 2px',
+                            background: top ? `${si2.color}18` : 'transparent',
+                            border: top ? `1px solid ${si2.color}55` : '1px solid transparent'}}>
+                            <div style={{fontSize:8,color:si2.color,fontFamily:M,
+                              fontWeight:top?700:400,whiteSpace:'nowrap',overflow:'hidden',
+                              textOverflow:'ellipsis'}}>{si2.label.split(' ')[0]}</div>
+                            <div style={{fontSize:12,color:top?si2.color:'#475569',
+                              fontFamily:M,fontWeight:600}}>{pct}%</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })() : (
+                <div style={{marginTop:8,padding:'10px 12px',background:'#0f172a',borderRadius:6,
+                  border:'1px solid #1e293b',fontSize:9,color:'#475569',fontFamily:M,
+                  textAlign:'center'}}>
+                  {currentShot.has_skeleton
+                    ? 'Prediction pending — restart server after training completes'
+                    : 'No skeleton — prediction unavailable'}
+                </div>
+              )}
+
+              {/* ── Pipeline legend ── */}
+              <div style={{marginTop:8,padding:'8px 12px',background:'#1e293b',borderRadius:6,
+                fontSize:9,color:'#64748b',fontFamily:M,lineHeight:1.7}}>
+                Frame → GDINO skeleton (17 joints × 2 players) → hitter-first reorder →
+                T=16 window → Feature eng. L2 → ST-GCN →&nbsp;
+                <span style={{color:'#60a5fa'}}>SSL pre-train (shot-type aux)</span> →&nbsp;
+                <span style={{color:'#a78bfa'}}>ProtoNet fine-tune (strategy + hit-type aux)</span> →&nbsp;
+                <span style={{color:'#10b981'}}>strategy prediction</span>
+              </div>
+            </>
+          ) : (
+            <div style={{background:'#0f172a',borderRadius:10,border:'1px solid #1e293b',
+              padding:40,textAlign:'center',color:'#475569',fontSize:12}}>
+              Select a shot from the list</div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ─── TAB: VIDEO OVERLAY ────────────────────────────────────────────────────────
 function VideoOverlayTab() {
-  const { online, shots, loading } = useRealFrames();
+  const { online, shots, loading }   = useRealFrames();
+  const [dataset,     setDataset]    = useState('fb');   // 'fb' | 'ss'
   const [view,        setView]       = useState('real');
   const [selMatch,    setSelMatch]   = useState(null);
   const [selRally,    setSelRally]   = useState(null);
@@ -1089,7 +1897,7 @@ function VideoOverlayTab() {
   const [stratFilter, setStratFilter]= useState('all');
   const [scrubFrame,   setScrubFrame]  = useState(null);  // null = show hit frame
   const [rallyMeta,    setRallyMeta]   = useState(null);  // /api/rally response
-  const [skelMode,     setSkelMode]    = useState('original');  // 'original' | 'gdino'
+  const [skelMode,     setSkelMode]    = useState('gdino');  // 'original' | 'gdino'
   const [gdinoRallies, setGdinoRallies]= useState([]);
 
   // Build match → rally → shots hierarchy
@@ -1169,6 +1977,16 @@ function VideoOverlayTab() {
     return result;
   }, [scrubFrame, rallyMeta]);
 
+  // Shot whose hit_frame the scrubber has most recently passed — drives metadata panel
+  const activeScrubShot = useMemo(() => {
+    if (!scrubFrame || !rallyShotsRaw.length) return currentShot;
+    let result = null;
+    for (const s of rallyShotsRaw) {
+      if (s.hit_frame <= scrubFrame) result = s;
+    }
+    return result || currentShot;
+  }, [scrubFrame, rallyShotsRaw, currentShot]);
+
   return (
     <div style={{padding:20}}>
       {/* Header */}
@@ -1178,16 +1996,32 @@ function VideoOverlayTab() {
             PHASE C · VIDEO FRAME + SKELETON OVERLAY</div>
           <div style={{fontSize:22,fontFamily:IS,fontStyle:'italic'}}>Match Video Analysis</div>
         </div>
-        <div style={{display:'flex',gap:6}}>
-          {[['real','📷 Real Frames'],['court','🗺 Court View']].map(([v,l])=>(
-            <button key={v} onClick={()=>setView(v)}
-              style={{background:view===v?'#1e293b':'transparent',
-                border:`1px solid ${view===v?'#FF6B35':'#334155'}`,
-                color:view===v?'#f8fafc':'#64748b',padding:'6px 14px',
-                borderRadius:8,fontSize:11,cursor:'pointer'}}>
-              {l}
-            </button>
-          ))}
+        <div style={{display:'flex',gap:10,alignItems:'center'}}>
+          {/* Dataset toggle */}
+          <div style={{display:'flex',background:'#0f172a',padding:3,borderRadius:8,
+            border:'1px solid #1e293b',gap:2}}>
+            {[['fb','FineBadminton'],['ss','ShuttleSet']].map(([d,l])=>(
+              <button key={d} onClick={()=>setDataset(d)}
+                style={{padding:'5px 14px',borderRadius:6,fontSize:11,cursor:'pointer',border:'none',
+                  background:dataset===d?'#FF6B35':'transparent',
+                  color:dataset===d?'#fff':'#64748b',
+                  fontWeight:dataset===d?600:400,transition:'all 0.15s'}}>
+                {l}
+              </button>
+            ))}
+          </div>
+          {/* View toggle */}
+          <div style={{display:'flex',gap:6}}>
+            {[['real','📷 Real Frames'],['court','🗺 Court View']].map(([v,l])=>(
+              <button key={v} onClick={()=>setView(v)}
+                style={{background:view===v?'#1e293b':'transparent',
+                  border:`1px solid ${view===v?'#FF6B35':'#334155'}`,
+                  color:view===v?'#f8fafc':'#64748b',padding:'6px 14px',
+                  borderRadius:8,fontSize:11,cursor:'pointer'}}>
+                {l}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -1209,8 +2043,8 @@ function VideoOverlayTab() {
         </div>
       )}
 
-      {/* Real Frames View */}
-      {view==='real' && (
+      {/* Real Frames View – FineBadminton */}
+      {view==='real' && dataset==='fb' && (
         <>
           {/* Server status banner */}
           {loading ? (
@@ -1396,7 +2230,7 @@ function VideoOverlayTab() {
                 </div>
               </div>
 
-              {/* ── Col 3: Frame canvas ── */}
+              {/* ── Col 3: Frame canvas + court panel ── */}
               <div>
                 {currentShot ? (
                   <>
@@ -1426,9 +2260,16 @@ function VideoOverlayTab() {
                         </span>
                       )}
                     </div>
-                    <RealFrameCanvas shot={currentShot} width={760} height={427}
-                      frameNum={scrubFrame} rallyMeta={rallyMeta} skelMode={skelMode}
-                      hitterOverride={frameHitter}/>
+                    <div style={{display:'flex',gap:8,alignItems:'flex-start'}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <RealFrameCanvas shot={currentShot} width={680} height={382}
+                          frameNum={scrubFrame} rallyMeta={rallyMeta} skelMode={skelMode}
+                          hitterOverride={frameHitter}/>
+                      </div>
+                      <CourtBirdseyePanel shot={currentShot}
+                        frameNum={scrubFrame} rallyMeta={rallyMeta}
+                        hitterOverride={frameHitter}/>
+                    </div>
                     <RallyScrubber
                       rallyMeta={rallyMeta}
                       currentShot={currentShot}
@@ -1440,7 +2281,7 @@ function VideoOverlayTab() {
                       }}/>
 
                     {/* Excluded disclaimer banner */}
-                    {currentShot.excluded && (
+                    {activeScrubShot.excluded && (
                       <div style={{marginTop:8,padding:'8px 12px',
                         background:'#f59e0b11',border:'1px solid #f59e0b44',borderRadius:6,
                         display:'flex',alignItems:'flex-start',gap:8}}>
@@ -1449,7 +2290,7 @@ function VideoOverlayTab() {
                           <div style={{fontSize:10,color:'#f59e0b',fontFamily:M,fontWeight:600,marginBottom:2}}>
                             Annotation-only strategy — not used in the model</div>
                           <div style={{fontSize:9,color:'#92400e',fontFamily:M,lineHeight:1.6}}>
-                            <strong style={{color:'#fbbf24'}}>{STRAT[currentShot.strategy].label}</strong> cannot be
+                            <strong style={{color:'#fbbf24'}}>{STRAT[activeScrubShot.strategy].label}</strong> cannot be
                             reliably inferred from skeleton kinematics alone — it requires intent/context beyond
                             what 2D joint positions encode. It is present in the raw annotations for reference
                             but is excluded from ProtoNet training and evaluation.
@@ -1459,14 +2300,14 @@ function VideoOverlayTab() {
                     )}
 
                     {/* Metadata row */}
-                    <div style={{display:'grid',gridTemplateColumns:`repeat(${currentShot.excluded?3:5},1fr)`,gap:8,marginTop:8}}>
+                    <div style={{display:'grid',gridTemplateColumns:`repeat(${activeScrubShot.excluded?3:5},1fr)`,gap:8,marginTop:8}}>
                       {[
-                        ['Strategy',  STRAT[currentShot.strategy].label, STRAT[currentShot.strategy].color],
-                        ['Shot type', currentShot.hit_type, '#e2e8f0'],
-                        ['Hitter',    currentShot.hitter,   '#e2e8f0'],
-                        ...(!currentShot.excluded ? [
-                          ['Confidence',`${(currentShot.conf*100).toFixed(0)}%`, currentShot.conf>.75?'#10b981':'#f59e0b'],
-                          ['Margin',   `${(currentShot.margin*100).toFixed(0)}%`,currentShot.margin>.15?'#10b981':'#ef4444'],
+                        ['Strategy',  STRAT[activeScrubShot.strategy].label, STRAT[activeScrubShot.strategy].color],
+                        ['Shot type', activeScrubShot.hit_type, '#e2e8f0'],
+                        ['Hitter',    activeScrubShot.hitter,   '#e2e8f0'],
+                        ...(!activeScrubShot.excluded ? [
+                          ['Confidence',`${(activeScrubShot.conf*100).toFixed(0)}%`, activeScrubShot.conf>.75?'#10b981':'#f59e0b'],
+                          ['Margin',   `${(activeScrubShot.margin*100).toFixed(0)}%`,activeScrubShot.margin>.15?'#10b981':'#ef4444'],
                         ] : []),
                       ].map(([l,v,c])=>(
                         <div key={l} style={{background:'#0f172a',borderRadius:6,padding:'8px 10px',
@@ -1480,13 +2321,13 @@ function VideoOverlayTab() {
                     {/* Pipeline note */}
                     <div style={{marginTop:8,padding:'8px 12px',background:'#1e293b',borderRadius:6,
                       fontSize:9,color:'#64748b',fontFamily:M,lineHeight:1.7}}>
-                      {currentShot.excluded
+                      {activeScrubShot.excluded
                         ? <>Frame → YOLOv8-Pose (17 joints × 2 players) → skeleton extracted for visualisation only ·
                           &nbsp;<span style={{color:'#f59e0b'}}>strategy label from annotation, not predicted by model</span></>
                         : <>Frame → YOLOv8-Pose (17 joints × 2 players) → hitter-first reorder → T=16 window →
                           Feature eng. L2 → ST-GCN (34 nodes) → ProtoNet 5-way →&nbsp;
-                          <span style={{color:STRAT[currentShot.strategy].color}}>
-                            {STRAT[currentShot.strategy].label}
+                          <span style={{color:STRAT[activeScrubShot.strategy].color}}>
+                            {STRAT[activeScrubShot.strategy].label}
                           </span></>
                       }
                     </div>
@@ -1501,6 +2342,11 @@ function VideoOverlayTab() {
             </div>
           )}
         </>
+      )}
+
+      {/* Real Frames View – ShuttleSet */}
+      {view==='real' && dataset==='ss' && (
+        <SSBrowser />
       )}
     </div>
   );
@@ -2057,194 +2903,165 @@ AblationConfig(
 }
 
 // ─── TAB: PREDICTIONS ────────────────────────────────────────────────────────
+// Uses real FB shots + real frame/skeleton viewer from the server.
+// Prediction panels (confidence, ProtoNet distances, t-SNE) are pending model training.
 function PredictionsTab() {
-  const [sel, setSel] = useState(0);
-  const d = RALLY[sel];
-  const sc = {};
-  RALLY.forEach(s=>{ sc[s.strategy]=(sc[s.strategy]||0)+1; });
-  const dom = Object.entries(sc).sort((a,b)=>b[1]-a[1])[0][0];
-  const avgC = RALLY.reduce((a,s)=>a+s.conf,0)/RALLY.length;
+  const { online, shots, loading } = useRealFrames();
+  const [selShotIdx, setSelShotIdx] = useState(0);
+  const [rallyMeta,  setRallyMeta]  = useState(null);
+
+  // Group shots by rally (video id)
+  const rallies = useMemo(() => {
+    const g = {};
+    shots.forEach(s => { if(!g[s.video]) g[s.video]=[];  g[s.video].push(s); });
+    return g;
+  }, [shots]);
+  const rallyKeys = useMemo(() => Object.keys(rallies).sort(), [rallies]);
+  const [selRally, setSelRally] = useState(null);
+  useEffect(() => {
+    if(rallyKeys.length && !selRally) setSelRally(rallyKeys[0]);
+  }, [rallyKeys]);
+
+  const rallyShots = (selRally && rallies[selRally]) || [];
+  const shot = rallyShots[selShotIdx] || null;
+
+  // Fetch rally metadata for the frame scrubber
+  useEffect(() => {
+    if(!selRally) return;
+    fetch(`${SERVER}/api/rally/${selRally}`)
+      .then(r=>r.json()).then(setRallyMeta).catch(()=>setRallyMeta(null));
+  }, [selRally]);
+
+  // Reset shot index when rally changes
+  useEffect(() => { setSelShotIdx(0); }, [selRally]);
+
+  // Pending-model overlay for prediction panels
+  const PendingOverlay = () => (
+    <div style={{position:'absolute',inset:0,background:'#0a0f1a99',backdropFilter:'blur(2px)',
+      borderRadius:10,display:'flex',alignItems:'center',justifyContent:'center',zIndex:2}}>
+      <span style={{fontSize:10,fontFamily:M,color:'#f59e0b'}}>⏳ pending trained model</span>
+    </div>
+  );
+
+  if(!online) return (
+    <div style={{padding:20,color:'#ef4444',fontFamily:M,fontSize:12}}>
+      ⚠ Server not running — start badminton_server.py to use this tab.</div>
+  );
 
   return (
     <div style={{display:'flex',height:'calc(100vh - 160px)'}}>
       {/* Left: shot list */}
-      <div style={{width:280,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column',flexShrink:0}}>
-        <div style={{padding:'10px 12px',borderBottom:'1px solid #1e293b'}}>
-          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:6}}>RALLY SUMMARY</div>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:4,marginBottom:8}}>
-            {[{v:RALLY.length,l:'shots',c:'#e2e8f0'},
-              {v:`${(avgC*100).toFixed(0)}%`,l:'avg conf',c:avgC>.75?'#10b981':'#f59e0b'},
-              {v:RALLY.filter(s=>s.margin<0.15).length,l:'flagged',c:'#ef4444'},
-            ].map(({v,l,c},i)=>(
-              <div key={i} style={{background:'#0f172a',borderRadius:6,padding:'6px 8px',border:'1px solid #1e293b'}}>
-                <div style={{fontSize:16,fontWeight:700,fontFamily:M,color:c}}>{v}</div>
-                <div style={{fontSize:7,color:'#64748b'}}>{l}</div>
-              </div>
-            ))}
-          </div>
-          {/* Strategy distribution bar */}
-          <div style={{display:'flex',height:5,borderRadius:3,overflow:'hidden'}}>
-            {Object.entries(sc).sort((a,b)=>b[1]-a[1]).map(([s,c])=>(
-              <div key={s} style={{width:`${(c/RALLY.length)*100}%`,background:STRAT[s].color}}/>
+      <div style={{width:240,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column',flexShrink:0}}>
+        {/* Rally selector */}
+        <div style={{padding:'8px 10px',borderBottom:'1px solid #1e293b',overflowX:'auto'}}>
+          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:6}}>RALLY</div>
+          <div style={{display:'flex',flexDirection:'column',gap:3}}>
+            {rallyKeys.map(r=>(
+              <button key={r} onClick={()=>setSelRally(r)}
+                style={{background:selRally===r?'#1e293b':'transparent',
+                  border:`1px solid ${selRally===r?'#FF6B35':'#1e293b'}`,
+                  color:selRally===r?'#f8fafc':'#64748b',padding:'4px 8px',borderRadius:5,
+                  fontSize:9,cursor:'pointer',textAlign:'left',fontFamily:M,
+                  whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                {r}
+              </button>
             ))}
           </div>
         </div>
+        {/* Shot list */}
         <div style={{flex:1,overflowY:'auto'}}>
-          {RALLY.map((s,i)=>(
-            <div key={i} onClick={()=>setSel(i)}
-              style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',cursor:'pointer',
-                background:sel===i?'#1e293b':'transparent',
-                borderLeft:sel===i?`3px solid ${STRAT[s.strategy].color}`:'3px solid transparent',
-                borderBottom:'1px solid #1e293b22',transition:'all .15s'}}>
-              <div style={{width:26,height:26,borderRadius:5,flexShrink:0,display:'flex',
-                alignItems:'center',justifyContent:'center',fontSize:13,
-                background:`${STRAT[s.strategy].color}22`}}>
-                {STRAT[s.strategy].icon}
-              </div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:'flex',alignItems:'center',gap:4,flexWrap:'wrap'}}>
-                  <span style={{fontSize:11,fontWeight:500}}>Shot {i+1}</span>
-                  <span style={{fontSize:10,color:STRAT[s.strategy].color,fontFamily:M}}>
-                    {STRAT[s.strategy].label}</span>
-                  <span style={{fontSize:9,color:'#64748b',fontFamily:M,background:'#1e293b',
-                    padding:'1px 4px',borderRadius:3}}>{s.shot}</span>
-                  {s.margin<0.15&&<span style={{fontSize:8,background:'#ef444433',color:'#fca5a5',
-                    padding:'1px 4px',borderRadius:3,fontFamily:M}}>LOW</span>}
+          <div style={{padding:'6px 10px',fontSize:9,color:'#64748b',fontFamily:M,
+            letterSpacing:1,borderBottom:'1px solid #1e293b'}}>
+            SHOTS ({rallyShots.length})</div>
+          {rallyShots.map((s,i)=>{
+            const strat = STRAT[s.strategy] || {color:'#64748b',icon:'·',label:s.strategy||'—'};
+            return (
+              <div key={s.id||i} onClick={()=>setSelShotIdx(i)}
+                style={{display:'flex',alignItems:'center',gap:8,padding:'7px 10px',cursor:'pointer',
+                  background:selShotIdx===i?'#1e293b':'transparent',
+                  borderLeft:selShotIdx===i?`3px solid ${strat.color}`:'3px solid transparent',
+                  borderBottom:'1px solid #1e293b22',transition:'all .1s'}}>
+                <span style={{fontSize:12,flexShrink:0}}>{strat.icon}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:10,fontWeight:500,color:'#e2e8f0',
+                    whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+                    Shot {i+1} · {s.hit_type||s.strategy||'—'}</div>
+                  <div style={{fontSize:9,color:strat.color,fontFamily:M}}>{strat.label}</div>
                 </div>
-                <div style={{display:'flex',alignItems:'center',gap:4,marginTop:2}}>
-                  <div style={{flex:1,height:3,background:'#1e293b',borderRadius:2,overflow:'hidden'}}>
-                    <div style={{width:`${s.conf*100}%`,height:'100%',background:STRAT[s.strategy].color}}/>
-                  </div>
-                  <span style={{fontSize:9,color:'#64748b',fontFamily:M,width:28,textAlign:'right'}}>
-                    {(s.conf*100).toFixed(0)}%</span>
+                {/* Confidence bar — pending */}
+                <div style={{width:28,height:3,background:'#1e293b',borderRadius:2,flexShrink:0}}>
+                  <div style={{width:'0%',height:'100%',background:strat.color,borderRadius:2}}/>
                 </div>
               </div>
-              <span style={{fontSize:9,color:'#475569',fontFamily:M}}>P{s.hitter}</span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
-      {/* Right: details */}
-      <div style={{flex:1,overflowY:'auto',padding:18}}>
-        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
-          <div>
-            <div style={{fontSize:10,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
-              SHOT {d.shotNumber||sel+1} OF {RALLY.length} · PLAYER {d.hitter} · T=16 FRAMES</div>
-            <div style={{display:'flex',alignItems:'center',gap:10}}>
-              <span style={{fontSize:28,fontFamily:IS,fontStyle:'italic',color:STRAT[d.strategy].color}}>
-                {STRAT[d.strategy].label}</span>
-              <span style={{fontSize:24}}>{STRAT[d.strategy].icon}</span>
-            </div>
-            <div style={{display:'flex',alignItems:'center',gap:6,marginTop:4}}>
-              <div style={{background:'#1e293b',border:'1px solid #334155',borderRadius:6,
-                padding:'3px 10px',fontSize:11,fontFamily:M}}>
-                <span style={{color:'#94a3b8'}}>Shot type: </span>
-                <span style={{color:'#f8fafc',fontWeight:500}}>{d.shot}</span>
-              </div>
-            </div>
+      {/* Centre: real video frame */}
+      <div style={{flex:'0 0 auto',padding:'12px 14px',borderRight:'1px solid #1e293b',
+        display:'flex',flexDirection:'column',gap:8}}>
+        <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1}}>
+          REAL FRAME · SKELETON OVERLAY</div>
+        {shot
+          ? <RealFrameCanvas shot={shot} rallyMeta={rallyMeta} skelMode='gdino' width={560} height={315}/>
+          : <div style={{width:560,height:315,background:'#0f172a',borderRadius:8,
+              display:'flex',alignItems:'center',justifyContent:'center',
+              color:'#334155',fontSize:11,fontFamily:M}}>Select a shot</div>
+        }
+        {shot && (
+          <div style={{fontSize:10,color:'#94a3b8',fontFamily:M}}>
+            {shot.video} · hit frame {shot.hit_frame}
+            {shot.hit_type && <span style={{color:'#60a5fa'}}> · {shot.hit_type}</span>}
           </div>
-          {d.margin<0.15&&(
-            <div style={{background:'#ef444422',border:'1px solid #ef444444',borderRadius:8,
-              padding:'8px 12px',fontSize:11,color:'#fca5a5',maxWidth:200,lineHeight:1.5}}>
-              ⚠ Low margin ({(d.margin*100).toFixed(0)}%). Flag for human review.
+        )}
+      </div>
+
+      {/* Right: prediction panels (pending model) */}
+      <div style={{flex:1,overflowY:'auto',padding:14,display:'flex',flexDirection:'column',gap:10}}>
+        <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1}}>
+          MODEL PREDICTIONS</div>
+
+        {/* Strategy + confidence */}
+        <div style={{position:'relative',background:'#0f172a',borderRadius:10,padding:14,
+          border:'1px solid #1e293b'}}>
+          <PendingOverlay/>
+          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+            PROTOTYPE DISTANCES (ProtoNet 5-way)</div>
+          {Object.entries(STRAT).map(([k,{color,label,icon}])=>(
+            <div key={k} style={{display:'flex',alignItems:'center',gap:6,marginBottom:5}}>
+              <span style={{width:16,fontSize:11}}>{icon}</span>
+              <span style={{width:90,fontSize:10,color:'#475569',fontFamily:M,textAlign:'right'}}>{label}</span>
+              <div style={{flex:1,height:12,background:'#1e293b',borderRadius:3}}/>
+              <span style={{width:30,fontSize:10,color:'#334155',fontFamily:M}}>—</span>
             </div>
-          )}
+          ))}
+          <div style={{marginTop:6,display:'flex',gap:16,fontSize:10,fontFamily:M}}>
+            <span style={{color:'#475569'}}>Conf: <span style={{color:'#334155'}}>—</span></span>
+            <span style={{color:'#475569'}}>Margin: <span style={{color:'#334155'}}>—</span></span>
+          </div>
         </div>
 
-        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
-          {/* Prototype distances */}
-          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
-            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
-              PROTOTYPE DISTANCES (ProtoNet)</div>
-            {Object.entries(STRAT).map(([k,{color,label,icon}])=>{
-              const isTop=k===d.strategy;
-              const PKEYS=Object.keys(STRAT);
-              const PFAKE=[0.28,0.20,0.16,0.22,0.14];
-              const pfSum=PFAKE.reduce((a,b)=>a+b,0)-PFAKE[PKEYS.indexOf(d.strategy)];
-              const barVal=isTop?d.conf:PFAKE[PKEYS.indexOf(k)]*(1-d.conf)/pfSum;
-              return (
-                <div key={k} style={{display:'flex',alignItems:'center',gap:6,marginBottom:5}}>
-                  <span style={{width:16,fontSize:11}}>{icon}</span>
-                  <span style={{width:88,fontSize:10,color:isTop?'#f8fafc':'#64748b',fontFamily:M,textAlign:'right'}}>
-                    {label}</span>
-                  <div style={{flex:1,height:13,background:'#1e293b',borderRadius:3,overflow:'hidden'}}>
-                    <div style={{width:`${barVal*100}%`,height:'100%',
-                      background:isTop?`linear-gradient(90deg,${color}99,${color})`:'#334155',
-                      borderRadius:3,transition:'width .6s'}}/>
-                  </div>
-                  <span style={{width:36,fontSize:10,color:isTop?'#f8fafc':'#475569',fontFamily:M}}>
-                    {(barVal*100).toFixed(0)}%</span>
-                </div>
-              );
-            })}
-            <div style={{marginTop:6,display:'flex',justifyContent:'space-between',fontSize:10,fontFamily:M}}>
-              <span style={{color:'#64748b'}}>Conf: <span style={{color:'#e2e8f0'}}>{(d.conf*100).toFixed(1)}%</span></span>
-              <span style={{color:'#64748b'}}>Margin: <span style={{color:d.margin<.15?'#ef4444':'#10b981'}}>
-                {(d.margin*100).toFixed(1)}%</span></span>
-            </div>
-          </div>
+        {/* t-SNE */}
+        <div style={{position:'relative',background:'#0f172a',borderRadius:10,padding:14,
+          border:'1px solid #1e293b'}}>
+          <PendingOverlay/>
+          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:6}}>
+            EMBEDDING SPACE (t-SNE · 256→2d)</div>
+          <TSNEPlot highlighted={null} w={260} h={180}/>
+        </div>
 
-          {/* Skeleton + features */}
-          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
-            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
-              SKELETON · PLAYER {d.hitter} (Hitter-first reorder)</div>
-            <div style={{display:'flex',gap:10,alignItems:'flex-start'}}>
-              <div style={{background:'#0a0f1a',borderRadius:6,padding:4,border:'1px solid #1e293b',flexShrink:0}}>
-                <SkelSVG pose={getPose(d.strategy)} color={STRAT[d.strategy].color} w={100} h={120}/>
-              </div>
-              <div style={{flex:1}}>
-                <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:4}}>
-                  NODE FEATURES (L2)</div>
-                {[['Velocity','2.3 m/s'],['Dist to net','2.1 m'],['Dist to opp.','5.6 m'],
-                  ['Shoulder ∠','138°'],['Court pos.','Rear']].map(([l,v])=>(
-                  <div key={l} style={{display:'flex',justifyContent:'space-between',padding:'2px 0',
-                    borderBottom:'1px solid #1e293b33',fontSize:10}}>
-                    <span style={{color:'#64748b'}}>{l}</span>
-                    <span style={{fontFamily:M,color:'#e2e8f0'}}>{v}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* t-SNE embedding space */}
-          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b'}}>
-            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
-              EMBEDDING SPACE (t-SNE · 256→2d)</div>
-            <div style={{fontSize:9,color:'#475569',fontFamily:M,marginBottom:6}}>
-              Hover to highlight. Each point = one shot embedding. Clusters = strategy prototypes.</div>
-            <TSNEPlot highlighted={STRAT[d.strategy]?d.strategy:null} w={290} h={240}/>
-          </div>
-
-          {/* Rally flow */}
-          <div style={{background:'#0f172a',borderRadius:10,padding:14,border:'1px solid #1e293b',
-            gridColumn:'span 2'}}>
-            <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
-              RALLY STRATEGY FLOW</div>
-            <div style={{display:'flex',gap:2,alignItems:'flex-end',height:50}}>
-              {RALLY.map((s,i)=>(
-                <div key={i} onClick={()=>setSel(i)}
-                  style={{flex:1,height:`${s.conf*100}%`,minHeight:6,borderRadius:'2px 2px 0 0',
-                    cursor:'pointer',transition:'all .2s',
-                    background:sel===i?STRAT[s.strategy].color:`${STRAT[s.strategy].color}88`}}
-                  title={`Shot ${i+1}: ${STRAT[s.strategy].label} (${s.shot})`}/>
-              ))}
-            </div>
-            <div style={{display:'flex',justifyContent:'space-between',marginTop:4,
-              fontSize:8,color:'#475569',fontFamily:M}}>
-              <span>1</span><span>Rally →</span><span>{RALLY.length}</span>
-            </div>
-            <div style={{marginTop:6,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
-              <span style={{fontSize:10,color:'#64748b'}}>
-                Dominant: <span style={{color:STRAT[dom].color,fontWeight:600}}>
-                  {STRAT[dom].label}</span> ({sc[dom]}/{RALLY.length})
-              </span>
-              <span style={{fontSize:10,color:'#64748b'}}>
-                Avg conf: <span style={{color:avgC>.75?'#10b981':'#f59e0b',fontWeight:600}}>
-                  {(avgC*100).toFixed(0)}%</span>
-              </span>
-            </div>
+        {/* Rally flow */}
+        <div style={{position:'relative',background:'#0f172a',borderRadius:10,padding:14,
+          border:'1px solid #1e293b'}}>
+          <PendingOverlay/>
+          <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:1,marginBottom:8}}>
+            RALLY STRATEGY FLOW</div>
+          <div style={{display:'flex',gap:2,alignItems:'flex-end',height:40}}>
+            {rallyShots.map((_,i)=>(
+              <div key={i} style={{flex:1,height:'40%',minHeight:4,borderRadius:'2px 2px 0 0',
+                background:'#1e293b'}}/>
+            ))}
           </div>
         </div>
       </div>
@@ -2292,7 +3109,7 @@ function ConfigTable({ rows, mt=0 }) {
   );
 }
 
-// ─── PIPELINE FLOW DIAGRAM ────────────────────────────────────────────────────
+// ─── PIPELINE FLOW DIAGRAM ──────────────────────────────────────────���─────────
 function PipelineFlow() {
   const steps = [
     { label:'Video', sub:'mp4/avi/mov', color:'#60a5fa', icon:'🎬' },
@@ -2732,13 +3549,70 @@ class PrototypicalNetwork(nn.Module):
   );
 }
 
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+// ─── INFERENCE DEMO WRAPPER (pending trained model) ──────────────────────
+function PredictionsWrapper() {
+  const [preview, setPreview] = useState(false);
+  if (preview) return (
+    <div>
+      <div style={{padding:'6px 16px',background:'#78350f22',borderBottom:'1px solid #f59e0b44',
+        display:'flex',alignItems:'center',gap:10}}>
+        <span style={{fontSize:10,color:'#f59e0b',fontFamily:M}}>
+          ⚠ ILLUSTRATIVE MOCK DATA — not real model output · 8 hardcoded shots, no match
+        </span>
+        <button onClick={()=>setPreview(false)}
+          style={{marginLeft:'auto',background:'transparent',border:'1px solid #334155',
+            color:'#64748b',padding:'2px 8px',borderRadius:4,fontSize:10,cursor:'pointer'}}>
+          Hide preview
+        </button>
+      </div>
+      <PredictionsTab/>
+    </div>
+  );
+  return (
+    <div style={{position:'relative'}}>
+      {/* Blurred demo content */}
+      <div style={{filter:'blur(3px)',pointerEvents:'none',userSelect:'none',opacity:0.45}}>
+        <PredictionsTab/>
+      </div>
+      {/* Overlay notice */}
+      <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        <div style={{background:'#0f172a',border:'1px solid #334155',borderRadius:12,
+          padding:'32px 40px',maxWidth:480,textAlign:'center',boxShadow:'0 0 60px #00000088'}}>
+          <div style={{fontSize:28,marginBottom:12}}>🏗</div>
+          <div style={{fontSize:16,fontWeight:600,marginBottom:8,color:'#f8fafc'}}>
+            Inference Demo — Pending Trained Model</div>
+          <div style={{fontSize:12,color:'#94a3b8',lineHeight:1.7,marginBottom:20}}>
+            This panel shows the full prediction pipeline: ProtoNet strategy classification,
+            per-shot confidence &amp; margin scoring, embedding space visualisation, and
+            rally-level strategy flow. It will be populated once ST-GCN + ProtoNet training
+            is complete.
+          </div>
+          <div style={{display:'flex',gap:10,justifyContent:'center',flexWrap:'wrap',marginBottom:20}}>
+            {[['ST-GCN encoder','pending'],['SSL pre-training','pending'],
+              ['ProtoNet 5-way','pending'],['Confidence scoring','pending']].map(([l,s])=>(
+              <div key={l} style={{background:'#1e293b',borderRadius:6,padding:'5px 10px',
+                fontSize:10,fontFamily:M,color:'#64748b'}}>
+                {l} <span style={{color:'#f59e0b'}}>· {s}</span>
+              </div>
+            ))}
+          </div>
+          <button onClick={()=>setPreview(true)}
+            style={{background:'transparent',border:'1px solid #334155',color:'#64748b',
+              padding:'6px 16px',borderRadius:6,fontSize:11,cursor:'pointer'}}>
+            Preview mock layout →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────��───
 const TABS = [
-  { id:'overlay',   label:'Video Overlay',    icon:'🎥' },
-  { id:'preproc',   label:'Preprocessing',    icon:'⚙' },
-  { id:'training',  label:'Training',         icon:'📈' },
-  { id:'predict',   label:'Predictions',      icon:'🎯' },
-  { id:'arch',      label:'Architecture',     icon:'🏗' },
+  { id:'overlay',   label:'Annotation QA',      icon:'🔍' },
+  { id:'preproc',   label:'Data Pipeline',       icon:'⚙' },
+  { id:'predict',   label:'Inference Demo',      icon:'🎯' },
+  { id:'arch',      label:'Architecture',        icon:'🏗' },
 ];
 
 function App() {
@@ -2756,7 +3630,7 @@ function App() {
           <div>
             <div style={{fontSize:14,fontWeight:600,letterSpacing:'-.02em'}}>Badminton Pipeline Demo</div>
             <div style={{fontSize:9,color:'#64748b',fontFamily:M,letterSpacing:.5}}>
-              SENSE-CHECK TOOL · COURT→SKELETON→ST-GCN→PROTONET</div>
+              ANNOTATION QA · DATA PIPELINE · INFERENCE DEMO · ARCHITECTURE</div>
           </div>
         </div>
         <div style={{display:'flex',gap:2}}>
@@ -2779,8 +3653,7 @@ function App() {
       {/* Tab content */}
       {tab==='overlay'  && <VideoOverlayTab/>}
       {tab==='preproc'  && <PreprocessingTab/>}
-      {tab==='training' && <TrainingTab/>}
-      {tab==='predict'  && <PredictionsTab/>}
+      {tab==='predict'  && <PredictionsWrapper/>}
       {tab==='arch'     && <ArchitectureTab/>}
     </div>
   );

@@ -570,73 +570,84 @@ Phase B is near-parameter-free. The ProtoNet operates in two steps:
 
 | Encoder | Pre-training | Classifier | Macro-F1 | Notes |
 |---|---|---|---|---|
-| Random baseline | — | — | ~20.0% | Theoretical floor (uniform 5-class) |
-| Majority class | — | — | \[TBD\] | Always predict "passive" |
-| **ST-GCN + ProtoNet** | **None (random init)** | **5-way 10-shot** | **37.0% ± 3.3%** | **Completed — L2 features, GDINO skeletons** |
-| ST-GCN + Linear probe | SimCLR + Aux | — | \[TBD\] est. 50–60% | Awaiting SSL pre-training |
-| **ST-GCN + ProtoNet** | **SimCLR + Aux** | **5-way 10-shot** | **\[TBD\] est. 65–75%** | **Primary target** |
-| Transformer + ProtoNet | SimCLR + Aux | 5-way 10-shot | \[TBD\] | Architecture ablation |
-| LSTM + ProtoNet | None (random init) | 5-way 10-shot | \[TBD\] | Sanity check |
-| 1D-CNN + ProtoNet | None (random init) | 5-way 10-shot | \[TBD\] | Sanity check |
+| Random baseline | — | uniform | ~20.0% | Theoretical floor (uniform 5-class) |
+| Majority class | — | always "intercept" | ~15.6% | Always predict majority class |
+| **ST-GCN + ProtoNet** | **None (random init)** | **5-way 10-shot** | **36.9% ± 3.3%** | **✅ Done — L2, GDINO, episodic fine-tune** |
+| ST-GCN + ProtoNet | SSL + Aux (L2) | 5-way 10-shot (frozen enc) | 55.9% ± 8.9% | ✅ Done (preliminary — frozen enc, not fine-tuned) |
+| **ST-GCN + ProtoNet** | **SSL + Aux (L2)** | **5-way 10-shot (fine-tuned)** | **\[TBD\]** | **Primary target — Step 3 ablation** |
+| Transformer + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
+| LSTM + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
+| 1D-CNN + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
 
-### 8.2 Per-Strategy F1 by Feature Layer (Step 1 Ablation)
+### 8.2 Per-Strategy F1 by Feature Layer (Step 1a)
 
-*Table 6: Per-strategy F1 across input feature layers*
+*Table 6: Per-strategy F1 across input feature layers (Step 1a ablation — pending Colab run)*
 
-| Strategy | L0 (x,y) | L1 (+vel,accel) | L2 (+court ctx) — random init | L2 — SSL+Aux | L3 (+angles) |
-|---|---|---|---|---|---|
-| create_depth | \[TBD\] | \[TBD\] | **0.581** | \[TBD\] | \[TBD\] |
-| intercept | \[TBD\] | \[TBD\] | **0.522** | \[TBD\] | \[TBD\] |
-| move_to_net | \[TBD\] | \[TBD\] | **0.036** | \[TBD\] | \[TBD\] |
-| passive | \[TBD\] | \[TBD\] | **0.290** | \[TBD\] | \[TBD\] |
-| defensive | \[TBD\] | \[TBD\] | **0.417** | \[TBD\] | \[TBD\] |
-| **Macro-F1** | | | **0.369 ± 0.033** | \[TBD\] | \[TBD\] |
-
-### 8.3 Spatial vs. Temporal Contribution (RQ1)
-
-*Table 7: Per-strategy F1 by feature dimension (uses best encoder, SSL+Aux pre-training)*
-
-| Strategy | Spatial-Only | Temporal-Only | Full (S+T) | Dominant Dim. |
+| Strategy | L0 (x,y) | L1 (+vel,accel) | L2 (+court ctx) — random init | L3 (+angles) |
 |---|---|---|---|---|
-| create_depth | \[TBD\] | \[TBD\] | \[TBD\] | \[TBD\] |
-| intercept | \[TBD\] | \[TBD\] | \[TBD\] | \[TBD\] |
-| move_to_net | \[TBD\] | \[TBD\] | \[TBD\] | \[TBD\] |
-| passive | \[TBD\] | \[TBD\] | \[TBD\] | \[TBD\] |
-| defensive | \[TBD\] | \[TBD\] | \[TBD\] | \[TBD\] |
+| create_depth | \[TBD\] | \[TBD\] | **0.581** | \[TBD\] |
+| intercept | \[TBD\] | \[TBD\] | **0.522** | \[TBD\] |
+| move_to_net | \[TBD\] | \[TBD\] | **0.036** | \[TBD\] |
+| passive | \[TBD\] | \[TBD\] | **0.290** | \[TBD\] |
+| defensive | \[TBD\] | \[TBD\] | **0.417** | \[TBD\] |
+| **Macro-F1** | \[TBD\] | \[TBD\] | **0.369 ± 0.033** | \[TBD\] |
+
+> L2 is the only layer with an SSL checkpoint; L0/L1/L3 comparisons use random init. This means the L2 advantage may partially reflect SSL pre-training rather than feature engineering alone — a known limitation of the sequential ablation design.
+
+### 8.3 Graph Structure Contribution (Step 1b)
+
+*Table 7: Macro-F1 by graph topology — does the opponent skeleton matter?*
+
+| Variant | Nodes | Inter-player edges | Macro-F1 |
+|---------|------:|-------------------|----------|
+| full_dual | 34 | Yes | \[TBD\] |
+| no_inter_edges | 34 | No | \[TBD\] |
+| single_player | 17 | — | \[TBD\] |
+
+> RQ1 (spatial vs. temporal contribution) is addressed indirectly by comparing L0 (position only) vs. L1 (+ velocity/acceleration) in Step 1a, rather than by disabling spatial/temporal conv layers, which would require distinct model variants not currently implemented.
 
 ### 8.4 Ablation Plan Summary
 
-Five ablation steps are run sequentially, each varying one axis while holding
-all others fixed at the best value found so far:
+Six ablation steps are run sequentially, each varying one axis while holding
+all others fixed at the best value found so far. Steps 1a and 1b are separated
+because feature engineering and graph topology answer distinct questions.
 
 ```
-STEP 1 — INPUT REPRESENTATION (fix encoder = ST-GCN, SSL+Aux)
-├── L0: Raw [x,y] only
-├── L1: + velocity, acceleration
-├── L2: + court-relative distances        ← random-init baseline complete
-├── L3: + joint angles
-├── Spatial-only vs. temporal-only (RQ1)
-├── Single-player vs. dual-player
-└── + Racket 18th joint, L4 (stretch)
+STEP 1a — FEATURE ENGINEERING ⭐ (fix encoder=ST-GCN, graph=full dual-player)
+├── L0: Raw [x, y] joint coordinates only                (2-dim)
+├── L1: + velocity, acceleration                         (6-dim)
+├── L2: + dist_to_net, dist_to_center, dist_to_opponent  (9-dim) ← baseline done (37.0%)
+└── L3: + elbow, shoulder, knee angles                   (12-dim)
+    Note: SSL checkpoint exists only for L2; L0/L1/L3 use random init.
+    Note: spatial_only/temporal_only excluded — not implementable without
+          a separate model variant; RQ1 is addressed by L0 vs L1 comparison.
 
-STEP 2 — ENCODER ARCHITECTURE (fix input = best from Step 1, SSL+Aux)
-├── ST-GCN          ← graph convolutions, structural priors
-├── Transformer     ← self-attention, BST-style
-├── LSTM            ← sequential baseline
-└── 1D-CNN          ← convolutional baseline
+STEP 1b — GRAPH STRUCTURE (fix feature_layer = best from Step 1a)
+├── full_dual:      34 nodes, inter-player edges = Yes   ← default
+├── no_inter_edges: 34 nodes, inter-player edges = No
+└── single_player:  17 nodes (hitter only), inter-player = N/A
+    Question: does the opponent skeleton contribute to strategy recognition?
 
-STEP 3 — PRE-TRAINING (fix encoder + input = best from Steps 1–2)
-├── Random initialization
-├── SimCLR contrastive only
-└── SimCLR + auxiliary shot-type (default)
+STEP 2 — ENCODER ARCHITECTURE (fix input = best from Steps 1a+1b)
+├── ST-GCN          ← graph convolutions, structural priors     (3.08M params)
+├── Transformer     ← self-attention, BST-style                 (~1.5M params)
+├── LSTM            ← bidirectional recurrent baseline          (2.86M params)
+└── 1D-CNN          ← temporal convolutional baseline           (0.48M params)
+    Note: SSL weights available for ST-GCN only; others use random init.
 
-STEP 4 — FEW-SHOT METHOD (fix encoder + input + pre-training = best)
-├── ProtoNet (centroid distance)
-├── k-NN, k=3 and k=5
-└── Linear probe (logistic regression)
+STEP 3 — PRE-TRAINING REGIME (fix encoder + input = best from Steps 1a+1b+2)
+├── random_init:    no pre-training                 ← baseline: 36.9%
+└── ssl_plus_aux:   SimCLR + shot-type auxiliary    ← checkpoint: ssl_pretrained_L2.pt
+    RQ2: does self-supervised pre-training on unlabeled ShuttleSet help?
+
+STEP 4 — FEW-SHOT CLASSIFIER (fix all above = best)
+├── ProtoNet        ← nearest centroid (preliminary: 55.9% ± 8.9%)
+├── k-NN (k=3)      ← (preliminary: 53.5% ± 11.7%)
+├── k-NN (k=5)      ← (preliminary: 54.5% ± 9.4%)
+└── Linear probe    ← logistic regression (preliminary: 51.5% ± 9.5%)
 
 STEP 5 — K-SHOT SENSITIVITY (final best configuration)
-└── K = 1, 3, 5, 8, 10, 15
+└── K = 1, 3, 5, 8, 10   (capped at 10 — move_to_net has ~11 train samples/fold)
 ```
 
 ### 8.5 Planned Visualizations
@@ -665,8 +676,10 @@ STEP 5 — K-SHOT SENSITIVITY (final best configuration)
 | `src/data/pose_extractor.py` | YOLOv8s-Pose skeleton extraction (GDINO-guided); top-2 by keypoint confidence, Y-sorted; exponential smoothing (α=0.7) | A1 / C4 |
 | `src/data/graph_builder.py` | Dual-player spatio-temporal graph (34 nodes, 3 adjacency types) | A2 |
 | `src/data/dataset.py` | Data loading, shot windowing, hitter-first ordering, episode sampling, 5-fold CV | Data Pipeline |
-| `src/models/stgcn_model.py` | ST-GCN backbone (9 blocks, configurable input dim) | A4 / C7 |
-| `src/models/transformer_encoder.py` | BST-style Transformer encoder (architecture ablation) | A4 (ablation) |
+| `src/models/stgcn_model.py` | ST-GCN backbone (9 blocks, configurable input dim); 3.08M params | A4 / C7 |
+| `src/models/transformer_encoder.py` | BST-style Transformer encoder (4 layers, 8 heads); architecture ablation | A4 (ablation) |
+| `src/models/lstm_encoder.py` | Bidirectional LSTM encoder (2 layers, hidden=256); architecture ablation | A4 (ablation) |
+| `src/models/cnn1d_encoder.py` | 1D temporal CNN encoder (3 conv blocks); architecture ablation | A4 (ablation) |
 | `src/models/simclr_loss.py` | NT-Xent contrastive loss, projection head, augmentation pipeline | A5 |
 | `src/models/proto_net.py` | ProtoNet + k-NN variant, confidence/margin scoring | B1–B2 / C8 |
 | `src/inference.py` | Phase C end-to-end inference on new video | C1–C8 |

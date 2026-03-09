@@ -9,6 +9,10 @@ Feature Layers (cumulative):
     L1: [x, y, vx, vy, ax, ay] — + velocity, acceleration (6-dim)
     L2: [..., dist_net, dist_center, dist_opp] — + court context (9-dim)
     L3: [..., elbow_angle, shoulder_angle, knee_angle] — + joint angles (12-dim)
+
+If a homography matrix (3×3 numpy array) is provided, pixel coordinates are
+transformed to court-relative coordinates before any features are computed.
+This makes all distance/velocity features physically meaningful (in metres).
 """
 import numpy as np
 from ..config import NUM_JOINTS, NUM_NODES, FEATURE_DIMS
@@ -33,17 +37,23 @@ CENTROID_JOINTS = [5, 6, 11, 12]
 class FeatureEngineer:
     """Compute enriched node features from raw skeleton coordinates."""
 
-    def __init__(self, feature_layer="L2", court_length=13.4, court_width=6.1):
+    def __init__(self, feature_layer="L2", court_length=13.4, court_width=6.1,
+                 homography=None):
         """
         Args:
             feature_layer: "L0", "L1", "L2", or "L3"
             court_length: full court length in meters (for L2)
             court_width: court width in meters (for L2)
+            homography: optional (3, 3) numpy array mapping pixel coords to
+                        court-relative coords (e.g. H_img_to_court_m.npy).
+                        If provided, raw (x, y) pixel coords are transformed
+                        before any feature computation.
         """
         self.feature_layer = feature_layer
         self.court_length = court_length
         self.court_width = court_width
         self.feature_dim = FEATURE_DIMS[feature_layer]
+        self.homography = homography  # (3, 3) or None
 
     def compute(self, skeleton):
         """
@@ -58,6 +68,10 @@ class FeatureEngineer:
         """
         C, T, V = skeleton.shape
         assert C == 2, f"Expected 2 channels (x, y), got {C}"
+
+        # Apply homography first if provided (pixel → court-relative coords)
+        if self.homography is not None:
+            skeleton = self._apply_homography(skeleton)
 
         # L0: raw coordinates
         features = skeleton.copy()  # (2, T, V)
@@ -78,6 +92,32 @@ class FeatureEngineer:
             f"Expected {self.feature_dim} features, got {features.shape[0]}"
 
         return features
+
+    def _apply_homography(self, skeleton):
+        """
+        Apply perspective transform to pixel coordinates.
+
+        Args:
+            skeleton: (2, T, V) in pixel space
+        Returns:
+            (2, T, V) in court-relative space
+        """
+        C, T, V = skeleton.shape
+        H = self.homography  # (3, 3)
+
+        # Flatten to (T*V, 2), add homogeneous coord → (T*V, 3)
+        pts = skeleton.reshape(2, -1).T  # (T*V, 2)
+        pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)  # (T*V, 3)
+
+        # Transform: (3, T*V) = H @ (T*V, 3).T
+        transformed = (H @ pts_h.T)  # (3, T*V)
+
+        # Perspective divide
+        w = transformed[2:3, :]
+        w = np.where(np.abs(w) < 1e-10, 1.0, w)
+        xy = transformed[:2, :] / w  # (2, T*V)
+
+        return xy.reshape(2, T, V).astype(skeleton.dtype)
 
     @staticmethod
     def _compute_kinematics(skeleton):

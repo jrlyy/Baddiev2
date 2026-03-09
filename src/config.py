@@ -18,17 +18,21 @@ FB_ROOT        = PROJECT_ROOT / "Datasets" / "FineBadminton-dataset" / "dataset"
 FB_FRAMES      = FB_ROOT / "image"
 FB_ANNOTATIONS = FB_ROOT / "transformed_combined_rounds_output_en_evals_translated.json"
 FB_SKELETONS       = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons"
-FB_SKELETONS_GDINO = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino"
+FB_SKELETONS_GDINO    = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino"
+FB_SKELETONS_GDINO_V2 = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino_v2"
 
 # ShuttleSet CSV annotations (in datasets/)
 SS_CSV_ROOT = PROJECT_ROOT / "datasets" / "ShuttleSet" / "set"
 SS_MATCH_CSV = SS_CSV_ROOT / "match.csv"
 
 # ShuttleSet processed data (in datasets_preprocessing/)
-SS_PREPROCESS_ROOT = PROJECT_ROOT / "datasets_preprocessing" / "ShuttleSet"
-SS_FRAMES = SS_PREPROCESS_ROOT / "frames"
-SS_OUTPUTS = SS_PREPROCESS_ROOT / "outputs"
-SS_SKELETONS = SS_PREPROCESS_ROOT / "skeletons"
+# Note: actual directories use the shuttleset_* prefix (flat, not nested under ShuttleSet/)
+SS_PREPROCESS_ROOT = PROJECT_ROOT / "datasets_preprocessing"
+SS_FRAMES          = SS_PREPROCESS_ROOT / "shuttleset_frames"
+SS_OUTPUTS         = SS_PREPROCESS_ROOT / "shuttleset_outputs"
+SS_SKELETONS       = SS_PREPROCESS_ROOT / "shuttleset_skeletons"
+SS_SKELETONS_GDINO = SS_PREPROCESS_ROOT / "shuttleset_skeletons_gdino"
+SS_SHUTTLES        = SS_PREPROCESS_ROOT / "shuttleset_shuttles"
 
 
 # ─── Strategy Labels ────────────────────────────────────────────────────────
@@ -55,13 +59,106 @@ FB_STRATEGY_MAP = {
 # Excluded strategies (not classifiable from skeleton data)
 FB_EXCLUDED_STRATEGIES = {"deception", "hesitation", "seamlessly", "a high net early shot"}
 
-# ShuttleSet shot type labels (Chinese → index)
+# FineBadminton hit type labels (raw field name: "hit_type")
+FB_HIT_TYPES = [
+    'block', 'clear', 'cross-court net shot', 'drive', 'drop shot',
+    'kill', 'net kill', 'net lift', 'net shot', 'push shot', 'serve',
+]
+FB_HIT_TYPE_TO_IDX = {h: i for i, h in enumerate(FB_HIT_TYPES)}
+NUM_FB_HIT_TYPES = len(FB_HIT_TYPES)
+
+# ShuttleSet shot type labels (raw field name: "type", Traditional Chinese)
+# Includes types found in actual shuttleset_outputs/*.json files plus
+# official ShuttleSet vocabulary entries not yet seen in extracted data.
 SS_SHOT_TYPES = [
-    '發短球', '發長球', '推撲球', '殺球', '過渡球', '防守回挑',
-    '切球', '接殺防守', '長球', '平球', '擋小球', '挑球',
-    '放小球', '勾球', '網前球', '點扣', '推球', '未知',
+    '放小球', '挑球', '擋小球', '推球', '長球', '殺球',
+    '發短球', '切球', '點扣', '勾球', '過度切球', '未知球種',
+    '平球', '撲球', '後場抽平球', '防守回抽', '防守回挑',
+    '發長球', '小平球',
+    # Official vocabulary entries (may not appear in all extracted matches)
+    '推撲球', '過渡球', '接殺防守', '網前球', '未知',
 ]
 SS_SHOT_TYPE_TO_IDX = {s: i for i, s in enumerate(SS_SHOT_TYPES)}
+NUM_SS_SHOT_TYPES = len(SS_SHOT_TYPES)
+
+# ─── Unified Shot Type Vocabulary ───────────────────────────────────────────
+# 17-class canonical vocabulary based on official ShuttleSet English translations.
+# FineBadminton hit types are mapped to the closest equivalent.
+# Use these indices for cross-dataset auxiliary tasks (e.g. SSL shot-type head).
+
+UNIFIED_SHOT_TYPES = [
+    'short_serve',    #  0 — 發短球 | FB: serve (undifferentiated)
+    'long_serve',     #  1 — 發長球
+    'smash',          #  2 — 殺球   | FB: kill
+    'tap_smash',      #  3 — 點扣   | FB: net kill
+    'push_rush',      #  4 — 推撲球, 撲球
+    'clear',          #  5 — 長球   | FB: clear
+    'slice_drop',     #  6 — 切球
+    'net_drop',       #  7 — 放小球 | FB: drop shot
+    'transition',     #  8 — 過渡球, 過度切球
+    'drive',          #  9 — 平球, 後場抽平球, 防守回抽, 小平球 | FB: drive
+    'block',          # 10 — 擋小球 | FB: block
+    'lob_lift',       # 11 — 挑球   | FB: net lift
+    'defensive_lift', # 12 — 防守回挑
+    'cross_net',      # 13 — 勾球   | FB: cross-court net shot
+    'net_shot',       # 14 — 網前球 | FB: net shot
+    'smash_defense',  # 15 — 接殺防守
+    'push',           # 16 — 推球   | FB: push shot
+]
+UNIFIED_SHOT_TO_IDX = {s: i for i, s in enumerate(UNIFIED_SHOT_TYPES)}
+NUM_UNIFIED_SHOT_TYPES = len(UNIFIED_SHOT_TYPES)  # 17
+
+# FineBadminton hit_type (English) → unified canonical label
+# Note: FB 'serve' does not distinguish short/long → mapped to 'short_serve'
+FB_HIT_TYPE_TO_UNIFIED = {
+    'serve':                'short_serve',
+    'kill':                 'smash',
+    'net kill':             'tap_smash',
+    'clear':                'clear',
+    'drop shot':            'net_drop',
+    'drive':                'drive',
+    'net shot':             'net_shot',
+    'cross-court net shot': 'cross_net',
+    'net lift':             'lob_lift',
+    'push shot':            'push',
+    'block':                'block',
+}
+
+# ShuttleSet type (Chinese) → unified canonical label
+# '未知球種' / '未知' (unknown) intentionally absent → maps to None (no auxiliary label)
+SS_SHOT_TYPE_TO_UNIFIED = {
+    # Serve
+    '發短球':    'short_serve',
+    '發長球':    'long_serve',
+    # Smash variants
+    '殺球':      'smash',
+    '點扣':      'tap_smash',
+    '撲球':      'push_rush',   # net rush (data variant of 推撲球)
+    '推撲球':    'push_rush',   # official term
+    # Clear
+    '長球':      'clear',
+    # Drop / slice
+    '切球':      'slice_drop',
+    '放小球':    'net_drop',
+    '過度切球':  'transition',  # transitional slice (data variant of 過渡球)
+    '過渡球':    'transition',  # official term
+    # Drive variants
+    '後場抽平球':'drive',
+    '平球':      'drive',
+    '防守回抽':  'drive',
+    '小平球':    'drive',
+    # Lift variants
+    '挑球':      'lob_lift',
+    '防守回挑':  'defensive_lift',
+    # Net play
+    '勾球':      'cross_net',
+    '網前球':    'net_shot',
+    # Defense
+    '接殺防守':  'smash_defense',
+    # Push / block
+    '推球':      'push',
+    '擋小球':    'block',
+}
 
 
 # ─── Feature Layer Dimensions (L0-L3) ──────────────────────────────────────
@@ -151,6 +248,27 @@ class TransformerConfig:
     embedding_dim: int = 256
 
 
+# ─── Model: LSTM (ablation baseline) ─────────────────────────────────────────
+
+@dataclass
+class LSTMConfig:
+    hidden_dim: int = 256
+    num_layers: int = 2
+    embedding_dim: int = 256
+    dropout: float = 0.3
+    bidirectional: bool = True
+
+
+# ─── Model: 1D-CNN (ablation baseline) ──────────────────────────────────────
+
+@dataclass
+class CNN1DConfig:
+    channels: tuple = (128, 256, 256)
+    kernel_size: int = 3
+    embedding_dim: int = 256
+    dropout: float = 0.3
+
+
 # ─── Self-Supervised Pre-Training ────────────────────────────────────────────
 
 @dataclass
@@ -159,7 +277,7 @@ class SSLConfig:
     projection_dim: int = 128     # projection head output
     projection_hidden: int = 256
     auxiliary_weight: float = 0.3  # weight for shot-type auxiliary loss
-    num_shot_types: int = 18       # ShuttleSet shot types
+    num_shot_types: int = NUM_UNIFIED_SHOT_TYPES  # unified shot types (9, shared across datasets)
 
     # Augmentation
     jitter_std: float = 0.01      # Gaussian noise on joint coords
@@ -239,6 +357,8 @@ class ExperimentConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     stgcn: STGCNConfig = field(default_factory=STGCNConfig)
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
+    lstm: LSTMConfig = field(default_factory=LSTMConfig)
+    cnn1d: CNN1DConfig = field(default_factory=CNN1DConfig)
     ssl: SSLConfig = field(default_factory=SSLConfig)
     proto: ProtoNetConfig = field(default_factory=ProtoNetConfig)
     pose: PoseConfig = field(default_factory=PoseConfig)
@@ -246,9 +366,12 @@ class ExperimentConfig:
 
     @property
     def encoder_config(self):
-        if self.ablation.encoder == "transformer":
-            return self.transformer
-        return self.stgcn
+        return {
+            "stgcn": self.stgcn,
+            "transformer": self.transformer,
+            "lstm": self.lstm,
+            "cnn1d": self.cnn1d,
+        }[self.ablation.encoder]
 
 
 def get_config(name: str = "default", **overrides) -> ExperimentConfig:
