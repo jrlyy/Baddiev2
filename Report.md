@@ -14,13 +14,17 @@ Abstract
 This project develops an end-to-end pipeline for recognizing fine-grained
 tactical strategies in badminton from raw match footage. The system extracts
 dual-player skeleton sequences from video, learns generalizable spatio-temporal
-representations through self-supervised contrastive pre-training on unlabeled
+representations through supervised contrastive pre-training on shot-type labeled
 data, and classifies tactical patterns using few-shot prototypical networks
 with only 40 expert-labeled rallies. We target five classifiable strategies
 (intercept, defensive, move to net, create depth, passive) and investigate
 two core research questions: (1) the relative contribution of spatial versus
 temporal features to strategy recognition, and (2) the effectiveness of
-self-supervised pre-training in reducing label dependency.
+self-supervised pre-training in reducing label dependency. Pre-training uses
+20 ShuttleSet matches (~17,000 shots) with shot-type supervision via SupCon
+(Supervised Contrastive Learning); few-shot classification is evaluated on
+the held-out FineBadminton set. The system additionally outputs shot-type
+predictions alongside strategy at inference.
 
 ---
 
@@ -153,12 +157,20 @@ tactical labels makes this an ideal application domain.
 
 We propose a three-stage pipeline:
 
-1. **Skeleton extraction** from raw video using pose estimation (YOLOv8-Pose),
-   producing dual-player joint sequences.
-2. **Self-supervised representation learning** via SimCLR contrastive objectives
-   on unlabeled ShuttleSet match data, learning generalizable motion embeddings.
-3. **Few-shot classification** using prototypical networks on the small
-   FineBadminton labeled set.
+1. **Skeleton extraction** from raw video using GDINO-guided YOLOv8-Pose,
+   with spatial court-region masking to eliminate non-player detections
+   (chair umpires, ball kids), producing dual-player joint sequences.
+2. **Supervised contrastive pre-training (SupCon)** on 20 ShuttleSet matches
+   (15 train / 5 validation) using shot-type labels. Positive pairs are shots
+   of the same type; negative pairs are shots of different types. This forces
+   the encoder to learn shot mechanics rather than player identity, and
+   provides richer supervisory signal than self-supervised SimCLR alone.
+3. **Few-shot strategy classification** using prototypical networks on the
+   small FineBadminton labeled set (30 train rallies / 10 test rallies).
+4. **Dual inference output:** strategy prediction (5 classes, confidence +
+   margin) and shot-type prediction (17 classes, logistic head trained on
+   frozen encoder) — enabling expert cross-validation of high-confidence
+   strategy predictions.
 
 The approach is skeleton-based rather than pixel-based, providing
 interpretability and robustness to visual variation (camera angle, lighting,
@@ -229,25 +241,52 @@ accordingly in baseline experiments (see §8).
 
 ### 4.2 ShuttleSet — SSL Pre-Training Dataset
 
-ShuttleSet is our large-scale unlabeled dataset used for self-supervised
-pre-training (Phase A).
+ShuttleSet is our large-scale dataset used for supervised contrastive
+pre-training (Phase A). Unlike FineBadminton, it carries **shot-type labels**
+(19 classes) but no tactical strategy labels.
 
-**Frame Extraction.** The dataset provides annotations and YouTube video links
-only — no raw frames. We manually downloaded videos via yt-dlp and extracted
-frames at 30 FPS via ffmpeg. Of 44 matches in `match.csv`: **25 YouTube links
-successfully processed**, 18 had broken links (content removed), and 1 had no
-URL.
+**Frame Extraction.** The dataset provides CSV annotations and YouTube video
+links only. We downloaded videos via yt-dlp and extracted frames using a
+streaming pipeline (frame stride = 4, every 4th frame extracted + all annotated
+hit frames). Of 44 matches in `match.csv`: 38 are usable broadcast-angle
+matches. **20 matches were selected for skeleton extraction** due to Colab GPU
+time constraints. 4 matches were excluded earlier due to non-standard broadcast
+camera angles (close-up or side-on views):
+- An Se Young vs Pornpawee Chochuwong (TOYOTA Thailand Open 2021 QF)
+- CHEN Long vs CHOU Tien Chen (Denmark Open 2019 QF)
+- CHOU Tien Chen vs Jonatan Christie (Sudirman Cup 2019 QF)
+- CHOU Tien Chen vs NG Ka Long Angus (Sudirman Cup 2019 Group Stage)
 
-**Scale.** The 25 processed matches yield **21,191 labeled shot records** across
-**963 rallies**, covering **19 shot types**. This is approximately 71× the
-size of the FineBadminton labeled set, providing adequate diversity for
-self-supervised pre-training.
+**Scale (20 matches, estimated):**
 
-**Coverage.** 13 tournaments, 17 unique elite players (including Viktor
-Axelsen, Kento Momota, Carolina Marín, Chou Tien Chen), 2018–2021. Average
-848 strokes per match, average rally length 22.0 strokes.
+| Statistic | Value |
+|---|---|
+| Matches extracted | 20 (of 38 usable) |
+| Total stroke records | ~17,000 (est.) |
+| Total rallies | ~590 (est.) |
+| Unique shot types | 17 (unified vocabulary) |
+| Avg strokes per match | ~847 |
 
-**Key annotation fields (from per-match JSON pipeline output):**
+*Exact figures updated after extraction completes.*
+
+**Train/Validation split (match-level):**
+
+| Split | Matches | Strokes (est.) | Role |
+|---|---|---|---|
+| Train | 15 | ~12,700 | SupCon pre-training |
+| Validation | 5 | ~4,200 | Shot-type linear probe (proxy metric) |
+| **Total** | **20** | **~17,000** | — |
+
+Split at match level to prevent frame leakage, with greedy balancing to
+minimise KL divergence between train and validation shot-type distributions.
+
+**Validation role:** The 5 held-out matches are used to evaluate
+shot-type classification accuracy as a proxy for representation quality —
+if the encoder separates shot types well, it likely separates strategies too.
+The same encoder is then loaded for expert-verified strategy evaluation on
+selected SS validation shots (qualitative; see Section 8.3).
+
+**Key annotation fields (from per-match CSV files):**
 
 | Field | Description |
 |---|---|
@@ -289,11 +328,18 @@ falls back to the umpire as the second "player" and forward-fills those frames.
 
 **Grounding DINO-guided extraction (adopted solution).** A GDINO-guided
 approach uses Grounding DINO (grounding-dino-tiny) with the text prompt
-`"player"` to produce court-region bounding boxes before YOLOv8 keypoint
-estimation. Only YOLO detections with IoU ≥ 0.25 against a GDINO bounding box
-are accepted as valid players. If fewer than 2 valid players pass this filter,
-the pipeline falls back to plain YOLOv8 top-2 selection. This approach
-substantially reduces umpire contamination in the extracted skeletons.
+`"badminton player ."` to produce court-region bounding boxes before YOLOv8
+keypoint estimation. Only YOLO detections with IoU ≥ 0.25 against a GDINO
+bounding box are accepted as valid players. If fewer than 2 valid players pass
+this filter, the pipeline falls back to plain YOLOv8 top-2 selection.
+Additionally, a **spatial court-region mask** filters all detections (both
+GDINO priors and YOLO candidates) to the central 76% of the frame width
+(x: 12%–88%) and enforces a minimum bounding box height of 10% of frame
+height. This eliminates chair umpires (seated at x ≈ 5–10%), line judges, and
+ball kids from the candidate set before IoU matching. The fallback (plain top-2
+YOLO when GDINO provides fewer than 2 priors) applies the same spatial filter,
+preventing contamination even when GDINO fails. This approach substantially
+reduces umpire contamination in the extracted skeletons.
 
 The FineBadminton skeletons used in all experiments were extracted with the
 GDINO-guided pipeline. All 40 rallies (10,620 frames) were successfully
@@ -352,9 +398,15 @@ fast-moving object like a shuttlecock moving 50–100 pixels per frame.
 Outputs: per-rally `.npy` files of shape `(T, 3)` — columns `[x, y, visible]`,
 frame-aligned with the skeleton arrays. These are stored in
 `datasets_preprocessing/finebadminton_shuttles/` and visualized in the demo UI
-as a yellow dot + trail overlay. Shuttle trajectory is **not yet incorporated
-as an encoder input** during Phases A–B; integration as a 35th graph node is
-the highest-priority near-term extension.
+as a yellow dot + trail overlay.
+
+Shuttle trajectory is optionally incorporated as **virtual node 34** in the
+dual-player graph (35 nodes total). When `use_shuttle=True`, the shuttle's
+`(x, y)` position is appended before feature engineering so that the homography
+transform applies to it, making all distance/velocity features camera-invariant.
+The shuttle node is connected to both players' wrist joints (nodes 9, 10 for P1;
+26, 27 for P2) in the ST-GCN graph. This is evaluated as **Step 6** in the
+ablation study (skeleton-only 34-node vs. skeleton+shuttle 35-node graph).
 
 ### 5.5 Player Court Position
 
@@ -386,6 +438,25 @@ Canny edge detection + probabilistic Hough transform + RANSAC fitting against
 a standard badminton court template (13.4m × 6.1m for singles). Manual fallback
 allows clicking four court corners in a reference frame (≈10 seconds of effort).
 
+**Perspective elevation error and mitigation.** A homography is defined on the
+court floor plane (z = 0), so it maps floor-level points exactly. However,
+skeleton joints are elevated above the floor — the torso by ≈1 m and the head
+by ≈2 m. Under a typical broadcast camera (elevated ≈10 m, tilted ≈15–20° down),
+elevated joints on the far-side player (top court) appear shifted *toward* the
+camera in image space, causing the homography to project their body centroid past
+the net into the opponent's half. The near-side player is less affected because
+perspective displacement pulls their joints *away* from the net. Three mitigations
+were evaluated in notebook 07: (A) ankle-only positioning, using only joints 15
+and 16 (left/right ankle) which lie on the floor plane — this is the adopted
+approach and is sufficient to eliminate net-crossing artefacts at negligible
+cost; (B) hip-midpoint positioning (joints 11–12), which reduces error relative
+to the full-body centroid; and (C) depth-corrected positioning using Depth
+Anything V2 Small to estimate per-joint depth, shifting each joint's image
+coordinate downward to its floor shadow before applying the homography. Approach
+A is adopted as the default because ankle detections are reliable and the
+floor-plane assumption is exactly satisfied; approach C is available as an
+optional refinement when full-body projections are needed for visualisation.
+
 ---
 
 6\. Model Training
@@ -393,13 +464,17 @@ allows clicking four court corners in a reference frame (≈10 seconds of effort
 
 ### 6.1 Few-Shot Training Setup
 
-Given the extremely small labeled set (40 rallies), we employ **5-fold
-cross-validation** to maximize data utilization and provide variance estimates.
-Each fold uses:
+Given the extremely small labeled set (40 rallies), the evaluation protocol
+uses **rally-level splits** to prevent data leakage — all shots from a given
+rally appear in only one partition (never split across train and test within
+the same fold).
 
-- **32 rallies** for the support set (prototype computation)
-- **4 rallies** for validation (hyperparameter tuning, early stopping)
-- **4 rallies** for testing (final evaluation)
+**Split design:**
+- **30 rallies (241 shots)** for cross-validation training
+- **10 rallies (55 shots)** held out for final generalization evaluation
+
+5-fold stratified CV is run within the 30 training rallies only; the 10
+held-out rallies are touched once at the end to produce the honest test estimate.
 
 All results report mean ± standard deviation across folds. Class distribution
 is imbalanced (intercept and passive are more common than move_to_net). We
@@ -449,20 +524,41 @@ on Colab T4 GPU.
    The centroid assumption holds — the embedding space (even random-init) creates
    roughly spherical per-class clusters.
 
-### 6.2 SSL Pre-Training (Phase A)
+### 6.2 SSL Pre-Training (Phase A) — Supervised Contrastive Learning
 
-We apply a SimCLR-style contrastive objective to skeleton sequences extracted
-from ShuttleSet videos. Data augmentation for skeleton contrastive learning
-includes: (a) joint-level jittering (Gaussian noise on coordinates),
-(b) temporal crop and resample, (c) spatial rotation (random court-relative
-rotation), and (d) joint masking (randomly zeroing 10–20% of joints). The
-NT-Xent loss trains the ST-GCN encoder to produce similar embeddings for
-augmented views of the same shot and dissimilar embeddings for different shots.
+We apply **SupCon (Supervised Contrastive Learning; Khosla et al., 2020)**
+using ShuttleSet's shot-type labels as supervision. Unlike SimCLR which pairs
+augmented views of the same sample, SupCon treats all shots of the same type
+(across different players and matches) as positives. This forces the encoder
+to cluster by shot mechanics (smash trajectory, drop placement, lob height)
+rather than by player identity or match context.
 
-An auxiliary task predicts shot type using ShuttleSet's 19-class labels from
-the CSV tracking data. This provides a domain-specific supervisory signal
-without requiring tactical labels. The auxiliary loss is weighted at 0.3
-relative to the contrastive loss.
+**Training objective:**
+
+For a batch of skeleton sequences {x_i}, let y_i be the shot-type label:
+
+```
+L_SupCon = Σ_i [ -1/|P(i)| · Σ_{p∈P(i)} log [ exp(z_i·z_p/τ) / Σ_{a≠i} exp(z_i·z_a/τ) ] ]
+```
+
+where P(i) = {j : y_j = y_i, j ≠ i} is the set of same-type positives in
+the batch, z_i is the L2-normalized projection head output, and τ=0.07 is the
+temperature.
+
+**Skeleton augmentations** (applied independently to both views):
+- Joint coordinate jittering (Gaussian noise σ=0.02)
+- Temporal crop and resample (±20% window)
+- Spatial rotation (±15° court-relative)
+- Joint masking (10–20% of joints zeroed)
+
+**Training data:** 15 SS train-split matches (~12,700 shots). The 5 validation
+matches are held out for shot-type linear probe evaluation. Since SupCon uses
+shot-type labels rather than strategy labels, there is no strategy label leakage.
+
+**Benefit over SimCLR:** The auxiliary shot-type classification head previously
+required separate loss weighting and competed with the contrastive objective.
+SupCon integrates shot-type supervision directly into the contrastive loss,
+producing semantically structured embeddings in a single objective.
 
 ---
 
@@ -488,7 +584,8 @@ The system comprises three phases executed sequentially:
 | A2 | Graph Builder + Feature Engineering | Skeleton sequences | Spatio-temporal graph G=(V,E,X) with enriched node features (L0–L3) |
 | A3 | Shot Segmentation | Skeleton graphs + timestamps | T=16 frame windows per shot, hitter-first ordered |
 | A4 | ST-GCN Encoder | Skeleton graph | 256-dim motion embedding |
-| A5 | SimCLR Head | Augmented skeleton pairs | NT-Xent contrastive loss + auxiliary shot-type loss |
+| A5 | SupCon Head | Augmented skeleton pairs + shot-type labels | Supervised contrastive loss (same-type = positive) |
+| A6 | Shot-Type Classifier | Frozen encoder embeddings (SS train) | Logistic head saved for inference |
 | B1 | Prototype Computation | FB labeled support embeddings | 5 class prototypes (mean vectors, one per strategy) |
 | B2 | ProtoNet Classifier | Query embedding + prototypes | Strategy label + confidence score |
 | C1 | Frame Extraction (ffmpeg) | New video (.mp4) | Frames at 30fps |
@@ -498,7 +595,8 @@ The system comprises three phases executed sequentially:
 | C5 | Shot Segmentation | Hit timestamps + skeletons | T=16 frame windows per shot |
 | C6 | Feature Engineering (L0–L3) | Skeleton windows + H | Enriched node features in court-relative coords |
 | C7 | Encoder (Phase A weights) | Enriched skeleton graphs | 256-dim embedding per shot |
-| C8 | ProtoNet (Phase B prototypes) | Embeddings + prototypes | Strategy label + confidence + shot type |
+| C8 | ProtoNet (Phase B prototypes) | Embeddings + prototypes | Strategy label + confidence score + margin |
+| C9 | Shot-Type Head (Phase A weights) | Same embedding | Shot-type label + confidence (17 classes) |
 
 ### 7.2 Graph Construction
 
@@ -573,8 +671,8 @@ Phase B is near-parameter-free. The ProtoNet operates in two steps:
 | Random baseline | — | uniform | ~20.0% | Theoretical floor (uniform 5-class) |
 | Majority class | — | always "intercept" | ~15.6% | Always predict majority class |
 | **ST-GCN + ProtoNet** | **None (random init)** | **5-way 10-shot** | **36.9% ± 3.3%** | **✅ Done — L2, GDINO, episodic fine-tune** |
-| ST-GCN + ProtoNet | SSL + Aux (L2) | 5-way 10-shot (frozen enc) | 55.9% ± 8.9% | ✅ Done (preliminary — frozen enc, not fine-tuned) |
-| **ST-GCN + ProtoNet** | **SSL + Aux (L2)** | **5-way 10-shot (fine-tuned)** | **\[TBD\]** | **Primary target — Step 3 ablation** |
+| ST-GCN + ProtoNet | SupCon (shot type, L2) | 5-way 10-shot (frozen enc) | 55.9% ± 8.9% | ✅ Done (preliminary — frozen enc, not fine-tuned) |
+| **ST-GCN + ProtoNet** | **SupCon (shot type, L2)** | **5-way 10-shot (fine-tuned)** | **\[TBD\]** | **Primary target — Step 3 ablation** |
 | Transformer + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
 | LSTM + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
 | 1D-CNN + ProtoNet | random init | 5-way 10-shot | \[TBD\] | Step 2 ablation |
@@ -594,7 +692,29 @@ Phase B is near-parameter-free. The ProtoNet operates in two steps:
 
 > L2 is the only layer with an SSL checkpoint; L0/L1/L3 comparisons use random init. This means the L2 advantage may partially reflect SSL pre-training rather than feature engineering alone — a known limitation of the sequential ablation design.
 
-### 8.3 Graph Structure Contribution (Step 1b)
+### 8.3 Expert-Verified Strategy Evaluation (SS Validation Set)
+
+As a qualitative cross-dataset evaluation, the trained system is applied to
+the 5 SS validation matches. For each shot the model outputs both a
+**strategy prediction** (5 classes, confidence score) and a **shot-type
+prediction** (17 classes). A domain expert reviews shots where strategy
+confidence exceeds a threshold (e.g. ≥ 0.75), confirming or rejecting each
+prediction. This produces:
+
+- **Precision at threshold:** fraction of high-confidence strategy predictions
+  confirmed by expert
+- **Shot-type accuracy:** automatic metric (ground truth from SS CSVs), used
+  as a sanity check that the encoder is functioning correctly
+- **Qualitative examples:** rally visualisations showing skeleton overlaid with
+  predicted strategy and shot type per frame, reviewed for coherence
+
+This evaluation is intentionally qualitative — ShuttleSet has no strategy
+labels — but provides meaningful evidence that the representation generalises
+across datasets. High shot-type accuracy (proxy) combined with expert-confirmed
+strategy predictions constitutes a sufficient cross-dataset validity check
+for a few-shot system.
+
+### 8.4 Graph Structure Contribution (Step 1b)
 
 *Table 7: Macro-F1 by graph topology — does the opponent skeleton matter?*
 
@@ -606,7 +726,7 @@ Phase B is near-parameter-free. The ProtoNet operates in two steps:
 
 > RQ1 (spatial vs. temporal contribution) is addressed indirectly by comparing L0 (position only) vs. L1 (+ velocity/acceleration) in Step 1a, rather than by disabling spatial/temporal conv layers, which would require distinct model variants not currently implemented.
 
-### 8.4 Ablation Plan Summary
+### 8.5 Ablation Plan Summary
 
 Six ablation steps are run sequentially, each varying one axis while holding
 all others fixed at the best value found so far. Steps 1a and 1b are separated
@@ -637,7 +757,7 @@ STEP 2 — ENCODER ARCHITECTURE (fix input = best from Steps 1a+1b)
 
 STEP 3 — PRE-TRAINING REGIME (fix encoder + input = best from Steps 1a+1b+2)
 ├── random_init:    no pre-training                 ← baseline: 36.9%
-└── ssl_plus_aux:   SimCLR + shot-type auxiliary    ← checkpoint: ssl_pretrained_L2.pt
+└── supcon:         SupCon (shot-type supervised contrastive) ← checkpoint: ssl_pretrained_L2.pt
     RQ2: does self-supervised pre-training on unlabeled ShuttleSet help?
 
 STEP 4 — FEW-SHOT CLASSIFIER (fix all above = best)
@@ -648,9 +768,17 @@ STEP 4 — FEW-SHOT CLASSIFIER (fix all above = best)
 
 STEP 5 — K-SHOT SENSITIVITY (final best configuration)
 └── K = 1, 3, 5, 8, 10   (capped at 10 — move_to_net has ~11 train samples/fold)
+
+STEP 6 — SHUTTLECOCK INPUT (fix all above = best)
+├── skeleton_only:         34 nodes  ← dual-player skeleton (baseline)
+└── skeleton_plus_shuttle: 35 nodes  ← + shuttle as virtual node 34,
+                                       connected to both players' wrists
+    Question: does shuttlecock trajectory improve strategy recognition?
+    Note: shuttle node appended pre-homography so features are in metres.
+    SSL weights trained on 34-node graph; skeleton+shuttle uses random init.
 ```
 
-### 8.5 Planned Visualizations
+### 8.6 Planned Visualizations
 
 - **t-SNE / UMAP embedding plots:** colored by strategy class, comparing
   random-init vs. SSL-pretrained embeddings.
@@ -702,7 +830,7 @@ STEP 5 — K-SHOT SENSITIVITY (final best configuration)
   COCO keypoint estimation in a single forward pass. Top-2 detections by mean
   keypoint confidence. Temporal smoothing via exponential filter (α=0.7).
 - **Player Filtering:** Grounding DINO (grounding-dino-tiny) with text prompt
-  `"player"` for umpire-rejection during FineBadminton extraction.
+  `"badminton player ."` for umpire-rejection during FineBadminton extraction.
 - **Shuttle Tracking (preprocessing):** TrackNetV4 (`tracknet-series-pytorch`,
   local clone) for per-frame shuttle position on FineBadminton. Pre-trained
   weights downloaded from GitHub Releases v1.0.1.
@@ -866,6 +994,8 @@ in Badminton Video. \[Venue TBD\].
 \[10\] Sun, Y., et al. (2023). TrackNetV3: Real-Time Shuttlecock Tracking in
 Badminton. *Proceedings of ACM Multimedia.*
 
+\[11\] Khosla, P., et al. (2020). Supervised Contrastive Learning. *Advances in Neural Information Processing Systems (NeurIPS).*
+
 ---
 
 Appendix A: Exploratory Data Analysis
@@ -978,44 +1108,95 @@ shots, push shots, and blocks in elite men's singles.
 | Statistic | Value |
 |---|---|
 | Total matches in match.csv | 44 |
-| Successfully downloaded and processed | 25 (56.8%) |
-| Failed / broken YouTube links | 18 |
-| Missing URL | 1 |
-| Total stroke records | 21,191 |
-| Total rallies | 963 |
-| Unique shot types | 19 |
-| Unique players | 17 |
-| Tournaments covered | 13 |
-| Avg strokes per match | 848 (min 312 · max 1,644) |
-| Avg rally length | 22.0 strokes (min 1 · max 83) |
-| Class imbalance (most/least common) | 98× |
+| Excluded (wrong broadcast angle) | 4 |
+| Usable broadcast-angle matches | 38 (of 44) |
+| Matches with skeleton extracted | 20 |
+| Total stroke records (20 matches) | ~17,000 (est.) |
+| Total rallies (20 matches) | ~590 (est.) |
+| Unique shot types (unified vocab) | 17 |
+| Avg strokes per match | ~847 |
+| Class imbalance (most/least common) | ~98× |
 
-**Shot type distribution (N=21,191):**
+*Full 38-match statistics (for reference only — subset of 20 used in experiments):*
+
+| Statistic | 38-match total |
+|---|---|
+| Total stroke records | 32,203 |
+| Extracted frames | 216,112 JPEG |
+| Unique players | 26 |
+| Tournaments covered | 13 |
+
+**Shot type distribution (N=32,203, full 38-match reference):**
 
 | Shot type (English) | Chinese | Count | % |
 |---|---|---|---|
-| Drop (Net) | 放小球 | 3,823 | 18.0% |
-| Lift | 挑球 | 3,159 | 14.9% |
-| Block | 擋小球 | 2,145 | 10.1% |
-| Push | 推球 | 1,686 | 8.0% |
-| Clear | 長球 | 1,609 | 7.6% |
-| Smash | 殺球 | 1,405 | 6.6% |
-| Short Serve | 發短球 | 1,328 | 6.3% |
-| Slice/Cut | 切球 | 1,208 | 5.7% |
-| Tap Smash | 點扣 | 1,013 | 4.8% |
-| Cross-Net | 勾球 | 842 | 4.0% |
-| (過度切球) | 過度切球 | 787 | 3.7% |
-| (Unknown) | 未知球種 | 615 | 2.9% |
-| Drive | 平球 | 423 | 2.0% |
-| (撲球) | 撲球 | 280 | 1.3% |
-| (後場抽平球) | 後場抽平球 | 253 | 1.2% |
-| (防守回抽) | 防守回抽 | 238 | 1.1% |
-| Defensive Lift | 防守回挑 | 174 | 0.8% |
-| Long Serve | 發長球 | 164 | 0.8% |
-| (小平球) | 小平球 | 39 | 0.2% |
+| Net Drop | 放小球 | 5,562 | 17.3% |
+| Lift | 挑球 | 4,756 | 14.8% |
+| Net Block | 擋小球 | 3,267 | 10.1% |
+| Clear | 長球 | 2,551 | 7.9% |
+| Push | 推球 | 2,519 | 7.8% |
+| Smash | 殺球 | 2,237 | 6.9% |
+| Slice | 切球 | 1,879 | 5.8% |
+| Short Serve | 發短球 | 1,722 | 5.3% |
+| Tap Smash | 點扣 | 1,522 | 4.7% |
+| Unknown | 未知球種 | 1,273 | 4.0% |
+| Cross-Net | 勾球 | 1,209 | 3.8% |
+| Trans. Slice | 過度切球 | 1,193 | 3.7% |
+| Drive | 平球 | 630 | 2.0% |
+| Rush | 撲球 | 453 | 1.4% |
+| BG Drive | 後場抽平球 | 394 | 1.2% |
+| Long Serve | 發長球 | 354 | 1.1% |
+| Def. Drive | 防守回抽 | 354 | 1.1% |
+| Def. Lift | 防守回挑 | 271 | 0.8% |
+| Half Smash | 小平球 | 57 | 0.2% |
 
 The 98× imbalance is handled via weighted sampling in the auxiliary shot-type
 task; it has no effect on the primary contrastive objective.
+
+**Full match list (SS01–SS38, alphabetical; TR=train, VA=val/test):**
+
+| ID | Split | Match |
+|---|---|---|
+| SS01 | TR | An Se Young vs Ratchanok Intanon — YONEX Thailand Open 2021 QF |
+| SS02 | TR | Anders Antonsen vs Jonatan Christie — Indonesia Masters 2020 QF |
+| SS03 | VA | Anders Antonsen vs Sameer Verma — TOYOTA Thailand Open 2021 QF |
+| SS04 | TR | Anders Antonsen vs Viktor Axelsen — HSBC BWF World Tour Finals 2020 Finals |
+| SS05 | TR | Anthony Sinisuka Ginting vs Anders Antonsen — Indonesia Masters 2020 Final |
+| SS06 | TR | Anthony Sinisuka Ginting vs Viktor Axelsen — Indonesia Masters 2020 SF |
+| SS07 | TR | Anthony Sinisuka Ginting vs Rasmus Gemke — YONEX Thailand Open 2021 QF |
+| SS08 | TR | CHEN Long vs CHOU Tien Chen — World Tour Finals Group Stage |
+| SS09 | TR | CHOU Tien Chen vs Anders Antonsen — Fuzhou Open 2019 SF |
+| SS10 | VA | CHOU Tien Chen vs Jonatan Christie — Indonesia Open 2019 QF |
+| SS11 | TR | Carolina Marin vs An Se Young — HSBC BWF World Tour Finals 2020 QF |
+| SS12 | TR | Carolina Marin vs An Se Young — TOYOTA Thailand Open 2021 SF |
+| SS13 | TR | Carolina Marin vs Neslihan Yigit — TOYOTA Thailand Open 2021 QF |
+| SS14 | TR | Carolina Marin vs Pornpawee Chochuwong — HSBC BWF World Tour Finals 2020 SF |
+| SS15 | TR | Carolina Marin vs Supanida Katethong — YONEX Thailand Open 2021 QF |
+| SS16 | TR | Evgeniya Kosetskaya vs Michelle Li — HSBC BWF World Tour Finals 2020 QF |
+| SS17 | TR | Hans-Kristian Solberg Vittinghus vs Anders Antonsen — TOYOTA Thailand Open 2021 SF |
+| SS18 | VA | Hans-Kristian Solberg Vittinghus vs Lee Cheuk Yu — TOYOTA Thailand Open 2021 QF |
+| SS19 | VA | Kento Momota vs CHOU Tien Chen — Denmark Open 2018 Finals |
+| SS20 | TR | Kento Momota vs CHOU Tien Chen — Fuzhou Open 2018 Finals |
+| SS21 | VA | Kento Momota vs CHOU Tien Chen — Fuzhou Open 2019 Finals |
+| SS22 | TR | Kento Momota vs CHOU Tien Chen — Korea Open 2019 Final |
+| SS23 | TR | Kento Momota vs CHOU Tien Chen — Malaysia Open 2018 QF |
+| SS24 | TR | Kento Momota vs Viktor Axelsen — Malaysia Masters 2020 Finals |
+| SS25 | TR | Mia Blichfeldt vs Busanan Ongbamrungphan — YONEX Thailand Open 2021 QF |
+| SS26 | TR | NG Ka Long Angus vs Jonatan Christie — Malaysia Masters 2020 QF |
+| SS27 | VA | Ng Ka Long Angus vs Kidambi Srikanth — HSBC BWF World Tour Finals 2020 QF |
+| SS28 | TR | Ng Ka Long Angus vs Lee Cheuk Yiu — YONEX Thailand Open 2021 QF |
+| SS29 | TR | Pusarla V. Sindhu vs Pornpawee Chochuwong — HSBC BWF World Tour Finals 2020 QF |
+| SS30 | TR | Ratchanok Intanon vs Pusarla V. Sindhu — TOYOTA Thailand Open 2021 QF |
+| SS31 | TR | Viktor Axelsen vs SHI Yu Qi — All England Open 2020 QF |
+| SS32 | TR | Viktor Axelsen vs CHEN Long — Malaysia Masters 2020 QF |
+| SS33 | TR | Viktor Axelsen vs NG Ka Long Angus — Malaysia Masters 2020 SF |
+| SS34 | TR | Viktor Axelsen vs Anthony Sinisuka Ginting — YONEX Thailand Open 2021 SF |
+| SS35 | TR | Viktor Axelsen vs Hans-Kristian Solberg Vittinghus — TOYOTA Thailand Open 2021 Finals |
+| SS36 | TR | Viktor Axelsen vs Jonatan Christie — YONEX Thailand Open 2021 QF |
+| SS37 | TR | Viktor Axelsen vs Liew Daren — TOYOTA Thailand Open 2021 QF |
+| SS38 | TR | Viktor Axelsen vs Ng Ka Long Angus — YONEX Thailand Open 2021 Finals |
+
+*4 excluded matches (non-standard camera angle, moved to `others_dataset_excluded/`): An Se Young vs Pornpawee Chochuwong (TOYOTA Thailand 2021 QF), CHEN Long vs CHOU Tien Chen (Denmark Open 2019 QF), CHOU Tien Chen vs Jonatan Christie (Sudirman Cup 2019 QF), CHOU Tien Chen vs NG Ka Long Angus (Sudirman Cup 2019 Group Stage).*
 
 ---
 
@@ -1027,8 +1208,8 @@ task; it has no effect on the primary contrastive objective.
 | **Strategy labels** | Yes — 5-class per shot | No |
 | **Shot type labels** | 12 classes | 19 classes (Chinese) |
 | **Frames provided?** | Yes (JPEG, ~20fps) | No — download + extract |
-| **Scale (shots)** | 414 annotated / 296 in training | 21,191 shots, 963 rallies |
-| **Video variety** | 11 matches, 1 camera angle | 25 matches, 13 tournaments, 17 players |
+| **Scale (shots)** | 414 annotated / 296 in training | ~17,000 shots (20 matches extracted) |
+| **Video variety** | 11 matches, 1 camera angle | 20 matches extracted (38 usable, 26 players) |
 | **Skeleton storage** | Per-rally `.npy` `(2, T_full, 34)` | Per-shot `.npy` `(2, 16, 34)` |
 | **Hitter ordering** | At dataset load time | At extraction time |
 | **Class imbalance** | Moderate | Severe (98×) |
