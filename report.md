@@ -250,7 +250,7 @@ and inter-player geometry — precisely what the skeleton graph captures.
  ABLATION  — answers RQ1 and RQ2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  RQ1 — which input features matter?  (Step 1a, random init, ST-GCN)
+  RQ1 — which input features matter?  (Step 1a, fix encoder = ST-GCN)
   ┌──────────────────────────────────────────┐
   │  L0 (x,y only)          → score          │
   │  L1 (+ velocity)        → score          │  ← compare
@@ -258,13 +258,38 @@ and inter-player geometry — precisely what the skeleton graph captures.
   │  L3 (+ joint angles)    → score          │
   └──────────────────────────────────────────┘
 
-  RQ2 — does pre-training help?  (Step 3, best layer from RQ1, ST-GCN)
+  RQ2 — does pre-training help?  (Step 2, best layer from RQ1, ST-GCN)
   ┌──────────────────────────────────────────┐
   │  Random init            → score          │
   │  SimCLR (self-supervised) → score        │  ← compare
   │  SupCon (shot-type labels) → score       │
   └──────────────────────────────────────────┘
 ```
+
+*Table 3: Pipeline component detail*
+
+| Stage | Component | Input | Output |
+|---|---|---|---|
+| **Preprocessing (shared)** | | | |
+| P1 | YOLOv8-Pose (GDINO-guided) | Video frames | 2D skeletons (17 joints × 2 players), Y-sorted, smoothed |
+| P2 | Graph Builder + Feature Engineering | Skeleton sequences | Spatio-temporal graph G=(V,E,X) with node features (L0–L3) |
+| P3 | Shot Segmentation | Skeleton graphs + timestamps | T=16 frame windows per shot, hitter-first ordered |
+| **Phase A — SSL Pre-Training** | | | |
+| A1 | ST-GCN Encoder + SupCon/SimCLR Head | Augmented skeleton pairs (+ shot-type labels for SupCon) | Contrastive loss → `ssl_pretrained_L2.pt` |
+| A2 | Shot-Type Classifier | Frozen encoder embeddings (SS train) | Logistic head → `shot_type_clf_supcon_L2.joblib` |
+| **Phase B — Few-Shot Training** | | | |
+| B1 | Prototype Computation | FB labeled support embeddings | 5 class prototypes (mean vectors, one per strategy) |
+| B2 | ProtoNet Classifier | Query embedding + prototypes | Strategy label + confidence score |
+| **Phase C — Inference** | | | |
+| C1 | Frame Extraction (ffmpeg) | New video (.mp4) | Frames at 30fps |
+| C2 | Court Detector (Hough + RANSAC) | Reference frame | Homography H (pixel → court coords) |
+| C3 | TrackNetV3 (pre-trained, frozen) | Consecutive frames | Shuttle (x,y) per frame + hit event timestamps |
+| C4 | YOLOv8-Pose | All frames | Skeleton keypoints (17 joints × 2 players) |
+| C5 | Shot Segmentation | Hit timestamps + skeletons | T=16 frame windows per shot |
+| C6 | Feature Engineering (L0–L3) | Skeleton windows + H | Enriched node features in court-relative coords |
+| C7 | Encoder (Phase A weights) | Enriched skeleton graphs | 256-dim embedding per shot |
+| C8 | ProtoNet (Phase B prototypes) | Embeddings + prototypes | Strategy label + confidence + margin |
+| C9 | Shot-Type Head (Phase A weights) | Same embedding | Shot-type label + confidence (17 classes) |
 
 ---
 
@@ -368,9 +393,11 @@ camera angles (close-up or side-on views):
 Split at match level to prevent frame leakage, with greedy balancing to
 minimise KL divergence between train and validation shot-type distributions.
 
-**Validation role:** The 5 held-out matches are used to evaluate
+**Validation role:** The held-out validation set is used to evaluate
 shot-type classification accuracy as a proxy for representation quality —
 if the encoder separates shot types well, it likely separates strategies too.
+In practice (Task 7a), 8 matches with GDINO skeletons were available,
+yielding 4,823 train / 3,455 val shots via rally-level splits (see §6.2.6).
 The same encoder is then loaded for expert-verified strategy evaluation on
 selected SS validation shots (qualitative; see Section 8.3).
 
@@ -493,7 +520,7 @@ dual-player graph (35 nodes total). When `use_shuttle=True`, the shuttle's
 `(x, y)` position is appended before feature engineering so that the homography
 transform applies to it, making all distance/velocity features camera-invariant.
 The shuttle node is connected to both players' wrist joints (nodes 9, 10 for P1;
-26, 27 for P2) in the ST-GCN graph. This is evaluated as **Step 6** in the
+26, 27 for P2) in the ST-GCN graph. This is evaluated as **Step 5** in the
 ablation study (skeleton-only 34-node vs. skeleton+shuttle 35-node graph).
 
 ### 5.5 Player Court Position
@@ -624,7 +651,7 @@ Pre-training on ShuttleSet's ~7,000 skeleton shots gives the ST-GCN encoder
 exposure to diverse badminton motion patterns before it sees any strategy
 labels. We train two contrastive variants — **SimCLR** (fully self-supervised)
 and **SupCon** (shot-type supervised) — and compare both against random
-initialisation in the Step 3 ablation (§8.5).
+initialisation in the Step 2 ablation (§8.5).
 
 #### 6.2.1 Shared Architecture & Augmentation Pipeline
 
@@ -684,7 +711,7 @@ from 0.698 (epoch 5) with no signs of instability.
 shots). This is below the random baseline of 0.20, indicating that SimCLR's
 self-supervised objective alone — without any semantic grouping — does not
 produce features that linearly separate strategy classes. This does not
-preclude benefit after episodic fine-tuning (evaluated in Step 3 ablation).
+preclude benefit after episodic fine-tuning (evaluated in Step 2 ablation).
 
 #### 6.2.3 SupCon — Supervised Contrastive Learning
 
@@ -775,7 +802,72 @@ Both notebooks include diagnostic visualisations run before training:
 
 These visualisations are saved to `results/ssl_*_viz_*.png`.
 
-#### 6.2.6 Limitations & Known Issues
+#### 6.2.6 SupCon Shot-Type Proxy Evaluation (Task 7a)
+
+To evaluate whether SupCon pre-training produces semantically meaningful
+embeddings, we train a logistic regression classifier on frozen SupCon
+encoder outputs and evaluate shot-type classification on the ShuttleSet
+validation split.
+
+**Experimental setup:**
+
+| Parameter | Value |
+|---|---|
+| **Encoder** | ST-GCN (frozen, SupCon checkpoint `ssl_pretrained_supcon_L2.pt`) |
+| **Feature layer** | L2 (9-dim: x, y, velocity, court context) |
+| **Embedding dim** | 256 (backbone output, no projection head) |
+| **Classifier** | Logistic regression (scikit-learn, via joblib) |
+| **Train split** | 4,823 shots from 8 ShuttleSet matches (whole-match skeletons) |
+| **Val split** | 3,455 shots from the same 8 matches (disjoint rallies) |
+| **Classes** | 15 of 17 unified shot types present (classes 14 `net_shot` and 15 `smash_defense` absent) |
+| **Augmentations** | None (frozen embeddings, no augmentation at eval time) |
+| **Shot window** | 16 frames (default `config.shot_window`) |
+| **Metric** | Macro-F1 (class-balanced), per-class precision/recall/F1 |
+
+**Results:** SS Val macro-F1 = **0.534**, accuracy = **0.63**.
+
+*Table 3a: Per-class shot-type classification on ShuttleSet validation set (SupCon L2 embeddings)*
+
+| ID | Shot Type | Precision | Recall | F1 | Support | Assessment |
+|---|---|---|---|---|---|---|
+| 0 | `short_serve` | 0.81 | 0.89 | **0.85** | 240 | Strong — distinctive compact serve posture |
+| 5 | `clear` | 0.89 | 0.89 | **0.89** | 314 | Best — full-body overhead arc well captured |
+| 7 | `net_drop` | 0.66 | 0.87 | **0.75** | 563 | Good recall, precision diluted by net-area confusion |
+| 11 | `lob_lift` | 0.78 | 0.66 | **0.71** | 513 | Good precision, ~1/3 missed (confused with clears) |
+| 1 | `long_serve` | 0.61 | 0.76 | **0.67** | 37 | Decent despite tiny support — biomechanically distinct |
+| 10 | `block` | 0.64 | 0.53 | **0.58** | 455 | Large class; confused with net_drop/transition |
+| 8 | `transition` | 0.55 | 0.61 | **0.58** | 160 | Inherently ambiguous — transitional shots overlap many types |
+| 16 | `push` | 0.50 | 0.63 | **0.56** | 276 | Recall OK but many false positives from other mid-court shots |
+| 2 | `smash` | 0.69 | 0.44 | **0.54** | 245 | Good precision, low recall — smashes misclassified as drives/clears |
+| 9 | `drive` | 0.39 | 0.38 | **0.39** | 152 | Flat shots overlap with blocks, pushes, smashes |
+| 3 | `tap_smash` | 0.30 | 0.53 | **0.38** | 151 | Many false positives — confused with smash/push_rush |
+| 12 | `defensive_lift` | 0.37 | 0.39 | **0.38** | 18 | Too few samples; confused with lob_lift |
+| 6 | `slice_drop` | 0.54 | 0.27 | **0.36** | 182 | Very low recall — classified as net_drop or transition |
+| 4 | `push_rush` | 0.29 | 0.16 | **0.20** | 38 | Rare + fast action = indistinguishable from push/tap_smash |
+| 13 | `cross_net` | 0.30 | 0.12 | **0.17** | 111 | Worst — subtle wrist motion invisible in skeleton space |
+
+**Confusion clusters identified:**
+
+- **Net area:** `net_drop` ↔ `cross_net` ↔ `slice_drop` ↔ `block` — these
+  shots differ primarily in racket angle and wrist orientation, which 2D
+  skeleton keypoints cannot resolve.
+- **Power shots:** `smash` ↔ `tap_smash` ↔ `push_rush` — similar overhead
+  body posture with different contact timing and racket speed.
+- **Lifts:** `lob_lift` ↔ `defensive_lift` ↔ `clear` — similar upward
+  trajectories with different court positions and intent.
+
+**Interpretation:** The 0.534 macro-F1 confirms that SupCon embeddings
+capture meaningful shot-type structure — shots with distinctive full-body
+motion signatures (serves, clears, net drops) are well-separated, while
+shots differentiated by racket/wrist subtleties remain confounded. This is a
+fundamental limitation of skeleton-only features, not a failure of the
+contrastive objective. The result serves as the baseline for comparison
+against SimCLR embeddings (Task 7b) to quantify the benefit of shot-type
+supervision in the contrastive loss.
+
+**Saved artefact:** `models/shot_type_clf_supcon_L2.joblib`
+
+#### 6.2.7 Limitations & Known Issues
 
 - **SSL checkpoints exist only for L2 features** (9-dim). The Step 1 ablation
   (feature engineering) uses random init for L0/L1/L3, meaning the L2
@@ -783,57 +875,25 @@ These visualisations are saved to `results/ssl_*_viz_*.png`.
   feature engineering alone — a known limitation of the sequential ablation
   design (see §8.2).
 
-- **Proxy evaluation failure on Colab:** The SS val-split linear probe in
-  notebook 03b failed due to a split-matching issue (`shuttleset_split.json`
-  match names not aligning with GDINO skeleton directory names). The FB
-  strategy probe also failed in 03b due to a path casing issue
-  (`Datasets` vs `datasets`). These are Colab path configuration issues,
-  not methodological problems — the SimCLR notebook's FB probe ran
-  successfully (F1=0.107).
+- **Proxy evaluation — resolved:** The SS val-split linear probe previously
+  failed due to a split-matching issue (`shuttleset_split.json` match names
+  not aligning with GDINO skeleton directory names) and a path casing issue.
+  These were resolved in Task 7a (§6.2.6) by using whole-match skeletons
+  with rally-level train/val splits, yielding the 0.534 macro-F1 result above.
 
-- **Training data scale:** Only 7 of 12 listed SS matches had complete GDINO
-  skeleton extractions. Expanding to all 20+ ShuttleSet matches would
-  increase training data ~3x and likely improve both methods.
+- **Training data scale:** Only 7–8 of 20+ SS matches had complete GDINO
+  skeleton extractions at training time. Expanding to all ShuttleSet matches
+  would increase training data ~3x and likely improve both methods.
 
 ---
 
-7\. Architecture & Pipeline
-----------------------------
+7\. Architecture
+-----------------
 
-### 7.1 End-to-End Pipeline
+The three-phase pipeline (Phase A → B → C) and its data flow are described
+in §3.1. This section details the individual architectural components.
 
-The system comprises three phases executed sequentially:
-
-- **Phase A (SSL pre-training):** Unlabeled ShuttleSet data → encoder learns
-  general badminton motion features via contrastive learning.
-- **Phase B (few-shot adaptation):** Small FineBadminton labeled set → ProtoNet
-  maps learned features to 5 tactical strategy classes.
-- **Phase C (inference):** New unseen video → automatic court detection + shot
-  boundary detection + full feature-to-prediction cascade.
-
-*Table 3: End-to-end pipeline stages*
-
-| Stage | Component | Input | Output |
-|---|---|---|---|
-| A1 | YOLOv8-Pose (GDINO-guided) | Video frames | 2D skeletons (17 joints × 2 players), Y-sorted, exponentially smoothed |
-| A2 | Graph Builder + Feature Engineering | Skeleton sequences | Spatio-temporal graph G=(V,E,X) with enriched node features (L0–L3) |
-| A3 | Shot Segmentation | Skeleton graphs + timestamps | T=16 frame windows per shot, hitter-first ordered |
-| A4 | ST-GCN Encoder | Skeleton graph | 256-dim motion embedding |
-| A5 | SupCon Head | Augmented skeleton pairs + shot-type labels | Supervised contrastive loss (same-type = positive) |
-| A6 | Shot-Type Classifier | Frozen encoder embeddings (SS train) | Logistic head saved for inference |
-| B1 | Prototype Computation | FB labeled support embeddings | 5 class prototypes (mean vectors, one per strategy) |
-| B2 | ProtoNet Classifier | Query embedding + prototypes | Strategy label + confidence score |
-| C1 | Frame Extraction (ffmpeg) | New video (.mp4) | Frames at 30fps |
-| C2 | Court Detector (Hough + RANSAC) | Reference frame | Homography H (pixel → court coords) |
-| C3 | TrackNetV3 (pre-trained, frozen) | Consecutive frames | Shuttle (x,y) per frame + hit event timestamps |
-| C4 | YOLOv8-Pose | All frames | Skeleton keypoints (17 joints × 2 players) |
-| C5 | Shot Segmentation | Hit timestamps + skeletons | T=16 frame windows per shot |
-| C6 | Feature Engineering (L0–L3) | Skeleton windows + H | Enriched node features in court-relative coords |
-| C7 | Encoder (Phase A weights) | Enriched skeleton graphs | 256-dim embedding per shot |
-| C8 | ProtoNet (Phase B prototypes) | Embeddings + prototypes | Strategy label + confidence score + margin |
-| C9 | Shot-Type Head (Phase A weights) | Same embedding | Shot-type label + confidence (17 classes) |
-
-### 7.2 Graph Construction
+### 7.1 Graph Construction
 
 The dual-player spatio-temporal graph uses a unified graph with **34 nodes**
 (17 joints per player). Intra-player edges follow the standard COCO skeleton
@@ -844,7 +904,7 @@ positioning. The adjacency matrix A combines three sub-matrices: A_intra1
 relations). Temporal edges connect each joint to itself in adjacent frames
 (default window w=1, ablation with w=3).
 
-### 7.3 Node Feature Engineering
+### 7.2 Node Feature Engineering
 
 Raw skeleton coordinates alone are an impoverished input. The strategy
 taxonomy requires the model to perceive velocity, court context, body
@@ -866,7 +926,7 @@ numpy operations (finite differences, Euclidean distances, arctan2). They
 require no additional data or models. Layer L4 requires running RacketVision
 on frames and is treated as a stretch goal.
 
-### 7.4 ST-GCN Encoder
+### 7.3 ST-GCN Encoder
 
 The ST-GCN encoder applies graph convolutions alternating between spatial
 graph operations (over the 34-node skeleton topology) and temporal convolutions
@@ -878,7 +938,7 @@ to 9 to 12 across feature layers L0–L3 with zero architectural modification.
 An alternative Transformer encoder (BST-style) is implemented for future
 encoder comparison but is not part of the current ablation scope (see §10.2).
 
-### 7.5 Prototypical Network Classifier
+### 7.4 Prototypical Network Classifier
 
 Phase B is near-parameter-free. The ProtoNet operates in two steps:
 
@@ -993,6 +1053,11 @@ STEP 3 — FEW-SHOT CLASSIFIER (fix all above = best)
 
 STEP 4 — K-SHOT SENSITIVITY (final best configuration)
 └── K = 1, 3, 5, 8, 10   (capped at 10 — move_to_net has ~11 train samples/fold)
+
+STEP 5 — SHUTTLECOCK ABLATION (fix all above = best)
+├── skeleton-only:      34-node graph (default)
+└── skeleton + shuttle: 35-node graph (shuttle trajectory as virtual node 34)
+    Uses TrackNetV4-extracted trajectories; shuttle node ↔ both players' wrists.
 ```
 
 ### 8.6 Planned Visualizations
@@ -1018,21 +1083,21 @@ STEP 4 — K-SHOT SENSITIVITY (final best configuration)
 | File | Responsibility | Pipeline Stage |
 |---|---|---|
 | `src/config.py` | Hyperparameters, file paths, experiment settings | Global configuration |
-| `src/data/pose_extractor.py` | YOLOv8s-Pose skeleton extraction (GDINO-guided); top-2 by keypoint confidence, Y-sorted; exponential smoothing (α=0.7) | A1 / C4 |
-| `src/data/graph_builder.py` | Dual-player spatio-temporal graph (34 nodes, 3 adjacency types) | A2 |
+| `src/data/pose_extractor.py` | YOLOv8s-Pose skeleton extraction (GDINO-guided); top-2 by keypoint confidence, Y-sorted; exponential smoothing (α=0.7) | P1 / C4 |
+| `src/data/graph_builder.py` | Dual-player spatio-temporal graph (34 nodes, 3 adjacency types) | P2 |
 | `src/data/dataset.py` | Data loading, shot windowing, hitter-first ordering, episode sampling, 5-fold CV | Data Pipeline |
-| `src/models/stgcn_model.py` | ST-GCN backbone (9 blocks, configurable input dim); 3.08M params | A4 / C7 |
+| `src/models/stgcn_model.py` | ST-GCN backbone (9 blocks, configurable input dim); 3.08M params | A1 / C7 |
 | `src/models/transformer_encoder.py` | BST-style Transformer encoder (4 layers, 8 heads); future encoder comparison | Future work |
-| `src/models/simclr_loss.py` | NT-Xent contrastive loss, projection head, augmentation pipeline | A5 |
+| `src/models/simclr_loss.py` | NT-Xent contrastive loss, projection head, augmentation pipeline | A1 |
 | `src/models/proto_net.py` | ProtoNet + k-NN variant, confidence/margin scoring | B1–B2 / C8 |
 | `src/inference.py` | Phase C end-to-end inference on new video | C1–C8 |
 | `notebooks/01_EDA_finebadminton.ipynb` | FineBadminton exploratory analysis | EDA |
 | `notebooks/01_EDA_shuttleset.ipynb` | ShuttleSet exploratory analysis | EDA |
-| `notebooks/02_skeleton_extraction_finebadminton.ipynb` | Batch GDINO+YOLO extraction for 40 FB rallies → `finebadminton_skeletons/` ✅ | A1 |
-| `notebooks/02_skeleton_extraction_shuttleset.ipynb` | Batch extraction for SS shots → `ShuttleSet/skeletons/` 🔄 | A1 |
-| `notebooks/02_shuttlecock_tracking_finebadminton.ipynb` | TrackNetV4 shuttle trajectory extraction → `finebadminton_shuttles/` ✅ | Preprocessing |
-| `notebooks/03_ssl_pretraining.ipynb` | SimCLR pre-training on ShuttleSet → `models/ssl_pretrained.pt` | A4–A5 |
-| `notebooks/04_fewshot_training.ipynb` | ProtoNet 5-fold CV → `models/fewshot_final.pt` | B1–B2 |
+| `notebooks/02_skeleton_extraction_finebadminton.ipynb` | Batch GDINO+YOLO extraction for 40 FB rallies → `finebadminton_skeletons/` | P1 |
+| `notebooks/02_skeleton_extraction_shuttleset.ipynb` | Batch extraction for SS shots → `ShuttleSet/skeletons/` | P1 |
+| `notebooks/02_shuttlecock_tracking_finebadminton.ipynb` | TrackNetV4 shuttle trajectory extraction → `finebadminton_shuttles/` | P1 |
+| `notebooks/03_ssl_pretraining.ipynb` | SimCLR/SupCon pre-training on ShuttleSet → `models/ssl_pretrained_*.pt` | A1 |
+| `notebooks/04_fewshot_training.ipynb` | ProtoNet 5-fold CV → `models/fewshot_*.pt` | B1–B2 |
 | `notebooks/05_ablations.ipynb` | All ablation configurations | Experiments |
 | `notebooks/06_analysis_and_plots.ipynb` | t-SNE, confusion matrix, K-shot curves | Analysis |
 | `badminton_server.py` | HTTP demo server (port 7860) serving FB frames, skeleton overlays, shuttle trajectories | Demo Backend |
@@ -1087,8 +1152,10 @@ Baddiev2/
 │       └── skeletons/                          # Per-shot .npy (2, 16, 34) 🔄
 │
 ├── models/                                     # Saved model checkpoints
-│   ├── ssl_pretrained.pt                       # Phase A output
-│   └── fewshot_final.pt                        # Phase B output
+│   ├── ssl_pretrained_simclr_L2.pt             # Phase A output (SimCLR)
+│   ├── ssl_pretrained_supcon_L2.pt             # Phase A output (SupCon)
+│   ├── shot_type_clf_supcon_L2.joblib          # Shot-type logistic head
+│   └── fewshot_supcon_L2.pt                    # Phase B output
 │
 ├── src/                                        # All reusable Python source code
 │   ├── config.py
@@ -1129,10 +1196,11 @@ Baddiev2/
   information that could help distinguish strategies (e.g., shuttle height for
   create_depth). 3D pose lifting (MotionBERT) is a potential extension.
 
-- **No shuttle trajectory in encoder:** Several strategies (create_depth,
-  intercept) are partially defined by shuttle placement. TrackNetV4 trajectories
-  are extracted and visualized in the demo but not yet incorporated as encoder
-  input during Phases A–B.
+- **No shuttle trajectory in encoder (default):** Several strategies
+  (create_depth, intercept) are partially defined by shuttle placement.
+  TrackNetV4 trajectories are extracted and visualized in the demo but not
+  yet incorporated as encoder input during Phases A–B. Evaluated in Step 5
+  ablation (34-node vs. 35-node graph).
 
 - **Pose estimation errors:** Occlusion, fast motion blur, and overlapping
   players cause pose estimation failures. The GDINO filter substantially reduces
@@ -1233,21 +1301,7 @@ ID (`{rally_id}_{abs_frame}.jpg`). Annotations are in two JSON files; the
 pipeline uses the English-translated version
 (`transformed_combined_rounds_output_en_evals_translated.json`).
 
-**Per-shot annotation fields:**
-
-| Field | Type | Notes |
-|---|---|---|
-| `hit_frame` | int | Exact contact frame, no missing values |
-| `start_frame` / `end_frame` | int | Shot window boundaries |
-| `hitter` | str | `"top"` or `"bottom"` (1 missing across all shots) |
-| `player` | str | Player name |
-| `hit_type` | str | Stroke type (12 classes) |
-| `subtype` | list[str] | Sub-classification |
-| `quality` | int | Annotator quality score 1–7 |
-| `ball_area` | str | 9 court zones (left/mid/right × front/mid/back) |
-| `player_actions` | list[str] | forehand / backhand / turnaround |
-| `shot_characteristics` | list[str] | cross-court / straight / over head / body hit |
-| `strategies` | list[str] | Tactical strategy labels (355/414 shots) |
+*Annotation fields: see §4.1 for the full field table.*
 
 **Scale:**
 
@@ -1544,7 +1598,7 @@ where no actual defensive shot exists.
 
 -   **k-NN (k=3 or k=5):** Classify by majority vote of k nearest
     support examples. No centroid assumption. Tests whether classes have
-    sub-clusters. Cheap to implement, included as Step 4 ablation.
+    sub-clusters. Cheap to implement, included as Step 3 ablation.
 
 -   **Matching Networks:** Attention-weighted distance to every support
     example. Handles irregular class shapes but adds complexity.
@@ -1627,107 +1681,56 @@ B.6 Strategy Signal Mapping to Pipeline Components
 | Temporal signals (timing, sequence) | How features change across T=16 frames; velocity/accel (L1) | Temporal edges in graph + kinematics (L1) |
 | Movement patterns (lunge, stretch) | Skeleton shape changing over time: joint angles (L3) + velocity (L1) | Learned by encoder from L1 + L3 features |
 | Player state / context | Relative positioning between two skeletons: dist_to_opponent (L2) | Inter-player edges + court context (L2) |
-| Shot/intent signals (trajectory) | NOT directly available. Partially inferable from arm kinematics + racket angle | Known limitation. Racket (L4) helps. Shuttle trajectory = future work. |
+| Shot/intent signals (trajectory) | NOT directly available. Partially inferable from arm kinematics + racket angle | Known limitation. Shuttle trajectory = Step 5 ablation. Racket (L4) = stretch goal. |
 
 The last row is the critical gap: shot trajectory signals ("deep
 controlled trajectory" for create depth, "flat aggressive trajectory"
-for intercept) are not directly available in a skeleton-only pipeline.
+for intercept) are not directly available in the default skeleton-only
+pipeline. Step 5 (shuttle ablation) partially addresses this.
 
-B.7 Full Strategy Taxonomy Including Excluded Categories
----------------------------------------------------------
-
-| Strategy | Key Signals | In Scope? |
-|---|---|---|
-| Create depth | Rear-court landing; opponent in mid/front; controlled execution | Yes |
-| Intercept | Forward court; early timing; quick forward lunge; flat/aggressive | Yes |
-| Move to net | Progressive forward positioning; sequential across multiple shots | Yes |
-| Passive | No spatial gain; standard/late timing; minimal repositioning | Yes |
-| Defensive | Rear/stretched position; reactive timing; recovery movement | Yes |
-| Deception | Spatial expectation vs. actual mismatch; timing disguise | No — requires biomechanical data |
-| Hesitation | Normal setup; delayed contact; micro-stall before execution | No — requires sub-frame timing |
-| Seamlessly | Smooth transitions; fluid movement; consistent shot flow | No — quality modifier |
+*B.7 removed — see §1 Table 1 for strategy taxonomy and excluded categories.*
 
 B.8 Ablation Step Summary Diagram
 ----------------------------------
 
-```
-STEP 1 — INPUT REPRESENTATION (fix encoder = ST-GCN, SSL+Aux)
-├── L0: Raw [x,y] only                              ← current baseline
-├── L1: + velocity, acceleration [x,y,vx,vy,ax,ay]  ← free to compute
-├── L2: + court-relative distances                   ← free to compute
-├── L3: + joint angles                               ← free to compute
-├── Full enriched features (L0–L3)                   ← best representation
-├── Spatial-only vs. temporal-only (RQ1)             ← on best features
-├── Single-player vs. dual-player                    ← inter-player value
-└── + Racket 18th joint, L4 (stretch)                ← needs RacketVision
-
-STEP 2 — ENCODER ARCHITECTURE (fix input = best from Step 1, SSL+Aux)
-├── ST-GCN          ← graph convolutions, structural priors
-├── Transformer     ← self-attention, BST-style
-├── LSTM            ← sequential baseline (sanity check)
-└── 1D-CNN          ← convolutional baseline (sanity check)
-
-STEP 3 — PRE-TRAINING (fix encoder + input = best from Steps 1–2)
-├── Random initialization
-├── SimCLR contrastive only
-└── SimCLR + auxiliary shot-type (default)
-
-STEP 4 — FEW-SHOT METHOD (fix encoder + input + pre-training = best)
-├── ProtoNet (centroid distance)
-├── k-NN, k=3 and k=5 (individual example distance)
-└── Linear probe (logistic regression, representation quality check)
-
-STEP 5 — K-SHOT SENSITIVITY (final best configuration)
-└── K = 1, 3, 5, 8, 10, 15
-```
-
-B.9 The Full Pipeline as One Picture
--------------------------------------
+Canonical ablation numbering (matches §8.5). Each step varies one axis
+while holding all others at the best value found so far.
 
 ```
-ShuttleSet (21,191 unlabeled shots)
-         │
-         ▼
-   ┌─────────────┐
-   │  YOLOv8-Pose │ ──→ Raw skeleton coords (17 joints × 2 players)
-   └─────────────┘
-         │
-         ▼
-   ┌──────────────────┐
-   │  Feature Eng.     │ ──→ Enriched node features (L0–L3):
-   │  (feature_eng.py) │     [x, y, vx, vy, ax, ay, dist_net,
-   └──────────────────┘      dist_center, dist_opp, angles...]
-         │
-         ▼
-   ┌─────────────────────────────────────────┐
-   │         ENCODER (the variable)           │
-   │                                          │
-   │  ST-GCN (default)  ◄── graph priors     │   Phase A:
-   │       vs.                                │   SimCLR contrastive
-   │  Transformer        ◄── BST's insight   │   + aux shot-type
-   │       vs.                                │   pre-training
-   │  LSTM / 1D-CNN      ◄── sanity check    │
-   │                                          │
-   └─────────────────────────────────────────┘
-         │
-         │  256-dim embedding per shot
-         ▼
-   ┌─────────────────────────────────────────┐
-   │      CLASSIFIER (the variable)           │
-   │                                          │   Phase B:
-   │  ProtoNet: distance to class centroids   │   Few-shot on 40
-   │       vs.                                │   FineBadminton
-   │  k-NN: nearest individual examples       │   labeled rallies
-   │       vs.                                │
-   │  Linear probe: logistic regression       │
-   │                                          │
-   │  → strategy label + confidence score     │
-   └─────────────────────────────────────────┘
+STEP 1a — FEATURE ENGINEERING ⭐ RQ1 (fix encoder = ST-GCN, graph = full dual-player)
+├── L0: Raw [x,y] only                              (2-dim)
+├── L1: + velocity, acceleration                    (6-dim)
+├── L2: + court-relative distances                   (9-dim) ← baseline done (37.0%)
+└── L3: + joint angles                               (12-dim)
+    Note: SSL checkpoint exists only for L2; L0/L1/L3 use random init.
+
+STEP 1b — GRAPH STRUCTURE (fix feature_layer = best from Step 1a)
+├── full_dual:      34 nodes, inter-player edges = Yes   ← default
+├── no_inter_edges: 34 nodes, inter-player edges = No
+└── single_player:  17 nodes (hitter only)
+
+STEP 2 — PRE-TRAINING REGIME ⭐ RQ2 (fix encoder = ST-GCN, input = best from Step 1)
+├── random_init:   no pre-training                       ← baseline: 36.9%
+├── simclr:        SimCLR (self-supervised, no labels)   ← checkpoint: ssl_pretrained_simclr_L2.pt
+└── supcon:        SupCon (shot-type labels as positives) ← checkpoint: ssl_pretrained_supcon_L2.pt
+
+STEP 3 — FEW-SHOT CLASSIFIER (fix all above = best)
+├── ProtoNet        ← nearest centroid
+├── k-NN (k=3, k=5)
+└── Linear probe    ← logistic regression
+
+STEP 4 — K-SHOT SENSITIVITY (final best configuration)
+└── K = 1, 3, 5, 8, 10
+
+STEP 5 — SHUTTLECOCK ABLATION (fix all above = best)
+├── skeleton-only:      34-node graph (default)
+└── skeleton + shuttle: 35-node graph (shuttle as virtual node 34)
 ```
 
-Phase A teaches the encoder what badminton movement looks like by
-training on thousands of unlabeled shots. Phase B shows it 40 examples
-of "this movement pattern = this strategy" and asks it to generalize.
+Encoder architecture comparison (ST-GCN vs. Transformer) is implemented
+but deferred to future work (§10.2).
+
+*B.9 removed — see §3.1 for the canonical pipeline diagram.*
 
 B.10 Inference on New Video — The Shot Detection Gap
 -----------------------------------------------------
@@ -1767,108 +1770,8 @@ none of that exists. The video is just a continuous stream of frames.
 | Feature engineering + encoding + classification | ~3 s |
 | **Total** | **~30 s** |
 
-B.11 Hitter-First Skeleton Ordering — The Core Data Convention
---------------------------------------------------------------
+*B.11 removed — content covered in §5.2.*
 
-**The problem:** The model must always know which player is the hitter so
-it learns strategy signals from the correct skeleton.
+*B.12 removed — content covered in §5.3.*
 
-**Initial bug — X-sort instead of Y-sort:** The original implementation
-sorted players by X position (left vs. right on screen). This is incorrect
-because broadcasts can flip orientation, and FineBadminton annotation uses
-"top"/"bottom" (court halves), not "left"/"right".
-
-**The fix — Y-sort by court position:**
-
-```
-player 0 (nodes 0–16)  = top court   (smaller Y = top of image)
-player 1 (nodes 17–33) = bottom court (larger Y = bottom of image)
-```
-
-This maps cleanly to the FineBadminton annotation field:
-`"hitter": "top"` → hitter is already at nodes 0–16, no swap needed.
-`"hitter": "bottom"` → swap both halves so hitter moves to nodes 0–16.
-
-**FineBadminton implementation (`dataset.py`):** After extracting the
-T=16 frame window centred on the hit frame, `_reorder_hitter_first()` is
-called. If `"bottom"`, nodes 0–16 and 17–33 are swapped in-place.
-
-**ShuttleSet implementation (notebook 02):** `player_location_y` (pixel Y
-of the hitting player) is compared against each player's skeleton centroid
-Y. The closer player is swapped to nodes 0–16 if needed. Applied at
-extraction time — saved `.npy` files are already hitter-first ordered.
-
-B.12 Extraction Granularity — Why FineBadminton is Per-Rally and ShuttleSet is Per-Shot
-----------------------------------------------------------------------------------------
-
-**FineBadminton:** Frames have rally identity encoded in the filename
-(`0011_001_00001.jpg`). The natural unit is to load all frames for one
-rally, run YOLOv8-Pose, and save one `.npy` covering the full rally
-duration. Windowing to T=16 happens at dataset load time.
-
-**ShuttleSet:** Frames are flat sequential integers within a match directory
-(no rally/shot identity in filename). The only way to locate a specific shot
-is to look up `frame_num` from the JSON record. Since per-shot lookup is
-required anyway, extracting one `.npy` per shot (16 frames centred on
-`frame_num`) is equally straightforward and avoids loading the entire match
-into memory.
-
-| Dataset | Skeleton granularity | Shape | Hitter reordering |
-|---|---|---|---|
-| FineBadminton | Per rally | `(2, T_full, 34)` | At load time |
-| ShuttleSet | Per shot | `(2, 16, 34)` | At extraction time |
-
-Both produce the same model input: `(2, 16, 34)`, hitter at nodes 0–16.
-
-B.13 Shot Segmentation Design — Why a Window Around the Hit, Not Just the Hit Frame
-------------------------------------------------------------------------------------
-
-**Answer:** A temporal window centred on the hit frame is strongly preferred.
-The implementation uses T=16 frames (±8 at 20fps ≈ 0.8 s).
-
-**Why frames BEFORE the hit are critical:**
-
-Tactical strategy is committed to during preparation, not at contact:
-
-- **Footwork direction:** A player moving to the net before striking reveals
-  "move to net" strategy in their approach, not in the swing.
-- **Preparation pose:** Shoulder/racket windup angle signals whether the
-  decision was deliberate.
-- **Opponent positioning:** Where the opponent is *before* contact determines
-  which strategy is rational. A baseline gap invites intercept; an opponent at
-  the net invites create_depth.
-
-**Why frames AFTER the hit are also included:**
-
-Post-contact frames confirm whether the executed shot matches the strategy
-(e.g., a "move to net" stroke should result in the hitter approaching the net).
-
-**Stroke-level samples, not frame-level samples:**
-
-Each sample is one hit event (one stroke), not one frame. The dataset is
-structured at the stroke level — hitter roles, labels, and T=16 windows are
-all defined per stroke.
-
-**Dynamic role assignment per stroke:**
-
-| Stroke | Hit frame | Hitter | Nodes 0–16 | Nodes 17–33 |
-|---|---|---|---|---|
-| Stroke 1 | Frame 10 | Player A | Player A skeleton | Player B skeleton |
-| Stroke 2 | Frame 24 | Player B | Player B skeleton | Player A skeleton |
-| Stroke 3 | Frame 38 | Player A | Player A skeleton | Player B skeleton |
-
-**Frame overlap between samples is intentional and correct:**
-
-Because consecutive strokes produce overlapping windows, the same frame may
-appear in two samples. This is standard practice in temporal action segmentation.
-The two samples have *different labels* and *different hitter assignments*, so
-the overlap does not inflate metrics.
-
-```python
-# dataset.py — _extract_shot_window()
-half = self.shot_window // 2          # 16 frames
-start = max(0, rel_hit - half)        # 16 frames before hit
-end   = start + self.shot_window      # 16 frames after hit (T=32 total)
-segment = full_skeleton[:, start:end, :]
-segment = _reorder_hitter_first(segment, hitter)
-```
+*B.13 removed — content merged into §5.3.*
