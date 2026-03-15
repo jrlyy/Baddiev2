@@ -553,16 +553,22 @@ optional refinement when full-body projections are needed for visualisation.
 ### 6.1 Few-Shot Training Setup
 
 Given the extremely small labeled set (40 rallies), the evaluation protocol
-uses **rally-level splits** to prevent data leakage — all shots from a given
-rally appear in only one partition (never split across train and test within
-the same fold).
+uses **rally-level 5-fold cross-validation** over all 40 rallies (~8 test
+rallies per fold, ~24 train, ~8 val for checkpoint selection).
 
-**Split design:**
-- **30 rallies (241 shots)** for cross-validation training
-- **10 rallies (55 shots)** held out for final generalization evaluation
+**Why rally-level (not shot-level) splitting:** Shots within the same rally
+share the same skeleton file and the same two players across consecutive
+frames. Shot-level k-fold places shots from the same rally in both train and
+test (empirically 25–28 of 40 rallies appear in both splits every fold),
+meaning the model has already seen those players' movement patterns at test
+time. Rally-level splitting ensures every test shot comes from a rally whose
+players were never seen during training, giving an honest generalisation
+estimate. All 40 rallies contribute to evaluation via rotation across folds.
 
-5-fold stratified CV is run within the 30 training rallies only; the 10
-held-out rallies are touched once at the end to produce the honest test estimate.
+**Split design (per fold):**
+- **~24 rallies** — episodic ProtoNet training
+- **~8 rallies** — validation (checkpoint selection only)
+- **~8 rallies** — test (reported metrics)
 
 All results report mean ± standard deviation across folds. Class distribution
 is imbalanced (intercept and passive are more common than move_to_net). We
@@ -612,41 +618,182 @@ on Colab T4 GPU.
    The centroid assumption holds — the embedding space (even random-init) creates
    roughly spherical per-class clusters.
 
-### 6.2 SSL Pre-Training (Phase A) — Supervised Contrastive Learning
+### 6.2 SSL Pre-Training (Phase A) — Contrastive Representation Learning
 
-We apply **SupCon (Supervised Contrastive Learning; Khosla et al., 2020)**
-using ShuttleSet's shot-type labels as supervision. Unlike SimCLR which pairs
-augmented views of the same sample, SupCon treats all shots of the same type
-(across different players and matches) as positives. This forces the encoder
-to cluster by shot mechanics (smash trajectory, drop placement, lob height)
-rather than by player identity or match context.
+Pre-training on ShuttleSet's ~7,000 skeleton shots gives the ST-GCN encoder
+exposure to diverse badminton motion patterns before it sees any strategy
+labels. We train two contrastive variants — **SimCLR** (fully self-supervised)
+and **SupCon** (shot-type supervised) — and compare both against random
+initialisation in the Step 3 ablation (§8.5).
+
+#### 6.2.1 Shared Architecture & Augmentation Pipeline
+
+Both methods share the same encoder (ST-GCN, 3.08M params), projection head
+(MLP: 256 → 256 → 128 with BatchNorm + ReLU), and augmentation pipeline.
+Two independently augmented "views" of each skeleton sequence are generated
+per training step. The augmentations are designed to preserve the semantic
+content of the shot while varying surface-level appearance:
+
+| Augmentation | Parameters | Purpose |
+|---|---|---|
+| Joint jittering | Gaussian noise σ=0.02 | Simulate pose estimation noise, prevent overfitting to exact coordinates |
+| Speed perturbation | ±20% temporal resampling | Invariance to shot speed variation across players and match contexts |
+| Spatial rotation | ±10° court-relative | Invariance to minor camera angle differences across matches |
+| Joint masking | 15% of joints zeroed | Forces the encoder to reconstruct information from partial observations |
+
+These augmentation parameters were tuned conservatively — earlier experiments
+with stronger augmentations (σ=0.06, 40% masking, ±25° rotation) degraded
+convergence, likely because aggressive perturbation destroys the court-relative
+spatial relationships encoded in L2 features.
+
+**Training data:** 7 ShuttleSet matches with GDINO-extracted skeletons
+(~38,200 frames, ~7,050 shots after shot segmentation with T=32 frame windows).
+The encoder uses L2 features (9-dim: x, y + velocity + court context).
+
+**Shared hyperparameters:** AdamW optimiser (lr=3e-4, weight_decay=1e-4),
+batch size 64, temperature τ=0.2, early stopping with patience=10 epochs.
+
+#### 6.2.2 SimCLR — Self-Supervised (NT-Xent Loss)
+
+SimCLR (Chen et al., 2020) requires no labels. For each skeleton sequence in
+the batch, the two augmented views form a single positive pair; all other
+2(B-1) samples serve as negatives. The NT-Xent loss is:
+
+```
+L_NT-Xent = -log [ exp(sim(z_i, z_j)/τ) / Σ_{k≠i} exp(sim(z_i, z_k)/τ) ]
+```
+
+where z_i, z_j are the L2-normalised projections of the two views and
+sim(·,·) is cosine similarity.
+
+**Key characteristic:** Each anchor has exactly **1 positive** (its own
+augmentation twin). This means the contrastive signal is invariant to semantic
+content — the encoder learns motion-general features (e.g. "similar skeleton
+poses should embed nearby") without any shot-type or strategy awareness.
+
+**Training results:** SimCLR used all 7 available matches (no split filtering,
+since no labels are needed), yielding 7,051 training samples and 110 batches
+per epoch. Training converged at epoch 93 (early stopped after patience=10)
+with a final NT-Xent loss of 0.640. The loss curve shows smooth convergence
+from 0.698 (epoch 5) with no signs of instability.
+
+**Checkpoint:** `models/ssl_pretrained_simclr_L2.pt`
+
+**Linear probe on FB strategy labels (sanity check):** Macro-F1 = 0.107 ± 0.002
+(5-fold CV with frozen encoder + logistic regression on 296 FineBadminton
+shots). This is below the random baseline of 0.20, indicating that SimCLR's
+self-supervised objective alone — without any semantic grouping — does not
+produce features that linearly separate strategy classes. This does not
+preclude benefit after episodic fine-tuning (evaluated in Step 3 ablation).
+
+#### 6.2.3 SupCon — Supervised Contrastive Learning
+
+SupCon (Khosla et al., 2020) extends SimCLR by using ShuttleSet's shot-type
+labels to define positive pairs. Rather than pairing only augmented views of
+the *same* sequence, SupCon treats **all shots of the same type** (across
+different players and matches) as positives. This forces the encoder to
+cluster by shot mechanics (smash trajectory, drop placement, lob arc) rather
+than by player identity or match context.
 
 **Training objective:**
 
-For a batch of skeleton sequences {x_i}, let y_i be the shot-type label:
+For a batch of skeleton sequences {x_i} with shot-type labels y_i:
 
 ```
 L_SupCon = Σ_i [ -1/|P(i)| · Σ_{p∈P(i)} log [ exp(z_i·z_p/τ) / Σ_{a≠i} exp(z_i·z_a/τ) ] ]
 ```
 
 where P(i) = {j : y_j = y_i, j ≠ i} is the set of same-type positives in
-the batch, z_i is the L2-normalized projection head output, and τ=0.07 is the
-temperature.
+the batch, z_i is the L2-normalised projection head output, and τ=0.2.
 
-**Skeleton augmentations** (applied independently to both views):
-- Joint coordinate jittering (Gaussian noise σ=0.02)
-- Temporal crop and resample (±20% window)
-- Spatial rotation (±15° court-relative)
-- Joint masking (10–20% of joints zeroed)
+**Key characteristic:** Each anchor has **multiple positives** — all
+batch members sharing its shot-type label. In a batch of 64 with ~10 shot
+types represented, each anchor averages ~7 positives (7x more gradient signal
+per step than SimCLR's single positive). This richer training signal enables
+the encoder to learn that structurally similar movements (e.g. all smashes,
+regardless of player or match) should cluster together.
 
-**Training data:** 15 SS train-split matches (~12,700 shots). The 5 validation
-matches are held out for shot-type linear probe evaluation. Since SupCon uses
-shot-type labels rather than strategy labels, there is no strategy label leakage.
+**Training data:** 5 train-split matches (~4,900 shots with valid shot-type
+labels), using only matches with both GDINO skeletons and matched CSV
+annotations (76 batches per epoch).
 
-**Benefit over SimCLR:** The auxiliary shot-type classification head previously
-required separate loss weighting and competed with the contrastive objective.
-SupCon integrates shot-type supervision directly into the contrastive loss,
-producing semantically structured embeddings in a single objective.
+**Training results:** SupCon converged at epoch 60 (early stopped) with a
+final loss of 2.516. The loss curve shows steeper initial descent than SimCLR
+(from 4.14 at epoch 5 to 2.52 at epoch 50), consistent with the richer
+per-step gradient signal from multiple positives. Note: SupCon loss values are
+not directly comparable to NT-Xent values due to the different normalisation
+(averaging over |P(i)| positives vs. a single positive).
+
+**Checkpoint:** `models/ssl_pretrained_supcon_L2.pt`
+
+#### 6.2.4 SimCLR vs SupCon — Conceptual Comparison
+
+| Aspect | SimCLR (NT-Xent) | SupCon |
+|---|---|---|
+| **Labels required** | None | Shot-type labels (from ShuttleSet CSVs) |
+| **Positive definition** | Augmentation twin of same sample | All samples with same shot-type label |
+| **Positives per anchor** | 1 (constant) | ~7 on average (scales with class frequency) |
+| **What the encoder learns** | General motion similarity | Shot-type-aware motion clustering |
+| **Training data** | All 7 matches (7,051 shots) | 5 train-split matches (~4,900 shots) |
+| **Convergence** | 93 epochs, loss 0.640 | 60 epochs, loss 2.516 |
+| **Risk** | May learn irrelevant invariances (player identity) | Depends on shot-type label quality |
+
+**Why SupCon is expected to outperform SimCLR:** Shot types partially correlate
+with tactical strategies — a smash is more likely to occur during an
+"intercept" strategy, while a lob is more associated with "defensive" play.
+By forcing the encoder to group by shot mechanics, SupCon pre-structures the
+embedding space in a way that is more directly useful for downstream strategy
+classification. An earlier design used SimCLR + an auxiliary shot-type
+classification head, but this required separate loss weighting and created
+competing objectives. SupCon integrates shot-type supervision directly into
+the contrastive loss, producing semantically structured embeddings in a single
+unified objective.
+
+#### 6.2.5 Diagnostic Visualisations
+
+Both notebooks include diagnostic visualisations run before training:
+
+- **Augmentation pipeline (SimCLR):** Multi-frame ghost trail showing each
+  augmentation in isolation (jitter, speed, rotation, masking) and the
+  combined "View A / View B" pair that the encoder actually sees. Confirms
+  that augmentations preserve recognisable player poses while introducing
+  sufficient variation.
+
+- **Positive-pair structure (SupCon):** Side-by-side 2B x 2B similarity
+  matrices for SimCLR vs SupCon, showing how many cells are "pull together"
+  (positive) vs "push apart" (negative). SupCon's matrix is visibly denser
+  in the positive region.
+
+- **Training signal richness:** Bar chart comparing positives-per-anchor
+  between SimCLR (constant 1) and SupCon (~7 average), quantifying the
+  gradient signal advantage.
+
+- **Intra-class skeleton consistency (SupCon):** Grid of skeleton stick
+  figures grouped by shot type, testing the core SupCon hypothesis — that
+  same-type shots share similar poses. Visual inspection confirms that
+  smashes, clears, and drops show recognisable within-class consistency.
+
+These visualisations are saved to `results/ssl_*_viz_*.png`.
+
+#### 6.2.6 Limitations & Known Issues
+
+- **SSL checkpoints exist only for L2 features** (9-dim). The Step 1 ablation
+  (feature engineering) uses random init for L0/L1/L3, meaning the L2
+  advantage in Step 1 may partially reflect SSL pre-training rather than
+  feature engineering alone — a known limitation of the sequential ablation
+  design (see §8.2).
+
+- **Proxy evaluation failure on Colab:** The SS val-split linear probe in
+  notebook 03b failed due to a split-matching issue (`shuttleset_split.json`
+  match names not aligning with GDINO skeleton directory names). The FB
+  strategy probe also failed in 03b due to a path casing issue
+  (`Datasets` vs `datasets`). These are Colab path configuration issues,
+  not methodological problems — the SimCLR notebook's FB probe ran
+  successfully (F1=0.107).
+
+- **Training data scale:** Only 7 of 12 listed SS matches had complete GDINO
+  skeleton extractions. Expanding to all 20+ ShuttleSet matches would
+  increase training data ~3x and likely improve both methods.
 
 ---
 
