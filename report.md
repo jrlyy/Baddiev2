@@ -133,8 +133,41 @@ Note: `move_to_net` has only 18 samples after windowing and skeleton extraction 
 
 **Strategy--shot type co-occurrence.** Initial co-occurrence analysis reveals meaningful correlations between strategy labels and shot types. For example, "create depth" is almost exclusively associated with push shots (47/61 occurrences), while "intercept" is dominated by kills (66/120). These correlations motivate the use of shot-type labels as a proxy supervision signal during pre-training.
 
-<!-- Figure: results/eda_shot_strategy_heatmap.png --- Strategy vs shot type co-occurrence heatmap -->
-<!-- Figure: results/eda_shot_strategy_prob.png --- Conditional probability of strategy given shot type -->
+![Shot type distribution](results/eda_shot_distribution.png)
+*Figure 1: Distribution of 12 shot types across all annotated shots.*
+
+![Strategy distribution](results/eda_strategy_distribution.png)
+*Figure 2: Strategy label distribution (5 classes).*
+
+![Strategy vs shot type co-occurrence heatmap](results/eda_shot_strategy_heatmap.png)
+*Figure 3: Strategy x shot type co-occurrence heatmap (raw counts).*
+
+![Conditional probability of strategy given shot type](results/eda_shot_strategy_prob.png)
+*Figure 4: P(strategy | shot_type) conditional probability heatmap.*
+
+![Strategy entropy per shot type](results/eda_strategy_entropy.png)
+*Figure 5: Shannon entropy per shot type -- quantifies how ambiguous each shot type is with respect to strategy.*
+
+![Rally statistics](results/eda_rally_stats.png)
+*Figure 6: Rally length distribution and shots per video.*
+
+![Area x strategy heatmap](results/eda_area_strategy_heatmap.png)
+*Figure 7: Court zone (9 areas) x strategy cross-tabulation (counts and probabilities).*
+
+![Shot characteristics](results/eda_shot_characteristics.png)
+*Figure 8: Shot characteristics frequency, player actions (forehand/backhand), and hitter position (top/bottom).*
+
+![Mean pose per strategy](results/eda_mean_pose_per_strategy.png)
+*Figure 9: Mean skeleton stick-figure poses at hit frame per strategy (P0 top-court / P1 bottom-court).*
+
+![Shuttle trajectory analysis](results/eda_shuttle_analysis.png)
+*Figure 10: Shuttle position density heatmap, trajectory length histogram, and visibility rate distribution.*
+
+![Shot quality distribution](results/eda_quality_distribution.png)
+*Figure 11: Shot quality distribution overall, by shot type, and by strategy.*
+
+![EDA summary dashboard](results/eda_summary_dashboard.png)
+*Figure 12: Comprehensive 8-panel EDA summary dashboard.*
 
 ### 4.2 ShuttleSet --- Pre-Training Dataset
 
@@ -195,6 +228,9 @@ Statistical significance: one-way ANOVA F = 493, p ~ 0; eta-squared = 0.57 (larg
 
 **Key findings.** Fast strategies (~0.8--0.9s: intercept, defensive) are reactive, pressure-driven plays. Slow strategies (~1.2--1.3s: move to net, create depth) are positional plays relying on push shots and clears with longer flight times. Passive shots (1.14s) have the lowest quality score (3.21), indicating forced responses under pressure rather than strategic choices. This temporal structure suggests that shot duration could serve as an auxiliary input feature for strategy classification.
 
+![Shot duration analysis](results/eda_shot_duration.png)
+*Figure 13: Shot duration distributions -- histogram, boxplots by shot type and by strategy.*
+
 ---
 
 ## 5. Dataset Pre-Processing
@@ -207,7 +243,8 @@ From raw video frames we extract three types of information: player skeletons, s
 
 **Umpire contamination.** A systematic quality audit of the extracted FineBadminton skeletons revealed a significant contamination issue. YOLOv8-Pose imposes no spatial constraint on detected persons. The chair umpire is consistently detected with high confidence because they are stationary, upright, and well-lit --- occupying a seat at approximately x ~ 102 px on a 1280 px-wide frame. In some cases, audience members were also detected as players.
 
-<!-- Figure: Side-by-side comparison of YOLOv8-only vs GDINO-guided extraction showing umpire contamination -->
+![Skeleton extraction quality](results/eda_skeleton_quality.png)
+*Figure 14: Skeleton extraction quality -- frames per rally, frames vs shots scatter, and YOLOv8 vs GDINO frame count comparison.*
 
 **Grounding DINO-guided extraction (adopted solution).** A GDINO-guided approach uses Grounding DINO (grounding-dino-tiny) with the text prompt `"badminton player ."` to produce court-region bounding boxes before YOLOv8 keypoint estimation. Only YOLO detections with IoU >= 0.25 against a GDINO bounding box are accepted as valid players. If fewer than 2 valid players pass this filter, the pipeline falls back to plain YOLOv8 top-2 selection.
 
@@ -410,6 +447,15 @@ where z\_i, z\_j are the L2-normalised projections of the two views and sim(.,.)
 
 **Training results:** SimCLR used all available matches (no split filtering required since no labels are needed). Training converged at epoch 93 (early stopped) with a final NT-Xent loss of 0.640.
 
+![SimCLR augmentation views](results/ssl_simclr_viz_augmentation_views.png)
+*Figure 15: SimCLR augmentation views -- two independently augmented skeleton views forming a positive pair.*
+
+![SimCLR positive pairs](results/ssl_simclr_viz_positive_pairs.png)
+*Figure 16: SimCLR positive pair structure -- each anchor has exactly one positive (its augmentation twin).*
+
+![SimCLR training loss](results/ssl_simclr_loss_L2.png)
+*Figure 17: SimCLR NT-Xent training loss curve.*
+
 ### 7.3 SupCon --- Supervised Contrastive Learning
 
 SupCon \[11\] extends SimCLR by using ShuttleSet's shot-type labels to define positive pairs. Rather than pairing only augmented views of the same sequence, SupCon treats **all shots of the same type** (across different players and matches) as positives:
@@ -423,6 +469,18 @@ where P(i) = {j : y\_j = y\_i, j != i} is the set of same-type positives.
 **Key characteristic:** Each anchor has **multiple positives** (~7 on average in a batch of 64 with ~10 shot types represented). This richer gradient signal enables the encoder to learn that structurally similar movements (e.g., all smashes) should cluster together regardless of player identity.
 
 **Training results:** SupCon converged at epoch 60 (early stopped) with a final loss of 2.516. The loss curve shows steeper initial descent than SimCLR, consistent with the richer per-step gradient signal.
+
+![SupCon positive pair structure](results/ssl_supcon_viz_positive_pair_structure.png)
+*Figure 18: SupCon positive pair structure -- all shots of the same type form positives, pulling smashes together regardless of player.*
+
+![SupCon training signal](results/ssl_supcon_viz_training_signal.png)
+*Figure 19: SupCon training signal -- richer gradient from multiple positives per anchor compared to SimCLR single positive.*
+
+![SupCon intra-class skeleton consistency](results/ssl_supcon_viz_intraclass_consistency.png)
+*Figure 20: Intra-class skeleton consistency under composite SupCon labels (shot_type + hitter side). Each row shows 10 random samples from the same composite label. Blue = top-court player (P0), Red = bottom-court player (P1), star = hitter. Low within-row variance indicates coherent SupCon positives.*
+
+![SupCon training loss](results/ssl_supcon_loss_L2.png)
+*Figure 21: SupCon training loss curve.*
 
 *Table 13: SimCLR vs SupCon comparison.*
 
@@ -529,14 +587,39 @@ All results report mean +/- standard deviation across 5 folds. Class distributio
 | passive | 50 | 0.290 | 0.130 | High variance; confused with intercept/defensive |
 | **move\_to\_net** | **18** | **0.036** | **0.073** | **Near-zero in 4/5 folds --- insufficient samples** |
 
-<!-- Figure: results/fewshot_confusion_matrix.png --- 5x5 confusion matrix -->
-<!-- Figure: results/fewshot_training_curves.png --- Training loss and validation F1 curves -->
+![Confusion matrix -- random init baseline](results/fewshot_confusion_matrix.png)
+*Figure 22: 5x5 strategy confusion matrix (averaged across 5-fold CV, random init baseline).*
+
+![Training curves -- random init baseline](results/fewshot_training_curves.png)
+*Figure 23: Training loss, accuracy, and validation F1 curves across 5 folds (random init baseline).*
 
 **Key observations:**
 
 1. **Severe episodic overfitting.** Training accuracy reaches 98--99% while validation F1 peaks around epoch 10 and degrades thereafter. SSL pre-training is expected to be the primary mitigation.
 2. **`move_to_net` is effectively unlearnable at this scale** (18 samples, 6.1% of dataset). The prototype is noise-dominated.
 3. **`create_depth` outperforms `intercept`** despite fewer samples (61 vs 108), suggesting create\_depth has more distinctive skeleton signatures (rear-court positioning, extended arm overhead).
+
+### 8.4 SimCLR Pre-Trained Results
+
+![SimCLR few-shot training curves](results/fewshot_simclr_training_curves.png)
+*Figure 27: SimCLR pre-trained few-shot training curves -- loss, accuracy, and validation F1 across 5 folds.*
+
+![SimCLR few-shot confusion matrix](results/fewshot_simclr_confusion_matrix.png)
+*Figure 28: SimCLR pre-trained few-shot confusion matrix (averaged 5-fold CV).*
+
+![SimCLR held-out confusion matrix](results/fewshot_simclr_holdout_confusion_matrix.png)
+*Figure 29: SimCLR pre-trained confusion matrix on held-out 10 rallies.*
+
+### 8.5 SupCon Pre-Trained Results
+
+![SupCon few-shot training curves](results/fewshot_supcon_training_curves.png)
+*Figure 30: SupCon pre-trained few-shot training curves -- loss, accuracy, and validation F1 across 5 folds.*
+
+![SupCon few-shot confusion matrix](results/fewshot_supcon_confusion_matrix.png)
+*Figure 31: SupCon pre-trained few-shot confusion matrix (averaged 5-fold CV).*
+
+![SupCon held-out confusion matrix](results/fewshot_supcon_holdout_confusion_matrix.png)
+*Figure 32: SupCon pre-trained confusion matrix on held-out 10 rallies.*
 
 ---
 
@@ -559,7 +642,8 @@ We test four progressively richer feature layers while fixing the encoder (ST-GC
 
 Note: The L2 advantage may partially reflect SSL pre-training rather than feature engineering alone, since SSL checkpoints exist only for L2. This is a known limitation of the sequential ablation design.
 
-<!-- Figure: results/ablation_feature_layers.png --- Bar chart of feature layer comparison -->
+![Feature layer ablation](results/ablation_feature_layers.png)
+*Figure 24: Feature layer comparison (L0/L1/L2/L3) -- macro-F1 by feature engineering depth.*
 
 ### 9.2 Step 2 --- Encoder Architecture: Does Graph Structure Help?
 
@@ -615,7 +699,8 @@ We sweep K = 1, 3, 5, 8, 10 support shots per class to determine the minimum via
 | 8 | 3 | \[TBD\] | \[TBD\] |
 | 10 | 1 | \[TBD\] | \[TBD\] |
 
-<!-- Figure: results/ablation_kshot_curve.png --- K-shot learning curve -->
+![K-shot learning curve](results/ablation_kshot_curve.png)
+*Figure 25: K-shot sensitivity curve -- macro-F1 vs K (support set size) with error bars across 5 folds.*
 
 ### 9.6 Step 6 --- Shuttlecock Trajectory
 
@@ -628,7 +713,28 @@ We test whether adding the shuttlecock as a 35th graph node improves strategy re
 | Skeleton only | 34 | \[TBD\] | \[TBD\] |
 | Skeleton + shuttle | 35 | \[TBD\] | \[TBD\] |
 
-<!-- Figure: results/ablation_shuttle.png --- Shuttle ablation bar chart -->
+![Shuttle ablation](results/ablation_shuttle.png)
+*Figure 26: Shuttle trajectory ablation — skeleton-only (34 nodes) vs skeleton + shuttle (35 nodes).*
+
+### 9.7 Held-Out Evaluation
+
+The best model configuration from the ablation study is evaluated on two held-out sets: (1) FineBadminton 10 held-out rallies with ground-truth strategy labels, and (2) ShuttleSet 2 held-out matches with ground-truth shot-type labels and predicted strategies for expert verification.
+
+**ShuttleSet held-out — shot-type classification:**
+
+![ShuttleSet held-out shot-type confusion](results/heldout_ss_shot_type_confusion_L2.png)
+*Figure 33: ShuttleSet held-out shot-type confusion matrix.*
+
+![ShuttleSet held-out strategy analysis](results/heldout_ss_strategy_analysis_L2.png)
+*Figure 34: ShuttleSet held-out strategy analysis — distribution, confidence histogram, margin histogram, and strategy × shot-type crosstab.*
+
+**FineBadminton held-out — strategy classification:**
+
+![FineBadminton held-out strategy confusion](results/heldout_fb_strategy_confusion_L2.png)
+*Figure 35: FineBadminton held-out strategy confusion matrix (raw counts and row-normalised).*
+
+![FineBadminton held-out confidence analysis](results/heldout_fb_confidence_L2.png)
+*Figure 36: FineBadminton held-out confidence and margin histograms (correct vs wrong predictions), and accuracy vs confidence threshold curve.*
 
 ---
 
