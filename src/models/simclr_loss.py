@@ -1,15 +1,16 @@
 """
-SimCLR-style contrastive learning components for self-supervised
-pre-training on unlabeled skeleton sequences.
+Contrastive learning components for skeleton sequence pre-training.
 
 Includes:
-    - NT-Xent (Normalized Temperature-scaled Cross-Entropy) loss
+    - NT-Xent (Normalized Temperature-scaled Cross-Entropy) loss — self-supervised
+    - SupConLoss (Supervised Contrastive Loss) — uses shot-type labels
     - Projection head (MLP)
     - Skeleton augmentation pipeline
 
-Reference:
+References:
     - Chen et al., 2020: "A Simple Framework for Contrastive Learning
       of Visual Representations (SimCLR)"
+    - Khosla et al., 2020: "Supervised Contrastive Learning"
 """
 import torch
 import torch.nn as nn
@@ -93,10 +94,10 @@ class SkeletonAugmentor:
     """
 
     def __init__(self, jitter_std=0.01, mask_ratio=0.15,
-                 temporal_crop_ratio=0.8, rotation_range=15.0):
+                 speed_range=0.2, rotation_range=15.0):
         self.jitter_std = jitter_std
         self.mask_ratio = mask_ratio
-        self.temporal_crop_ratio = temporal_crop_ratio
+        self.speed_range = speed_range
         self.rotation_range = rotation_range
 
     def __call__(self, x):
@@ -111,7 +112,7 @@ class SkeletonAugmentor:
         """
         x = x.clone()
         x = self._jitter(x)
-        x = self._temporal_crop(x)
+        x = self._speed_perturb(x)
         x = self._rotate(x)
         x = self._mask_joints(x)
         return x
@@ -121,19 +122,29 @@ class SkeletonAugmentor:
         noise = torch.randn_like(x) * self.jitter_std
         return x + noise
 
-    def _temporal_crop(self, x):
-        """Randomly crop temporal dimension and resample to original length."""
-        C, T, V = x.shape
-        crop_len = max(1, int(T * self.temporal_crop_ratio))
-        start = torch.randint(0, T - crop_len + 1, (1,)).item()
-        cropped = x[:, start:start + crop_len, :]
+    def _speed_perturb(self, x):
+        """Resample the full sequence at a random speed, preserving temporal order.
 
-        # Resample back to original length T
-        if crop_len != T:
-            cropped = cropped.unsqueeze(0)  # (1, C, crop_len, V)
-            cropped = F.interpolate(cropped, size=(T, V), mode="nearest")
-            cropped = cropped.squeeze(0)
-        return cropped
+        Unlike temporal crop, all phases of the stroke remain present — the
+        sequence is simply played faster or slower. A speed > 1 compresses
+        the motion (fast-forward effect); speed < 1 stretches it (slow-motion).
+
+        Args:
+            x: (C, T, V)
+
+        Returns:
+            (C, T, V) with the same number of frames but different temporal density
+        """
+        C, T, V = x.shape
+        speed = 1.0 + (torch.rand(1).item() * 2 - 1) * self.speed_range
+        new_len = max(2, int(round(T * speed)))
+        if new_len == T:
+            return x
+        # Interpolate only along the temporal axis: reshape to (1, C*V, T)
+        x_2d = x.reshape(1, C * V, T)
+        x_rs = F.interpolate(x_2d, size=new_len, mode='linear', align_corners=False)
+        x_back = F.interpolate(x_rs, size=T, mode='linear', align_corners=False)
+        return x_back.reshape(C, T, V)
 
     def _rotate(self, x):
         """Apply random 2D rotation to (x, y) coordinates."""
@@ -157,8 +168,77 @@ class SkeletonAugmentor:
         return x
 
 
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al., 2020).
+
+    Uses shot-type labels to define positives: any two samples with the
+    same shot-type label form a positive pair. Both augmented views of the
+    same sample also form a positive pair, so this subsumes NT-Xent when
+    every sample has a unique label.
+
+    Usage in SSL ablation:
+        - SimCLR:  NTXentLoss()(z_i, z_j)
+        - SupCon:  SupConLoss()(z_i, z_j, labels)
+    """
+
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, z_i, z_j, labels):
+        """
+        Args:
+            z_i: (B, D) projections from augmentation view 1
+            z_j: (B, D) projections from augmentation view 2
+            labels: (B,) integer shot-type labels
+
+        Returns:
+            loss: scalar SupCon loss
+        """
+        B = z_i.shape[0]
+        device = z_i.device
+
+        z_i = F.normalize(z_i, dim=1)
+        z_j = F.normalize(z_j, dim=1)
+
+        # Concatenate both views: (2B, D) and (2B,) labels
+        z = torch.cat([z_i, z_j], dim=0)
+        labels_2x = torch.cat([labels, labels], dim=0)
+
+        # Similarity matrix scaled by temperature: (2B, 2B)
+        sim = torch.mm(z, z.t()) / self.temperature
+
+        # Self-mask: exclude diagonal (anchor vs itself)
+        self_mask = torch.eye(2 * B, dtype=torch.bool, device=device)
+
+        # Positive mask: same label, excluding self
+        pos_mask = (
+            labels_2x.unsqueeze(1) == labels_2x.unsqueeze(0)
+        ) & ~self_mask  # (2B, 2B)
+
+        # Log-denominator: log sum over all non-self pairs
+        sim_no_self = sim.masked_fill(self_mask, float('-inf'))
+        log_denom = torch.logsumexp(sim_no_self, dim=1)  # (2B,)
+
+        # Log-prob for every pair: sim[i,j] - log_denom[i]
+        log_probs = sim - log_denom.unsqueeze(1)  # (2B, 2B)
+
+        # Mean loss over anchors that have at least one positive
+        n_pos = pos_mask.sum(dim=1).float()  # (2B,)
+        valid = n_pos > 0
+
+        if not valid.any():
+            # Fallback: batch has no within-class pairs — shouldn't happen
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        per_anchor = -(log_probs * pos_mask.float()).sum(dim=1)  # (2B,)
+        loss = (per_anchor[valid] / n_pos[valid]).mean()
+        return loss
+
+
 class AuxiliaryShotTypeHead(nn.Module):
-    """Optional auxiliary head for shot-type prediction during SSL."""
+    """Auxiliary head for shot-type prediction during SSL (kept for reference)."""
 
     def __init__(self, embedding_dim, num_shot_types=18):
         super().__init__()

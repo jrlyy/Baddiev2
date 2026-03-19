@@ -8,6 +8,14 @@ checkpoints/
 *.avi
 __pycache__/
 .ipynb_checkpoints/
-.venv/datasets_preprocessing/ShuttleSet/skeletons/
+.venv/
 .DS_Store
 notebooks/*_FULL.ipynb
+
+# Large data directories
+datasets_preprocessing/shuttleset_frames/
+datasets_preprocessing/shuttleset_skeletons_gdino/
+datasets_preprocessing/finebadminton_skeletons_gdino_v2/
+datasets_preprocessing/shuttleset_shuttles/
+utility/
+baddiev2_colab.zip

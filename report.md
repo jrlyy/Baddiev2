@@ -184,18 +184,17 @@ ShuttleSet is the large-scale dataset used for contrastive pre-training (Phase A
 | Matches extracted | 20 (of 38 usable) |
 | Total stroke records | ~17,000 |
 | Total rallies | ~590 |
-| Unique shot types | 17 (unified vocabulary) |
+| Unique shot types | 17 |
 
-**Train/Test/Held-out split (match-level).** The 11 matches with GDINO-extracted skeletons are split at match level to prevent frame leakage:
+**Train/Held-out split (match-level).** The 10 active matches with GDINO-extracted skeletons are split at match level to prevent frame leakage (2 matches removed: Ginting vs Gemke — all skeletons wrong; Antonsen vs Christie — sparse frames & skeletons):
 
 *Table 6: ShuttleSet data split.*
 
 | Split | Matches | Shots | Role |
 |---|---|---|---|
-| Train | 8 | 6,149 | SupCon/SimCLR pre-training |
-| Test | 1 | 1,127 | SSL checkpoint selection (monitoring only) |
-| Held-out | 2 | 1,675 | Strategy prediction + expert verification |
-| **Total** | **11** | **8,951** | --- |
+| Train | 8 | 5,549 | Supervised shot type classification (cross-validation) |
+| Held-out | 2 | 1,675 | Final evaluation |
+| **Total** | **10** | **7,224** | --- |
 
 The held-out matches (Anthony Sinisuka Ginting vs Lee Zii Jia; CHEN Long vs CHOU Tien Chen) feature different players and tournaments from the training set, providing a meaningful cross-dataset evaluation target.
 
@@ -863,13 +862,13 @@ Evaluation:
 
 ---
 
-## Appendix A: Unified Shot Type Vocabulary
+## Appendix A: Shot Type Vocabulary
 
-Both datasets use different shot type taxonomies. We define a 17-class unified vocabulary to enable cross-dataset training:
+Both datasets use different shot type taxonomies. We define a 17-class canonical vocabulary:
 
-*Table A1: Unified shot type mapping.*
+*Table A1: Shot type mapping.*
 
-| ID | Unified Label | ShuttleSet (Chinese) | FineBadminton (English) |
+| ID | Label | ShuttleSet (Chinese) | FineBadminton (English) |
 |---|---|---|---|
 | 0 | `short_serve` | fa duan qiu | short serve |
 | 1 | `long_serve` | fa chang qiu | high serve, flick serve |

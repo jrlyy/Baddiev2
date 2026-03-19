@@ -16,21 +16,29 @@ import torch
 from ..config import (
     NUM_JOINTS, NUM_PLAYERS, NUM_NODES,
     COCO_SKELETON, INTER_PLAYER_EDGES,
+    SHUTTLE_EDGES, NUM_NODES_WITH_SHUTTLE,
 )
 
 
 class GraphBuilder:
     """Builds adjacency matrices for the dual-player skeleton graph."""
 
-    def __init__(self, use_inter_player=True, single_player=False):
+    def __init__(self, use_inter_player=True, single_player=False, use_shuttle=False):
         """
         Args:
             use_inter_player: include cross-player edges
             single_player: use only player 1 (17 nodes instead of 34)
+            use_shuttle: add shuttle as virtual node 34 (35 nodes total)
         """
         self.use_inter_player = use_inter_player
         self.single_player = single_player
-        self.num_nodes = NUM_JOINTS if single_player else NUM_NODES
+        self.use_shuttle = use_shuttle and not single_player  # shuttle needs both players
+        if single_player:
+            self.num_nodes = NUM_JOINTS
+        elif self.use_shuttle:
+            self.num_nodes = NUM_NODES_WITH_SHUTTLE
+        else:
+            self.num_nodes = NUM_NODES
 
     def build_adjacency(self):
         """
@@ -56,6 +64,12 @@ class GraphBuilder:
             # Inter-player edges
             if self.use_inter_player:
                 for (i, j) in INTER_PLAYER_EDGES:
+                    A[i, j] = 1
+                    A[j, i] = 1
+
+            # Shuttle node edges (node 34 ↔ both players' wrists)
+            if self.use_shuttle:
+                for (i, j) in SHUTTLE_EDGES:
                     A[i, j] = 1
                     A[j, i] = 1
 
@@ -130,7 +144,8 @@ class GraphBuilder:
     def _normalize_adj(A):
         """Symmetric normalization: D^{-1/2} A D^{-1/2}."""
         D = np.sum(A, axis=1)
-        D_inv_sqrt = np.where(D > 0, np.power(D, -0.5), 0)
+        with np.errstate(divide='ignore'):
+            D_inv_sqrt = np.where(D > 0, np.power(D, -0.5), 0)
         D_mat = np.diag(D_inv_sqrt)
         return D_mat @ A @ D_mat
 
@@ -154,6 +169,11 @@ class GraphBuilder:
             # Inter-player edges
             if self.use_inter_player:
                 for (i, j) in INTER_PLAYER_EDGES:
+                    edges.append((i, j))
+                    edges.append((j, i))
+
+            if self.use_shuttle:
+                for (i, j) in SHUTTLE_EDGES:
                     edges.append((i, j))
                     edges.append((j, i))
 

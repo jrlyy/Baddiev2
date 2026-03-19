@@ -53,9 +53,9 @@ Evaluation uses **5-fold stratified cross-validation**, stratified by **strategy
 
 ---
 
-## ShuttleSet (SS) — Unlabeled Biomechanics Dataset
+## ShuttleSet (SS) — Shot Type Dataset
 
-**Role in pipeline:** Phase A (SSL pre-training only). No strategy labels.
+**Role in pipeline:** Supervised shot type classification (8 train + 2 held-out = 10 active matches). Has shot type labels from CSV annotations.
 
 **Frame extraction:**
 - **Full** = consecutive frames for every frame in the rally (streaming pipeline, gap=1)
@@ -94,9 +94,9 @@ Evaluation uses **5-fold stratified cross-validation**, stratified by **strategy
 | **ss01** | Momota vs Chou — Fuzhou 2019 F | `Kento_MOMOTA_CHOU_Tien_Chen_Fuzhou_Open_2019_Finals` | MS | 1644 | 40 401 | **Full** (consecutive) | **GDINO/rally** (39 rallies) | Hit-frame (1143/1644 vis) |
 | **ss02** | Ginting vs Axelsen — INA Masters 2020 SF | `Anthony_Sinisuka_GINTING_Viktor_AXELSEN _Indonesia_Masters_2020_SemiFinals` | MS | 506 | 11 509 | **Full** (consecutive) | None | Hit-frame (282/506 vis) |
 | ss03 | An Se Young vs Intanon — THA Open 2021 QF | `An_Se_Young_Ratchanok_Intanon_YONEX_Thailand_Open_2021_QuarterFinals` | WS | 663 | 1 972 | Sparse | **YOLOv8/shot** (460 files) | Hit-frame (612/663 vis) |
-| ss04 | Antonsen vs Christie — INA Masters 2020 QF | `Anders_ANTONSEN_Jonatan_CHRISTIE Indonesia_Masters_2020_QuarterFinals` | MS | 1018 | 2 891 | Sparse | None | Hit-frame (626/1018 vis) |
+| ~~ss04~~ | ~~Antonsen vs Christie — INA Masters 2020 QF~~ | `Anders_ANTONSEN_Jonatan_CHRISTIE Indonesia_Masters_2020_QuarterFinals` | MS | 1018 | 2 891 | Sparse | None | **REMOVED** — sparse frames & skeletons, not useful |
 | ss05 | Ginting vs Antonsen — INA Masters 2020 F | `Anthony_Sinisuka_GINTING_Anders_ANTONSEN_Indonesia_Masters_2020_Final` | MS | 824 | 2 394 | Sparse | None | Hit-frame (457/824 vis) |
-| ss06 | Ginting vs Gemke — THA Open 2021 QF | `Anthony_Sinisuka_Ginting_Rasmus_Gemke_YONEX_Thailand_Open_2021_QuarterFinals` | MS | 1127 | 3 305 | Sparse | None | Hit-frame (1059/1127 vis) |
+| ~~ss06~~ | ~~Ginting vs Gemke — THA Open 2021 QF~~ | `Anthony_Sinisuka_Ginting_Rasmus_Gemke_YONEX_Thailand_Open_2021_QuarterFinals` | MS | 1127 | 3 305 | Sparse | None | **REMOVED** — all skeletons wrong |
 | ss07 | Chen Long vs Chou — Denmark Open 2019 QF | `CHEN_Long_CHOU_Tien_Chen_Denmark_Open_2019_QuarterFinal` | MS | 818 | 2 361 | Sparse | None | Hit-frame (700/818 vis) |
 | ss08 | Chen Long vs Chou — World Tour Finals GS | `CHEN_Long_CHOU_Tien_Chen_World_Tour_Finals_Group_Stage` | MS | 860 | 2 472 | Sparse | None | Hit-frame (489/860 vis) |
 | ss09 | Chou vs Antonsen — Fuzhou Open 2019 SF | `CHOU_Tien_Chen_Anders_ANTONSEN_Fuzhou_Open_2019_Semi-finals` | MS | 704 | 2 030 | Sparse | None | None |

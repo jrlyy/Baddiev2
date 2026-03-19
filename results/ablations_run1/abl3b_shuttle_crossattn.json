@@ -1,0 +1,130 @@
+{
+  "name": "abl3b_shuttle_crossattn",
+  "accuracy": 0.0817,
+  "macro_f1": 0.0101,
+  "best_train_loss": Infinity,
+  "stopped_epoch": 10,
+  "train_time_s": 141.1,
+  "n_train": 6149,
+  "n_test": 1675,
+  "n_test_labeled": 1627,
+  "history": {
+    "train_loss": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ]
+  },
+  "per_class": {
+    "short_serve": {
+      "precision": 0.08174554394591273,
+      "recall": 1.0,
+      "f1-score": 0.15113636363636362,
+      "support": 133.0
+    },
+    "long_serve": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 4.0
+    },
+    "smash": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 107.0
+    },
+    "tap_smash": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 75.0
+    },
+    "push_rush": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 31.0
+    },
+    "clear": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 129.0
+    },
+    "slice_drop": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 61.0
+    },
+    "net_drop": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 296.0
+    },
+    "transition": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 88.0
+    },
+    "drive": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 106.0
+    },
+    "block": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 163.0
+    },
+    "lob_lift": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 137.0
+    },
+    "defensive_lift": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 8.0
+    },
+    "cross_net": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 63.0
+    },
+    "push": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 226.0
+    },
+    "accuracy": 0.08174554394591273,
+    "macro avg": {
+      "precision": 0.005449702929727515,
+      "recall": 0.06666666666666667,
+      "f1-score": 0.010075757575757575,
+      "support": 1627.0
+    },
+    "weighted avg": {
+      "precision": 0.006682333955013149,
+      "recall": 0.08174554394591273,
+      "f1-score": 0.012354724255461807,
+      "support": 1627.0
+    }
+  }
+}

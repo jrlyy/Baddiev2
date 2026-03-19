@@ -1,5 +1,5 @@
 """
-Central configuration for the Badminton Tactical Strategy pipeline.
+Central configuration for the Badminton Shot Attribute Prediction pipeline.
 All hyperparameters, file paths, and experiment settings in one place.
 """
 from dataclasses import dataclass, field
@@ -13,13 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
 RESULTS_DIR = PROJECT_ROOT / "results"
 
-# FineBadminton (in Datasets/)
-FB_ROOT        = PROJECT_ROOT / "Datasets" / "FineBadminton-dataset" / "dataset"
+# FineBadminton (in datasets/)
+FB_ROOT        = PROJECT_ROOT / "datasets" / "FineBadminton-dataset" / "dataset"
 FB_FRAMES      = FB_ROOT / "image"
 FB_ANNOTATIONS = FB_ROOT / "transformed_combined_rounds_output_en_evals_translated.json"
 FB_SKELETONS       = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons"
 FB_SKELETONS_GDINO    = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino"
 FB_SKELETONS_GDINO_V2 = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_skeletons_gdino_v2"
+FB_SHUTTLES           = PROJECT_ROOT / "datasets_preprocessing" / "finebadminton_shuttles"
 
 # ShuttleSet CSV annotations (in datasets/)
 SS_CSV_ROOT = PROJECT_ROOT / "datasets" / "ShuttleSet" / "set"
@@ -33,6 +34,7 @@ SS_OUTPUTS         = SS_PREPROCESS_ROOT / "shuttleset_outputs"
 SS_SKELETONS       = SS_PREPROCESS_ROOT / "shuttleset_skeletons"
 SS_SKELETONS_GDINO = SS_PREPROCESS_ROOT / "shuttleset_skeletons_gdino"
 SS_SHUTTLES        = SS_PREPROCESS_ROOT / "shuttleset_shuttles"
+SS_SPLIT_JSON      = SS_PREPROCESS_ROOT / "shuttleset_split.json"
 
 
 # ─── Strategy Labels ────────────────────────────────────────────────────────
@@ -81,37 +83,68 @@ SS_SHOT_TYPES = [
 SS_SHOT_TYPE_TO_IDX = {s: i for i, s in enumerate(SS_SHOT_TYPES)}
 NUM_SS_SHOT_TYPES = len(SS_SHOT_TYPES)
 
-# ─── Unified Shot Type Vocabulary ───────────────────────────────────────────
+# ─── Shot Type Vocabulary ──────────────────────────────────────────────────
 # 17-class canonical vocabulary based on official ShuttleSet English translations.
-# FineBadminton hit types are mapped to the closest equivalent.
-# Use these indices for cross-dataset auxiliary tasks (e.g. SSL shot-type head).
+# FineBadminton subtypes (fine-grained) are preferred; hit_type is the fallback.
 
-UNIFIED_SHOT_TYPES = [
-    'short_serve',    #  0 — 發短球 | FB: serve (undifferentiated)
-    'long_serve',     #  1 — 發長球
-    'smash',          #  2 — 殺球   | FB: kill
+SHOT_TYPES = [
+    'short_serve',    #  0 — 發短球 | FB subtype: short serve
+    'long_serve',     #  1 — 發長球 | FB subtype: high serve, flick serve
+    'smash',          #  2 — 殺球   | FB subtype: jump/full/common/slice/stick smash
     'tap_smash',      #  3 — 點扣   | FB: net kill
     'push_rush',      #  4 — 推撲球, 撲球
-    'clear',          #  5 — 長球   | FB: clear
-    'slice_drop',     #  6 — 切球
-    'net_drop',       #  7 — 放小球 | FB: drop shot
+    'clear',          #  5 — 長球   | FB subtype: attacking clear
+    'slice_drop',     #  6 — 切球   | FB subtype: slice drop shot, reverse slice drop shot
+    'net_drop',       #  7 — 放小球 | FB subtype: stop drop shot, blocked drop shot
     'transition',     #  8 — 過渡球, 過度切球
-    'drive',          #  9 — 平球, 後場抽平球, 防守回抽, 小平球 | FB: drive
-    'block',          # 10 — 擋小球 | FB: block
-    'lob_lift',       # 11 — 挑球   | FB: net lift
+    'drive',          #  9 — 平球, 後場抽平球, 防守回抽, 小平球 | FB subtype: high/flat drive
+    'block',          # 10 — 擋小球 | FB subtype: high block
+    'lob_lift',       # 11 — 挑球   | FB subtype: flat lift, high lift
     'defensive_lift', # 12 — 防守回挑
     'cross_net',      # 13 — 勾球   | FB: cross-court net shot
-    'net_shot',       # 14 — 網前球 | FB: net shot
+    'net_shot',       # 14 — 網前球 | FB subtype: spinning net
     'smash_defense',  # 15 — 接殺防守
-    'push',           # 16 — 推球   | FB: push shot
+    'push',           # 16 — 推球
 ]
-UNIFIED_SHOT_TO_IDX = {s: i for i, s in enumerate(UNIFIED_SHOT_TYPES)}
-NUM_UNIFIED_SHOT_TYPES = len(UNIFIED_SHOT_TYPES)  # 17
+SHOT_TYPE_TO_IDX = {s: i for i, s in enumerate(SHOT_TYPES)}
+NUM_SHOT_TYPES = len(SHOT_TYPES)  # 17
 
-# FineBadminton hit_type (English) → unified canonical label
-# Note: FB 'serve' does not distinguish short/long → mapped to 'short_serve'
-FB_HIT_TYPE_TO_UNIFIED = {
-    'serve':                'short_serve',
+# FineBadminton subtype (fine-grained) → canonical shot type
+# Preferred over hit_type when available (305 of ~355 shots have subtypes).
+FB_SUBTYPE_TO_SHOT_TYPE = {
+    # Serve subtypes
+    'short serve':              'short_serve',
+    'high serve':               'long_serve',
+    'flick serve':              'short_serve',    # flick = deceptive short serve variant
+    # Kill (smash) subtypes
+    'jump smash':               'smash',
+    'full smash':               'smash',
+    'common smash':             'smash',
+    'slice smash':              'smash',
+    'stick smash':              'smash',
+    # Clear subtypes
+    'attacking clear':          'clear',
+    # Drop shot subtypes
+    'slice drop shot':          'slice_drop',
+    'reverse slice drop shot':  'slice_drop',
+    'stop drop shot':           'net_drop',
+    'blocked drop shot':        'net_drop',
+    # Drive subtypes
+    'high drive':               'drive',
+    'flat drive':               'drive',
+    # Net shot subtypes
+    'spinning net':             'net_shot',
+    # Net lift subtypes
+    'flat lift':                'lob_lift',       # was wrongly mapped via push shot → push
+    'high lift':                'lob_lift',
+    # Block subtypes
+    'high block':               'block',
+}
+
+# FineBadminton hit_type (English) → canonical shot type (fallback)
+# Used only when no subtype is available for a shot.
+FB_HIT_TYPE_TO_SHOT_TYPE = {
+    'serve':                'short_serve',    # conservative default (most serves are short)
     'kill':                 'smash',
     'net kill':             'tap_smash',
     'clear':                'clear',
@@ -124,9 +157,9 @@ FB_HIT_TYPE_TO_UNIFIED = {
     'block':                'block',
 }
 
-# ShuttleSet type (Chinese) → unified canonical label
+# ShuttleSet type (Chinese) → canonical shot type
 # '未知球種' / '未知' (unknown) intentionally absent → maps to None (no auxiliary label)
-SS_SHOT_TYPE_TO_UNIFIED = {
+SS_TYPE_TO_SHOT_TYPE = {
     # Serve
     '發短球':    'short_serve',
     '發長球':    'long_serve',
@@ -167,8 +200,12 @@ FEATURE_DIMS = {
     "L0": 2,   # [x, y]
     "L1": 6,   # [x, y, vx, vy, ax, ay]
     "L2": 9,   # [..., dist_to_net, dist_to_center, dist_to_opponent]
-    "L3": 12,  # [..., elbow_angle, shoulder_angle, knee_angle]
+    "L3": 13,  # [..., L_elbow, R_elbow, L_knee, R_knee (node-specific)]
 }
+
+# When use_hitter_feature=True, one extra channel is appended:
+# +1 dim: 1.0 for hitter's joints, 0.0 for opponent's joints
+FEATURE_DIMS_WITH_HITTER = {k: v + 1 for k, v in FEATURE_DIMS.items()}
 
 
 # ─── Skeleton / Graph ───────────────────────────────────────────────────────
@@ -193,12 +230,21 @@ COCO_SKELETON = [
 # Inter-player edges: connect corresponding joints between player 1 and 2
 INTER_PLAYER_EDGES = [(j, j + NUM_JOINTS) for j in range(NUM_JOINTS)]
 
+# Shuttle node index (when use_shuttle=True)
+SHUTTLE_NODE = NUM_NODES  # 34
+NUM_NODES_WITH_SHUTTLE = NUM_NODES + 1  # 35
+# Shuttle connects to both players' wrists (joint 9=left wrist, 10=right wrist)
+SHUTTLE_EDGES = [
+    (SHUTTLE_NODE, 9),  (SHUTTLE_NODE, 10),   # P1 wrists
+    (SHUTTLE_NODE, 26), (SHUTTLE_NODE, 27),   # P2 wrists (9+17, 10+17)
+]
+
 
 # ─── Data Processing ────────────────────────────────────────────────────────
 
 @dataclass
 class DataConfig:
-    shot_window: int = 16          # frames per shot segment (T)
+    shot_window: int = 32          # frames per shot segment (T)
     fb_fps: int = 20               # FineBadminton frame rate
     ss_fps: int = 30               # ShuttleSet frame rate
     target_fps: int = 20           # resample to this rate
@@ -244,29 +290,8 @@ class TransformerConfig:
     num_layers: int = 4
     dim_feedforward: int = 512
     dropout: float = 0.1
-    max_seq_len: int = 16          # same as shot_window
+    max_seq_len: int = 32          # same as shot_window
     embedding_dim: int = 256
-
-
-# ─── Model: LSTM (ablation baseline) ─────────────────────────────────────────
-
-@dataclass
-class LSTMConfig:
-    hidden_dim: int = 256
-    num_layers: int = 2
-    embedding_dim: int = 256
-    dropout: float = 0.3
-    bidirectional: bool = True
-
-
-# ─── Model: 1D-CNN (ablation baseline) ──────────────────────────────────────
-
-@dataclass
-class CNN1DConfig:
-    channels: tuple = (128, 256, 256)
-    kernel_size: int = 3
-    embedding_dim: int = 256
-    dropout: float = 0.3
 
 
 # ─── Self-Supervised Pre-Training ────────────────────────────────────────────
@@ -277,12 +302,12 @@ class SSLConfig:
     projection_dim: int = 128     # projection head output
     projection_hidden: int = 256
     auxiliary_weight: float = 0.3  # weight for shot-type auxiliary loss
-    num_shot_types: int = NUM_UNIFIED_SHOT_TYPES  # unified shot types (9, shared across datasets)
+    num_shot_types: int = NUM_SHOT_TYPES  # 17 shot types
 
     # Augmentation
     jitter_std: float = 0.01      # Gaussian noise on joint coords
     mask_ratio: float = 0.15      # fraction of joints to mask
-    temporal_crop_ratio: float = 0.8  # min fraction of frames to keep
+    speed_range: float = 0.2      # speed perturb: speed ~ Uniform(1-r, 1+r)
     rotation_range: float = 15.0  # degrees
 
     # Training
@@ -338,10 +363,20 @@ class AblationConfig:
     use_auxiliary_task: bool = True  # include shot-type auxiliary loss
 
     # Architecture ablation
-    encoder: str = "stgcn"         # "stgcn", "transformer", "lstm", "cnn1d"
+    encoder: str = "stgcn"         # "stgcn", "transformer"
 
     # Feature layer ablation (Step 1)
     feature_layer: str = "L2"      # L0, L1, L2, L3
+
+    # Shuttlecock ablation (Step 6)
+    use_shuttle: bool = False      # append shuttle trajectory as virtual node 34
+    shuttle_fusion: str = "graph"  # "graph" (virtual node) or "cross_attn" (BST-style)
+
+    # Hitter identity ablation
+    use_hitter: bool = False       # append is_hitter channel (1=hitter's joints, 0=opponent's)
+
+    # Temporal window ablation
+    variable_window: bool = False  # use prev/next shot frames instead of fixed window
 
     # Few-shot method ablation (Step 4)
     classifier: str = "protonet"   # "protonet", "knn", "linear_probe"
@@ -357,8 +392,6 @@ class ExperimentConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     stgcn: STGCNConfig = field(default_factory=STGCNConfig)
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
-    lstm: LSTMConfig = field(default_factory=LSTMConfig)
-    cnn1d: CNN1DConfig = field(default_factory=CNN1DConfig)
     ssl: SSLConfig = field(default_factory=SSLConfig)
     proto: ProtoNetConfig = field(default_factory=ProtoNetConfig)
     pose: PoseConfig = field(default_factory=PoseConfig)
@@ -369,8 +402,6 @@ class ExperimentConfig:
         return {
             "stgcn": self.stgcn,
             "transformer": self.transformer,
-            "lstm": self.lstm,
-            "cnn1d": self.cnn1d,
         }[self.ablation.encoder]
 
 
