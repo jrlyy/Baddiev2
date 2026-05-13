@@ -93,6 +93,34 @@ class STGCNBlock(nn.Module):
         return x
 
 
+class TemporalTransformerPooling(nn.Module):
+    """
+    Pool over joints, then apply a transformer encoder over time steps.
+    Uses a CLS token to aggregate the sequence into a single embedding.
+    Gives each frame global context over the full shot window.
+    """
+    def __init__(self, d_model, nhead=4, num_layers=2, max_T=32, dropout=0.1):
+        super().__init__()
+        self.cls     = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pos_enc = nn.Parameter(torch.zeros(1, max_T + 1, d_model))
+        layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward=d_model * 2,
+            dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(layer, num_layers)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # x: (B, C, T', V') from ST-GCN layers
+        x = x.mean(dim=3)        # (B, C, T') — pool over joints
+        x = x.permute(0, 2, 1)  # (B, T', C)
+        B, T, C = x.shape
+        cls = self.cls.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)          # (B, T'+1, C)
+        x = x + self.pos_enc[:, :T + 1, :]
+        x = self.transformer(x)
+        return self.norm(x[:, 0])               # CLS token → (B, C)
+
+
 class STGCN(nn.Module):
     """
     Full ST-GCN encoder.
@@ -105,10 +133,18 @@ class STGCN(nn.Module):
 
     def __init__(self, in_channels, num_nodes, adjacency,
                  num_layers=9, base_channels=64, embedding_dim=256,
-                 temporal_kernel=9, dropout=0.3):
+                 temporal_kernel=9, dropout=0.3, pooling='mean'):
+        """
+        Args:
+            pooling: 'mean' | 'attn' | 'max' | 'temporal_transformer'
+                temporal_transformer: pool joints → transformer over T steps
+                    → CLS token. Learns which frames are most discriminative
+                    with full inter-frame context.
+        """
         super().__init__()
 
         self.embedding_dim = embedding_dim
+        self.pooling_type = pooling
 
         # Batch norm on input
         self.bn_input = nn.BatchNorm1d(in_channels * num_nodes)
@@ -136,6 +172,17 @@ class STGCN(nn.Module):
             )
             c_in = c_out
 
+        self._last_channels = channels[-1]
+
+        if pooling == 'attn':
+            # Learned attention weights over (T', V) positions
+            self.temporal_attn = nn.Linear(channels[-1], 1)
+            self.joint_attn = nn.Linear(channels[-1], 1)
+        elif pooling == 'temporal_transformer':
+            # After 2 stride-2 downsamples, T=32 → T'=8
+            self.temporal_transformer = TemporalTransformerPooling(
+                d_model=channels[-1], nhead=4, num_layers=2, max_T=32)
+
         # Global average pooling → embedding
         self.fc = nn.Linear(channels[-1], embedding_dim)
 
@@ -158,12 +205,48 @@ class STGCN(nn.Module):
         for layer in self.layers:
             x = layer(x)
 
-        # Global average pooling over time and nodes
-        x = x.mean(dim=[2, 3])  # (B, C_last)
+        # Pooling: (B, C_last, T', V') → (B, C_last)
+        if self.pooling_type == 'attn':
+            x = self._attention_pool(x)
+        elif self.pooling_type == 'max':
+            x = x.flatten(2).max(dim=2).values  # (B, C_last)
+        else:
+            x = x.mean(dim=[2, 3])  # (B, C_last)
 
         # Project to embedding
         x = self.fc(x)
         return x
+
+    def _attention_pool(self, x):
+        """
+        Learned attention pooling over temporal and joint dimensions.
+
+        Computes separate attention weights for time and joints, then
+        applies them sequentially. This lets the model focus on the
+        contact frames (temporal) and the hitting arm joints (spatial).
+
+        Args:
+            x: (B, C, T', V')
+        Returns:
+            (B, C)
+        """
+        B, C, Tp, Vp = x.shape
+        # x reshaped for attention: (B, T', V', C)
+        x_perm = x.permute(0, 2, 3, 1)
+
+        # Temporal attention: score each frame (pool over joints first)
+        t_feat = x_perm.mean(dim=2)  # (B, T', C)
+        t_scores = self.temporal_attn(t_feat).squeeze(-1)  # (B, T')
+        t_weights = F.softmax(t_scores, dim=1).unsqueeze(1).unsqueeze(-1)  # (B, 1, T', 1)
+        x_t = (x * t_weights).sum(dim=2)  # (B, C, V')
+
+        # Joint attention: score each joint
+        j_feat = x_t.permute(0, 2, 1)  # (B, V', C)
+        j_scores = self.joint_attn(j_feat).squeeze(-1)  # (B, V')
+        j_weights = F.softmax(j_scores, dim=1).unsqueeze(1)  # (B, 1, V')
+        out = (x_t * j_weights).sum(dim=2)  # (B, C)
+
+        return out
 
     def get_attention_maps(self, x):
         """Return per-layer spatial attention for visualization."""

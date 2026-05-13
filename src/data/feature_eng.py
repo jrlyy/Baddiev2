@@ -7,7 +7,7 @@ numpy operations. No additional data, models, or processing needed.
 Feature Layers (cumulative):
     L0: [x, y] — raw court-relative coordinates (2-dim)
     L1: [x, y, vx, vy, ax, ay] — + velocity, acceleration (6-dim)
-    L2: [..., dist_net, dist_center, dist_opp] — + court context (9-dim)
+    L2: [..., dist_net, dist_center, depth_to_opp, lateral_to_opp] — + court context (10-dim)
     L3: [..., L_elbow, R_elbow, L_knee, R_knee] — + node-specific joint angles (13-dim)
 
 If a homography matrix (3×3 numpy array) is provided, pixel coordinates are
@@ -15,7 +15,10 @@ transformed to court-relative coordinates before any features are computed.
 This makes all distance/velocity features physically meaningful (in metres).
 """
 import numpy as np
-from ..config import NUM_JOINTS, NUM_NODES, FEATURE_DIMS, FEATURE_DIMS_WITH_HITTER
+from ..config import (
+    NUM_JOINTS, NUM_NODES, FEATURE_DIMS, FEATURE_DIMS_WITH_HITTER,
+    BONE_CHANNELS, COCO_BONE_PARENTS,
+)
 
 
 # COCO joint indices for angle computation
@@ -38,7 +41,8 @@ class FeatureEngineer:
     """Compute enriched node features from raw skeleton coordinates."""
 
     def __init__(self, feature_layer="L2", court_length=13.4, court_width=6.1,
-                 net_y=6.7, homography=None, use_hitter=False):
+                 net_y=6.7, homography=None, use_hitter=False,
+                 use_bones=False, use_bbox_norm=False):
         """
         Args:
             feature_layer: "L0", "L1", "L2", or "L3"
@@ -52,6 +56,11 @@ class FeatureEngineer:
                         before any feature computation.
             use_hitter: if True, compute() expects a hitter arg and appends
                         a binary is_hitter channel (1=hitter's joints, 0=opponent's)
+            use_bones: if True, append bone vectors (child − parent) as 2
+                       extra channels per joint. Encodes limb direction/length.
+            use_bbox_norm: if True, normalize each player's joint coordinates
+                          relative to their bounding box before computing features.
+                          Makes features scale-invariant (handles camera distance).
         """
         self.feature_layer = feature_layer
         self.court_length = court_length
@@ -60,10 +69,14 @@ class FeatureEngineer:
         self.court_center_x = court_width / 2    # 3.05 m
         self.court_center_y = net_y               # net line = court center along length
         self.use_hitter = use_hitter
+        self.use_bones = use_bones
+        self.use_bbox_norm = use_bbox_norm
+        base_dim = FEATURE_DIMS[feature_layer]
         if use_hitter:
-            self.feature_dim = FEATURE_DIMS_WITH_HITTER[feature_layer]
-        else:
-            self.feature_dim = FEATURE_DIMS[feature_layer]
+            base_dim += 1
+        if use_bones:
+            base_dim += BONE_CHANNELS
+        self.feature_dim = base_dim
         self.homography = homography  # (3, 3) or None
 
     def compute(self, skeleton, hitter=None):
@@ -87,25 +100,36 @@ class FeatureEngineer:
         C, T, V = skeleton.shape
         assert C == 2, f"Expected 2 channels (x, y), got {C}"
 
-        # L0: raw pixel coordinates (no homography — preserves body shape)
-        features = skeleton.copy()  # (2, T, V)
+        # Apply bbox normalization before any feature computation
+        if self.use_bbox_norm:
+            skel_for_features = self._apply_bbox_norm(skeleton)
+        else:
+            skel_for_features = skeleton
+
+        # L0: coordinates (bbox-normed or raw pixel)
+        features = skel_for_features.copy()  # (2, T, V)
 
         if self.feature_layer in ("L1", "L2", "L3"):
-            vel, acc = self._compute_kinematics(skeleton)
+            vel, acc = self._compute_kinematics(skel_for_features)
             features = np.concatenate([features, vel, acc], axis=0)  # (6, T, V)
 
         if self.feature_layer in ("L2", "L3"):
+            # Court context always uses original pixel coords (need absolute position)
             court_ctx = self._compute_court_context(skeleton)
             features = np.concatenate([features, court_ctx], axis=0)  # (9, T, V)
 
         if self.feature_layer == "L3":
-            # Joint angles from pixel coords (perspective warp would distort them)
-            angles = self._compute_joint_angles(skeleton)
+            # Joint angles from bbox-normed coords (scale-invariant angles)
+            angles = self._compute_joint_angles(skel_for_features)
             features = np.concatenate([features, angles], axis=0)  # (12, T, V)
 
         if self.use_hitter:
             hitter_ch = self._compute_hitter_channel(T, V, hitter)
             features = np.concatenate([features, hitter_ch], axis=0)
+
+        if self.use_bones:
+            bones = self._compute_bone_vectors(skel_for_features)
+            features = np.concatenate([features, bones], axis=0)
 
         assert features.shape[0] == self.feature_dim, \
             f"Expected {self.feature_dim} features, got {features.shape[0]}"
@@ -205,13 +229,14 @@ class FeatureEngineer:
         Features per node per frame (broadcast from centroid):
             - dist_to_net: centroid distance to net line
             - dist_to_center: centroid distance to court center
-            - dist_to_opponent: centroid-to-centroid distance
+            - depth_to_opp: signed depth (along court, y-axis) to opponent centroid
+            - lateral_to_opp: signed lateral (across court, x-axis) to opponent centroid
 
         Args:
             skeleton: (2, T, V) — raw pixel coordinates
 
         Returns:
-            court_features: (3, T, V)
+            court_features: (4, T, V)
         """
         C, T, V = skeleton.shape
         x = skeleton[0]  # (T, V)
@@ -244,13 +269,19 @@ class FeatureEngineer:
         dist_to_center[:, :NUM_JOINTS] = p0_ctr[:, None]
         dist_to_center[:, NUM_JOINTS:] = p1_ctr[:, None]
 
-        # dist_to_opponent — centroid-to-centroid
-        c2c = np.sqrt((p0_cx - p1_cx)**2 + (p0_cy - p1_cy)**2)  # (T,)
-        dist_to_opponent = np.zeros((T, V))
-        dist_to_opponent[:, :NUM_JOINTS] = c2c[:, None]
-        dist_to_opponent[:, NUM_JOINTS:] = c2c[:, None]
+        # depth_to_opp — signed along-court (y-axis) distance to opponent
+        # Positive = opponent is further from baseline (deeper)
+        depth_to_opp = np.zeros((T, V))
+        depth_to_opp[:, :NUM_JOINTS] = (p1_cy - p0_cy)[:, None]  # P0's view
+        depth_to_opp[:, NUM_JOINTS:] = (p0_cy - p1_cy)[:, None]  # P1's view
 
-        return np.stack([dist_to_net, dist_to_center, dist_to_opponent], axis=0)
+        # lateral_to_opp — signed across-court (x-axis) distance to opponent
+        # Positive = opponent is to the right
+        lateral_to_opp = np.zeros((T, V))
+        lateral_to_opp[:, :NUM_JOINTS] = (p1_cx - p0_cx)[:, None]
+        lateral_to_opp[:, NUM_JOINTS:] = (p0_cx - p1_cx)[:, None]
+
+        return np.stack([dist_to_net, dist_to_center, depth_to_opp, lateral_to_opp], axis=0)
 
     @staticmethod
     def _compute_joint_angles(skeleton):
@@ -298,6 +329,94 @@ class FeatureEngineer:
                 angles[feat_idx, :, j_idx] = angle
 
         return angles  # (4, T, V)
+
+    @staticmethod
+    def _compute_bone_vectors(skeleton):
+        """
+        Compute bone vectors: child_joint − parent_joint for each COCO limb.
+
+        Bone vectors explicitly encode limb direction and length, making it
+        easier to distinguish e.g. elbow-high (full smash) vs elbow-low
+        (tap smash) from the same joint positions.
+
+        For dual-player graphs (V=34 or 35), bone parents are applied per
+        player with the appropriate offset. Root joints (parent=-1) and
+        the shuttle virtual node get zero vectors.
+
+        Args:
+            skeleton: (2, T, V) — [x, y] coordinates (bbox-normed or raw)
+
+        Returns:
+            bones: (2, T, V) — [bone_x, bone_y] per joint
+        """
+        C, T, V = skeleton.shape
+        bones = np.zeros_like(skeleton)  # (2, T, V)
+
+        for player_offset in range(0, V, NUM_JOINTS):
+            if player_offset + NUM_JOINTS > V:
+                break  # skip shuttle node if present
+            for j in range(NUM_JOINTS):
+                parent = COCO_BONE_PARENTS[j]
+                if parent < 0:
+                    continue  # root joint → zero bone
+                bones[:, :, player_offset + j] = (
+                    skeleton[:, :, player_offset + j] -
+                    skeleton[:, :, player_offset + parent]
+                )
+
+        return bones
+
+    @staticmethod
+    def _apply_bbox_norm(skeleton):
+        """
+        Normalize each player's joints relative to their bounding box.
+
+        For each player at each frame:
+            x_norm = (x - bbox_cx) / max(bbox_w, 1)
+            y_norm = (y - bbox_cy) / max(bbox_h, 1)
+
+        This makes features scale-invariant (handles players at different
+        distances from camera) and translation-invariant within the frame.
+        Court position information is preserved in L2 court context features
+        which use the original pixel coordinates.
+
+        Zero-valued joints (undetected) remain zero after normalization.
+
+        Args:
+            skeleton: (2, T, V) — raw pixel coordinates
+
+        Returns:
+            normed: (2, T, V) — bbox-normalized coordinates
+        """
+        C, T, V = skeleton.shape
+        normed = skeleton.copy()
+
+        for player_offset in range(0, V, NUM_JOINTS):
+            if player_offset + NUM_JOINTS > V:
+                break  # skip shuttle node
+            pslice = slice(player_offset, player_offset + NUM_JOINTS)
+            px = skeleton[0, :, pslice]  # (T, 17)
+            py = skeleton[1, :, pslice]
+
+            # Mask: valid joints have nonzero coords
+            valid = (px > 0) | (py > 0)  # (T, 17)
+
+            for t in range(T):
+                v = valid[t]
+                if v.sum() < 2:
+                    continue  # not enough joints to compute bbox
+                vx = px[t, v]
+                vy = py[t, v]
+                x_min, x_max = vx.min(), vx.max()
+                y_min, y_max = vy.min(), vy.max()
+                bw = max(x_max - x_min, 1.0)
+                bh = max(y_max - y_min, 1.0)
+                cx = (x_min + x_max) / 2
+                cy = (y_min + y_max) / 2
+                normed[0, t, pslice] = np.where(v, (px[t] - cx) / bw, 0.0)
+                normed[1, t, pslice] = np.where(v, (py[t] - cy) / bh, 0.0)
+
+        return normed
 
 
 def compute_features_batch(skeletons, feature_layer="L2", hitters=None, **kwargs):

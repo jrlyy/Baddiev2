@@ -1,21 +1,16 @@
 """
-Data loading, episode sampling, and fold splitting for both
-FineBadminton (labeled) and ShuttleSet (unlabeled) datasets.
+Data loading, episode sampling, and fold splitting for ShuttleSet dataset.
 """
 import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 from pathlib import Path
-from typing import List, Optional
-from sklearn.model_selection import StratifiedKFold
+from typing import Optional
 
 from ..config import (
-    FB_ANNOTATIONS, FB_SKELETONS, FB_FRAMES, FB_SHUTTLES,
-    SS_SKELETONS, SS_OUTPUTS, SS_FRAMES, SS_SHUTTLES, SS_CSV_ROOT, SS_SPLIT_JSON,
-    STRATEGY_TO_IDX, FB_STRATEGY_MAP, FB_EXCLUDED_STRATEGIES,
-    SS_SHOT_TYPE_TO_IDX, NUM_CLASSES, NUM_JOINTS,
-    FB_SUBTYPE_TO_SHOT_TYPE, FB_HIT_TYPE_TO_SHOT_TYPE,
+    SS_SKELETONS, SS_OUTPUTS, SS_SHUTTLES, SS_CSV_ROOT, SS_SPLIT_JSON,
+    NUM_JOINTS,
     SS_TYPE_TO_SHOT_TYPE, SHOT_TYPE_TO_IDX,
     PROJECT_ROOT,
 )
@@ -23,337 +18,9 @@ from .feature_eng import FeatureEngineer
 
 
 
-
-
-class FineBadmintonDataset(Dataset):
-    """
-    Labeled dataset for few-shot strategy classification.
-
-    Loads FineBadminton annotations, maps strategy labels to indices,
-    and pairs with skeleton .npy files (or raw frame paths for extraction).
-    """
-
-    def __init__(self, skeleton_dir=None, annotations_path=None,
-                 shot_window=16, feature_layer="L2", transform=None,
-                 use_shuttle=False, shuttle_dir=None, use_hitter=False):
-        self.skeleton_dir = Path(skeleton_dir or FB_SKELETONS)
-        self.annotations_path = Path(annotations_path or FB_ANNOTATIONS)
-        self.shot_window = shot_window
-        self.transform = transform
-        self.use_shuttle = use_shuttle
-        self.shuttle_dir = Path(shuttle_dir or FB_SHUTTLES)
-        self.use_hitter = use_hitter
-
-        # Load court homography (pixel → court metres) if available
-        h_path = PROJECT_ROOT / "datasets_preprocessing" / "court_homographies" / "H_img_to_court_m.npy"
-        homography = np.load(h_path) if h_path.exists() else None
-        if homography is not None:
-            print(f"[INFO] FineBadminton: loaded court homography from {h_path.name}")
-        self.feature_eng = FeatureEngineer(feature_layer=feature_layer,
-                                           homography=homography,
-                                           use_hitter=use_hitter)
-
-        self.samples = []       # (skeleton_path, label_idx)
-        self.rally_info = []    # metadata for each sample
-        self.raw_annotations = None
-        self._load_annotations()
-
-    def _load_annotations(self):
-        """Parse FineBadminton annotations and build sample list."""
-        if not self.annotations_path.exists():
-            print(f"[WARN] Annotations not found: {self.annotations_path}")
-            return
-
-        with open(self.annotations_path) as f:
-            self.raw_annotations = json.load(f)
-
-        for rally in self.raw_annotations:
-            video_name = rally.get("video", "")
-            rally_id = video_name.replace(".mp4", "")
-
-            for hit_idx, hit in enumerate(rally.get("hitting", [])):
-                strategies = hit.get("strategies", [])
-                if not strategies:
-                    continue
-
-                raw_label = strategies[0].lower().strip()
-                if raw_label in FB_EXCLUDED_STRATEGIES:
-                    continue
-                canonical = FB_STRATEGY_MAP.get(raw_label)
-                if canonical is None:
-                    continue
-                label_idx = STRATEGY_TO_IDX[canonical]
-
-                skeleton_path = self.skeleton_dir / f"{rally_id}.npy"
-                hit_frame = hit.get("hit_frame")
-                start_frame = hit.get("start_frame")
-                end_frame = hit.get("end_frame")
-
-                hit_type_raw = hit.get("hit_type", "")
-                subtypes = hit.get("subtype", [])
-                # Prefer subtype (fine-grained) over hit_type for shot type mapping
-                shot_type = None
-                subtype_used = None
-                for st in subtypes:
-                    shot_type = FB_SUBTYPE_TO_SHOT_TYPE.get(st)
-                    if shot_type is not None:
-                        subtype_used = st
-                        break
-                if shot_type is None:
-                    shot_type = FB_HIT_TYPE_TO_SHOT_TYPE.get(hit_type_raw)
-                sample_info = {
-                    "rally_id": rally_id,
-                    "hit_idx": hit_idx,
-                    "hit_frame": hit_frame,
-                    "start_frame": start_frame,
-                    "end_frame": end_frame,
-                    "skeleton_path": str(skeleton_path),
-                    "has_skeleton": skeleton_path.exists(),
-                    "hit_type": hit_type_raw,
-                    "subtype": subtype_used or (subtypes[0] if subtypes else None),
-                    "shot_type": shot_type,
-                    "shot_type_idx": SHOT_TYPE_TO_IDX.get(shot_type) if shot_type else None,
-                    "player": hit.get("player", ""),
-                    # "top" = upper court (player 0 after Y-sort), "bottom" = lower court (player 1)
-                    "hitter": hit.get("hitter", ""),
-                    "strategy": canonical,
-                    "raw_strategy": raw_label,
-                    "quality": hit.get("quality"),
-                }
-
-                self.samples.append((skeleton_path, label_idx))
-                self.rally_info.append(sample_info)
-
-        print(f"[INFO] FineBadminton: {len(self.samples)} labeled shots "
-              f"across {len(self.raw_annotations)} rallies")
-
-        from collections import Counter
-        dist = Counter(info["strategy"] for info in self.rally_info)
-        for s, c in dist.most_common():
-            print(f"  {s}: {c}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        skeleton_path, label = self.samples[idx]
-        info = self.rally_info[idx]
-
-        skeleton_path = Path(skeleton_path)
-        if skeleton_path.exists():
-            raw_skel = np.load(skeleton_path)  # (2, T_full, 34)
-            x = self._extract_shot_window(raw_skel, info)
-        else:
-            x = np.zeros((2, self.shot_window, 34), dtype=np.float32)
-
-        # Append shuttle as virtual node 34 (before feature engineering so homography applies)
-        if self.use_shuttle:
-            x = self._append_shuttle(x, info)  # (2, T, 35)
-
-        # Compute enriched features
-        if x.shape[0] == 2:
-            hitter = info.get('hitter') if self.use_hitter else None
-            x = self.feature_eng.compute(x, hitter=hitter)
-
-        x = torch.tensor(x, dtype=torch.float32)
-
-        if self.transform:
-            x = self.transform(x)
-
-        return x, label
-
-    def _extract_shot_window(self, full_skeleton, info):
-        """Extract a T=shot_window segment centered on the hit frame."""
-        C, T_full, V = full_skeleton.shape
-        hit_frame = info.get("hit_frame")
-        rally_start = None
-
-        if hit_frame is not None and self.raw_annotations:
-            for rally in self.raw_annotations:
-                if rally.get("video", "").replace(".mp4", "") == info["rally_id"]:
-                    rally_start = rally.get("start_frame", 0)
-                    break
-
-        if hit_frame is not None and rally_start is not None:
-            rel_hit = hit_frame - rally_start
-            half = self.shot_window // 2
-            start = max(0, rel_hit - half)
-            end = start + self.shot_window
-            if end > T_full:
-                end = T_full
-                start = max(0, end - self.shot_window)
-        else:
-            start = 0
-            end = min(self.shot_window, T_full)
-
-        segment = full_skeleton[:, start:end, :]
-
-        if segment.shape[1] < self.shot_window:
-            pad_len = self.shot_window - segment.shape[1]
-            pad = np.zeros((C, pad_len, V), dtype=segment.dtype)
-            segment = np.concatenate([segment, pad], axis=1)
-
-        return segment
-
-    def _append_shuttle(self, skeleton, info):
-        """
-        Append shuttle position as virtual node 34.
-
-        Loads the rally's shuttle trajectory .npy (shape: (T_rally, 3) [x, y, vis]),
-        extracts the same shot window as the skeleton, and appends as a (2, T, 1) node.
-        Positions where visibility < 0.5 are zeroed out.
-
-        Args:
-            skeleton: (2, T, V) raw skeleton (pixel coords, pre-homography)
-            info: sample metadata dict with 'rally_id', 'hit_frame', etc.
-
-        Returns:
-            (2, T, V+1) skeleton with shuttle appended as the last node
-        """
-        C, T, V = skeleton.shape
-        shuttle_node = np.zeros((C, T, 1), dtype=skeleton.dtype)
-
-        shuttle_path = self.shuttle_dir / f"{info['rally_id']}.npy"
-        if shuttle_path.exists():
-            shuttle = np.load(shuttle_path)  # (T_full, 3): [x, y, vis]
-
-            # Find same window as skeleton extraction
-            hit_frame = info.get("hit_frame")
-            rally_start = None
-            if hit_frame is not None and self.raw_annotations:
-                for rally in self.raw_annotations:
-                    if rally.get("video", "").replace(".mp4", "") == info["rally_id"]:
-                        rally_start = rally.get("start_frame", 0)
-                        break
-
-            if hit_frame is not None and rally_start is not None:
-                rel_hit = hit_frame - rally_start
-                half = self.shot_window // 2
-                start = max(0, rel_hit - half)
-                end = start + self.shot_window
-                T_full = len(shuttle)
-                if end > T_full:
-                    end = T_full
-                    start = max(0, end - self.shot_window)
-            else:
-                start = 0
-                end = min(self.shot_window, len(shuttle))
-
-            segment = shuttle[start:end]  # (T_seg, 3)
-            T_seg = segment.shape[0]
-            xy = segment[:, :2].T  # (2, T_seg)
-            vis = segment[:, 2]    # (T_seg,)
-
-            # Zero out low-visibility positions
-            xy[:, vis < 0.5] = 0.0
-
-            # Pad if short
-            if T_seg < T:
-                pad = np.zeros((C, T - T_seg), dtype=skeleton.dtype)
-                xy = np.concatenate([xy, pad], axis=1)
-            elif T_seg > T:
-                xy = xy[:, :T]
-
-            shuttle_node[:, :, 0] = xy
-
-        return np.concatenate([skeleton, shuttle_node], axis=2)  # (C, T, V+1)
-
-    def get_labels(self):
-        return [s[1] for s in self.samples]
-
-    def get_rally_splits(self, n_train_rallies=30, seed=42):
-        """
-        Split dataset by rally to prevent data leakage between train and held-out sets.
-
-        All shots from a given rally appear in only one split (train or held-out),
-        unlike get_fold_splits() which can put shots from the same rally in both.
-
-        Args:
-            n_train_rallies: number of rallies for training (rest go to held-out)
-            seed: random seed for reproducibility
-
-        Returns:
-            train_idx: list of sample indices for training
-            holdout_idx: list of sample indices for held-out evaluation
-        """
-        rng = np.random.RandomState(seed)
-        rally_ids = sorted({info['rally_id'] for info in self.rally_info})
-        rally_ids = list(rally_ids)
-        rng.shuffle(rally_ids)
-
-        train_rallies = set(rally_ids[:n_train_rallies])
-        holdout_rallies = set(rally_ids[n_train_rallies:])
-
-        train_idx = [i for i, info in enumerate(self.rally_info)
-                     if info['rally_id'] in train_rallies]
-        holdout_idx = [i for i, info in enumerate(self.rally_info)
-                       if info['rally_id'] in holdout_rallies]
-
-        print(f"Rally split: {len(train_rallies)} train rallies ({len(train_idx)} shots), "
-              f"{len(holdout_rallies)} held-out rallies ({len(holdout_idx)} shots)")
-        return train_idx, holdout_idx
-
-    def get_fold_splits(self, n_folds=5, seed=42):
-        """
-        Rally-level stratified k-fold splits.
-
-        Rallies (not individual shots) are assigned to folds so that no rally
-        appears in both train and test — preventing leakage from shared player
-        skeletons across shots of the same rally.  The dominant strategy label
-        per rally is used as the stratification key.
-
-        Each fold also carves out a val set (1 inner fold from the train rallies)
-        for checkpoint selection.
-
-        Returns:
-            list of (train_idx, val_idx, test_idx) — sample-level indices.
-        """
-        if len(self.samples) == 0:
-            return []
-
-        from collections import Counter as _Counter
-        rally_ids = sorted({info['rally_id'] for info in self.rally_info})
-        rally_label = {
-            rid: _Counter(
-                info['strategy'] for info in self.rally_info
-                if info['rally_id'] == rid
-            ).most_common(1)[0][0]
-            for rid in rally_ids
-        }
-
-        rally_arr = np.array(rally_ids)
-        strat_arr = np.array([rally_label[r] for r in rally_ids])
-
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-
-        splits = []
-        for tr_r_idx, te_r_idx in skf.split(rally_arr, strat_arr):
-            test_rallies = set(rally_arr[te_r_idx])
-            tv_rallies   = rally_arr[tr_r_idx]
-            tv_strat     = strat_arr[tr_r_idx]
-
-            inner_skf = StratifiedKFold(
-                n_splits=max(2, n_folds - 1), shuffle=True, random_state=seed
-            )
-            tr_inner, val_inner = next(inner_skf.split(tv_rallies, tv_strat))
-            train_rallies = set(tv_rallies[tr_inner])
-            val_rallies   = set(tv_rallies[val_inner])
-
-            train_idx = [i for i, info in enumerate(self.rally_info)
-                         if info['rally_id'] in train_rallies]
-            val_idx   = [i for i, info in enumerate(self.rally_info)
-                         if info['rally_id'] in val_rallies]
-            test_idx  = [i for i, info in enumerate(self.rally_info)
-                         if info['rally_id'] in test_rallies]
-
-            splits.append((train_idx, val_idx, test_idx))
-
-        return splits
-
-
 class ShuttleSetDataset(Dataset):
     """
-    Unlabeled dataset for self-supervised pre-training.
+    ShuttleSet dataset for shot-type classification.
 
     Supports two skeleton formats auto-detected from skeleton_dir:
     1. Per-shot files: {skeleton_dir}/{match_id}/r????_b????.npy  shape (2, T, 34)
@@ -375,7 +42,8 @@ class ShuttleSetDataset(Dataset):
                  split=None, split_json=None,
                  use_shuttle=False, shuttle_dir=None,
                  use_hitter=False, variable_window=False,
-                 shuttle_fusion="graph"):
+                 shuttle_fusion="graph",
+                 use_bones=False, use_bbox_norm=False):
         """
         Args:
             split: None (all matches) | 'train' | 'val'
@@ -389,6 +57,8 @@ class ShuttleSetDataset(Dataset):
             variable_window: use prev/next shot hit frames instead of fixed window
             shuttle_fusion: "graph" (virtual node in skeleton) or
                            "cross_attn" (separate trajectory tensor returned)
+            use_bones: append bone vectors (child − parent) as 2 extra channels
+            use_bbox_norm: normalize joints relative to per-player bounding box
         """
         self.skeleton_dir = Path(skeleton_dir or SS_SKELETONS)
         self.outputs_dir = Path(outputs_dir or SS_OUTPUTS)
@@ -401,6 +71,8 @@ class ShuttleSetDataset(Dataset):
         self.use_hitter = use_hitter
         self.variable_window = variable_window
         self.shuttle_fusion = shuttle_fusion
+        self.use_bones = use_bones
+        self.use_bbox_norm = use_bbox_norm
         self.allowed_matches = self._load_split(split, split_json)
 
         # Load per-match homographies (Roboflow-based, from notebook 07)
@@ -409,7 +81,9 @@ class ShuttleSetDataset(Dataset):
         self._use_hitter = use_hitter
         # Default feature engineer (no H) — used when match H is unavailable
         self.feature_eng = FeatureEngineer(feature_layer=feature_layer, homography=None,
-                                           use_hitter=use_hitter)
+                                           use_hitter=use_hitter,
+                                           use_bones=use_bones,
+                                           use_bbox_norm=use_bbox_norm)
         # Per-match feature engineers (cached lazily)
         self._fe_cache: dict = {}
         if self._homography_dict:
@@ -928,7 +602,9 @@ class ShuttleSetDataset(Dataset):
             if h is not None:
                 self._fe_cache[match_name] = FeatureEngineer(
                     feature_layer=self._feature_layer, homography=h,
-                    use_hitter=self._use_hitter)
+                    use_hitter=self._use_hitter,
+                    use_bones=self.use_bones,
+                    use_bbox_norm=self.use_bbox_norm)
             else:
                 self._fe_cache[match_name] = self.feature_eng  # no-H fallback
         return self._fe_cache[match_name]
