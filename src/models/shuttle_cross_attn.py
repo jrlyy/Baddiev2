@@ -131,13 +131,17 @@ class ShuttleCrossAttention(nn.Module):
         safe_mask = shuttle_mask.clone()
         safe_mask[all_masked, 0] = False
 
-        # Cross-attention
-        attn_out, _ = self.cross_attn(
+        # Cross-attention (capture weights for analysis; averaged over heads)
+        attn_out, attn_weights = self.cross_attn(
             query=q,
             key=shuttle_emb,
             value=shuttle_emb,
             key_padding_mask=safe_mask,
-        )  # (B, 1, d_shuttle)
+            need_weights=True,
+            average_attn_weights=True,
+        )  # attn_out: (B, 1, d_shuttle); attn_weights: (B, 1, T)
+        self._last_attn = attn_weights.squeeze(1).detach().cpu()  # (B, T)
+        self._last_all_masked = all_masked.detach().cpu()  # (B,)
 
         attn_out = self.norm(attn_out.squeeze(1))  # (B, d_shuttle)
 

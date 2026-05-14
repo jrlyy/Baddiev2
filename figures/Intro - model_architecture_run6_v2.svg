@@ -1,0 +1,343 @@
+<svg width="100%" viewBox="0 0 1100 540" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Run 6 model architecture — decomposed view</title>
+<desc>Four-panel diagram: (a) overall pipeline, (b) spatial graph conv module, (c) temporal conv module, (d) shuttle cross-attention fusion. Styled after Yan et al. and BST reference diagrams.</desc>
+
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+  <marker id="arrThin" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+  <!-- 3D-ish input tensor gradient -->
+  <linearGradient id="tens" x1="0" x2="0" y1="0" y2="1">
+    <stop offset="0" stop-color="#8a96aa"/>
+    <stop offset="1" stop-color="#5a6878"/>
+  </linearGradient>
+  <linearGradient id="tens2" x1="0" x2="1" y1="0" y2="0">
+    <stop offset="0" stop-color="#7c8aa0"/>
+    <stop offset="1" stop-color="#4f5d6f"/>
+  </linearGradient>
+  <!-- Heatmap cells palette -->
+  <linearGradient id="cellHot" x1="0" x2="0" y1="0" y2="1">
+    <stop offset="0" stop-color="#f6c177"/>
+    <stop offset="1" stop-color="#e07a3c"/>
+  </linearGradient>
+  <linearGradient id="cellCool" x1="0" x2="0" y1="0" y2="1">
+    <stop offset="0" stop-color="#aac6e7"/>
+    <stop offset="1" stop-color="#5a85b8"/>
+  </linearGradient>
+</defs>
+
+<!-- ============================================================ -->
+<!-- (a) Overall pipeline                                          -->
+<!-- ============================================================ -->
+<g font-family="system-ui,sans-serif" fill="#222">
+
+  <!-- Input tensor (3D look) -->
+  <g transform="translate(40,55)">
+    <!-- back face -->
+    <polygon points="20,0 200,0 220,-18 40,-18" fill="#9aa6b8" stroke="#3b475a" stroke-width="0.8"/>
+    <!-- right face -->
+    <polygon points="200,0 220,-18 220,42 200,60" fill="#5a6878" stroke="#3b475a" stroke-width="0.8"/>
+    <!-- front face -->
+    <rect x="20" y="0" width="180" height="60" fill="url(#tens)" stroke="#3b475a" stroke-width="0.8"/>
+    <text x="-6" y="34" font-size="11" fill="#222" text-anchor="end">#Dim C=2</text>
+    <text x="110" y="-26" font-size="11" fill="#222" text-anchor="middle">Temporal length T=16</text>
+    <text x="234" y="22" font-size="11" fill="#222">#Joint V=17</text>
+    <text x="110" y="78" font-size="11" fill="#666" text-anchor="middle" font-style="italic">single hitter, L3 features</text>
+  </g>
+
+  <!-- Arrow into pipeline -->
+  <line x1="160" y1="140" x2="160" y2="172" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- ST-GCN block stack (dashed grouping) -->
+  <rect x="60" y="175" width="200" height="170" rx="10" fill="none" stroke="#3b475a" stroke-width="1" stroke-dasharray="5 3"/>
+  <text x="160" y="194" text-anchor="middle" font-size="11" fill="#3b475a" font-weight="600">ST-GCN Block × 9</text>
+
+  <!-- Spatial module box -->
+  <rect x="85" y="207" width="150" height="36" rx="6" fill="#cfe1f4" stroke="#3a6ea8" stroke-width="1"/>
+  <text x="160" y="229" text-anchor="middle" font-size="12" fill="#0f3458" font-weight="600">Spatial Module</text>
+
+  <!-- Temporal module box -->
+  <rect x="85" y="253" width="150" height="36" rx="6" fill="#3a6ea8" stroke="#22436b" stroke-width="1"/>
+  <text x="160" y="276" text-anchor="middle" font-size="12" fill="#ffffff" font-weight="600">Temporal Module</text>
+
+  <!-- Internal arrows -->
+  <line x1="160" y1="243" x2="160" y2="252" stroke="#444" stroke-width="1.3" marker-end="url(#arrThin)"/>
+  <line x1="160" y1="289" x2="160" y2="305" stroke="#444" stroke-width="1.3" marker-end="url(#arrThin)"/>
+
+  <!-- Residual ⊕ -->
+  <circle cx="160" cy="316" r="9" fill="#fff" stroke="#444" stroke-width="1.2"/>
+  <text x="160" y="320" text-anchor="middle" font-size="12" fill="#444">+</text>
+  <!-- Residual bypass line -->
+  <path d="M55 225 Q40 225 40 316 Q40 316 150 316" fill="none" stroke="#666" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#arrThin)"/>
+
+  <!-- Channel progression note -->
+  <text x="270" y="222" font-size="10.5" fill="#3b475a">channels:</text>
+  <text x="270" y="237" font-size="10.5" fill="#3b475a">64,64,64</text>
+  <text x="270" y="251" font-size="10.5" fill="#3b475a">128,128,128</text>
+  <text x="270" y="265" font-size="10.5" fill="#3b475a">256,256,256</text>
+  <text x="270" y="285" font-size="10" fill="#7a4a1a" font-style="italic">stride 2 @ L3, L6</text>
+  <text x="270" y="299" font-size="10" fill="#7a4a1a" font-style="italic">T: 16 → 8 → 4</text>
+
+  <!-- Out of stack -->
+  <line x1="160" y1="345" x2="160" y2="362" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Pooling box -->
+  <rect x="80" y="365" width="160" height="32" rx="6" fill="#f6dba8" stroke="#a87a23" stroke-width="1"/>
+  <text x="160" y="385" text-anchor="middle" font-size="12" fill="#5a3d0a" font-weight="600">T,V Pooling (mean)</text>
+
+  <line x1="160" y1="397" x2="160" y2="412" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Cross-attention box (Run 6 addition) -->
+  <rect x="60" y="415" width="200" height="42" rx="6" fill="#e9d6f3" stroke="#7a3aa8" stroke-width="1"/>
+  <text x="160" y="433" text-anchor="middle" font-size="12" fill="#4a1e6e" font-weight="600">Shuttle Cross-Attention</text>
+  <text x="160" y="448" text-anchor="middle" font-size="10" fill="#4a1e6e" font-style="italic">Q=skel,  K,V=ShuttleTCN(s)</text>
+
+  <line x1="160" y1="457" x2="160" y2="473" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- FC + prediction -->
+  <rect x="100" y="475" width="120" height="30" rx="6" fill="#ffd0bf" stroke="#b04a25" stroke-width="1"/>
+  <text x="160" y="495" text-anchor="middle" font-size="12" fill="#5a1a06" font-weight="600">FC → ŷ (18 classes)</text>
+
+  <!-- Shuttle input branch (right of pipeline) -->
+  <g transform="translate(290,75)">
+    <rect x="0" y="0" width="80" height="38" rx="5" fill="#c8e0ce" stroke="#3a7a55" stroke-width="0.8"/>
+    <text x="40" y="17" text-anchor="middle" font-size="10.5" fill="#143924" font-weight="600">Shuttle</text>
+    <text x="40" y="32" text-anchor="middle" font-size="10" fill="#143924">(2 × 16)</text>
+  </g>
+  <line x1="330" y1="113" x2="330" y2="350" stroke="#3a7a55" stroke-width="1.2" stroke-dasharray="3 2"/>
+  <g transform="translate(290,355)">
+    <rect x="0" y="0" width="80" height="32" rx="5" fill="#a8c9b3" stroke="#3a7a55" stroke-width="0.8"/>
+    <text x="40" y="20" text-anchor="middle" font-size="11" fill="#143924" font-weight="600">ShuttleTCN</text>
+  </g>
+  <line x1="330" y1="387" x2="330" y2="425" stroke="#3a7a55" stroke-width="1.4" marker-end="url(#arr)"/>
+  <line x1="328" y1="425" x2="262" y2="436" stroke="#3a7a55" stroke-width="1.4" marker-end="url(#arr)"/>
+
+  <!-- Panel label -->
+  <text x="160" y="528" text-anchor="middle" font-size="13" fill="#222" font-weight="600">(a) Overall pipeline</text>
+</g>
+
+<!-- ============================================================ -->
+<!-- (b) Spatial module                                            -->
+<!-- ============================================================ -->
+<g font-family="system-ui,sans-serif" fill="#222" transform="translate(390,0)">
+
+  <!-- Tensor at top -->
+  <g transform="translate(40,55)">
+    <polygon points="20,0 200,0 220,-18 40,-18" fill="#9aa6b8" stroke="#3b475a" stroke-width="0.8"/>
+    <polygon points="200,0 220,-18 220,42 200,60" fill="#5a6878" stroke="#3b475a" stroke-width="0.8"/>
+    <rect x="20" y="0" width="180" height="60" fill="url(#tens)" stroke="#3b475a" stroke-width="0.8"/>
+    <text x="110" y="-26" font-size="11" fill="#222" text-anchor="middle">Temporal length T</text>
+    <text x="234" y="22" font-size="11" fill="#222">#Joint V</text>
+    <text x="110" y="78" font-size="10.5" fill="#666" text-anchor="middle" font-style="italic">for each frame t_i ∈ {1,…,T}</text>
+  </g>
+
+  <line x1="160" y1="143" x2="160" y2="178" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Adjacency matrix V x V -->
+  <g transform="translate(40,190)">
+    <text x="55" y="-6" text-anchor="middle" font-size="11">V</text>
+    <text x="-12" y="55" text-anchor="middle" font-size="11">V</text>
+    <!-- 6x6 heatmap cells -->
+    <g>
+      <rect x="0" y="0" width="15" height="15" fill="#f4a261"/>
+      <rect x="15" y="0" width="15" height="15" fill="#e07a3c"/>
+      <rect x="30" y="0" width="15" height="15" fill="#aac6e7"/>
+      <rect x="45" y="0" width="15" height="15" fill="#5a85b8"/>
+      <rect x="60" y="0" width="15" height="15" fill="#f4a261"/>
+      <rect x="75" y="0" width="15" height="15" fill="#e07a3c"/>
+
+      <rect x="0" y="15" width="15" height="15" fill="#5a85b8"/>
+      <rect x="15" y="15" width="15" height="15" fill="#f4a261"/>
+      <rect x="30" y="15" width="15" height="15" fill="#e07a3c"/>
+      <rect x="45" y="15" width="15" height="15" fill="#aac6e7"/>
+      <rect x="60" y="15" width="15" height="15" fill="#5a85b8"/>
+      <rect x="75" y="15" width="15" height="15" fill="#f4a261"/>
+
+      <rect x="0" y="30" width="15" height="15" fill="#aac6e7"/>
+      <rect x="15" y="30" width="15" height="15" fill="#5a85b8"/>
+      <rect x="30" y="30" width="15" height="15" fill="#f4a261"/>
+      <rect x="45" y="30" width="15" height="15" fill="#e07a3c"/>
+      <rect x="60" y="30" width="15" height="15" fill="#aac6e7"/>
+      <rect x="75" y="30" width="15" height="15" fill="#5a85b8"/>
+
+      <rect x="0" y="45" width="15" height="15" fill="#e07a3c"/>
+      <rect x="15" y="45" width="15" height="15" fill="#aac6e7"/>
+      <rect x="30" y="45" width="15" height="15" fill="#5a85b8"/>
+      <rect x="45" y="45" width="15" height="15" fill="#f4a261"/>
+      <rect x="60" y="45" width="15" height="15" fill="#e07a3c"/>
+      <rect x="75" y="45" width="15" height="15" fill="#aac6e7"/>
+
+      <rect x="0" y="60" width="15" height="15" fill="#f4a261"/>
+      <rect x="15" y="60" width="15" height="15" fill="#e07a3c"/>
+      <rect x="30" y="60" width="15" height="15" fill="#aac6e7"/>
+      <rect x="45" y="60" width="15" height="15" fill="#5a85b8"/>
+      <rect x="60" y="60" width="15" height="15" fill="#f4a261"/>
+      <rect x="75" y="60" width="15" height="15" fill="#e07a3c"/>
+
+      <rect x="0" y="75" width="15" height="15" fill="#5a85b8"/>
+      <rect x="15" y="75" width="15" height="15" fill="#f4a261"/>
+      <rect x="30" y="75" width="15" height="15" fill="#e07a3c"/>
+      <rect x="45" y="75" width="15" height="15" fill="#aac6e7"/>
+      <rect x="60" y="75" width="15" height="15" fill="#5a85b8"/>
+      <rect x="75" y="75" width="15" height="15" fill="#f4a261"/>
+    </g>
+    <text x="110" y="48" font-size="14" fill="#222">⊗</text>
+  </g>
+
+  <!-- Feature matrix V x C -->
+  <g transform="translate(180,190)">
+    <text x="30" y="-6" text-anchor="middle" font-size="11">C</text>
+    <text x="-12" y="55" text-anchor="middle" font-size="11">V</text>
+    <!-- 6x4 columns alternating -->
+    <g>
+      <rect x="0" y="0" width="15" height="90" fill="#aac6e7"/>
+      <rect x="15" y="0" width="15" height="90" fill="#5a85b8"/>
+      <rect x="30" y="0" width="15" height="90" fill="#f4a261"/>
+      <rect x="45" y="0" width="15" height="90" fill="#e07a3c"/>
+    </g>
+    <text x="80" y="48" font-size="11" fill="#444">Feature x_{t_i}</text>
+  </g>
+
+  <!-- Equation strip -->
+  <g transform="translate(40,310)">
+    <rect x="0" y="0" width="240" height="30" rx="6" fill="#eef1f5" stroke="#7d8a9c" stroke-width="0.6"/>
+    <text x="120" y="20" text-anchor="middle" font-size="11.5" fill="#1a2a3a">
+      x'_{t_i} = Σ_k (α_k · A_k) · h_k(x_{t_i})
+    </text>
+  </g>
+
+  <text x="160" y="360" text-anchor="middle" font-size="10.5" fill="#666" font-style="italic">
+    K subsets + learnable edge-importance α_k
+  </text>
+  <text x="160" y="378" text-anchor="middle" font-size="10.5" fill="#666" font-style="italic">
+    (1×1 conv expands C→K·C_out, then aggregate)
+  </text>
+
+  <text x="160" y="528" text-anchor="middle" font-size="13" fill="#222" font-weight="600">(b) Spatial Module</text>
+</g>
+
+<!-- ============================================================ -->
+<!-- (c) Temporal module                                           -->
+<!-- ============================================================ -->
+<g font-family="system-ui,sans-serif" fill="#222" transform="translate(740,0)">
+
+  <!-- Tensor at top -->
+  <g transform="translate(40,55)">
+    <polygon points="20,0 200,0 220,-18 40,-18" fill="#9aa6b8" stroke="#3b475a" stroke-width="0.8"/>
+    <polygon points="200,0 220,-18 220,42 200,60" fill="#5a6878" stroke="#3b475a" stroke-width="0.8"/>
+    <rect x="20" y="0" width="180" height="60" fill="url(#tens)" stroke="#3b475a" stroke-width="0.8"/>
+    <text x="110" y="-26" font-size="11" fill="#222" text-anchor="middle">Temporal length T</text>
+    <text x="234" y="22" font-size="11" fill="#222">#Joint V</text>
+    <text x="110" y="78" font-size="10.5" fill="#666" text-anchor="middle" font-style="italic">for each joint v_i ∈ {1,…,V}</text>
+  </g>
+
+  <line x1="160" y1="143" x2="160" y2="178" stroke="#444" stroke-width="1.6" marker-end="url(#arr)"/>
+
+  <!-- Time-series feature (T x C) -->
+  <g transform="translate(30,190)">
+    <text x="30" y="-6" text-anchor="middle" font-size="11">C</text>
+    <text x="-12" y="10" text-anchor="middle" font-size="10">t_1</text>
+    <text x="-12" y="118" text-anchor="middle" font-size="10">t_T</text>
+    <g>
+      <rect x="0" y="0" width="15" height="130" fill="#aac6e7"/>
+      <rect x="15" y="0" width="15" height="130" fill="#5a85b8"/>
+      <rect x="30" y="0" width="15" height="130" fill="#7ba4cd"/>
+      <rect x="45" y="0" width="15" height="130" fill="#4a76a8"/>
+    </g>
+  </g>
+
+  <!-- 1D conv kernel symbol -->
+  <g transform="translate(115,225)">
+    <rect x="0" y="0" width="38" height="60" rx="4" fill="#fff" stroke="#444" stroke-width="1"/>
+    <text x="19" y="22" text-anchor="middle" font-size="10" fill="#444">1D</text>
+    <text x="19" y="36" text-anchor="middle" font-size="10" fill="#444">Conv</text>
+    <text x="19" y="50" text-anchor="middle" font-size="9.5" fill="#666">k=9</text>
+  </g>
+
+  <!-- Dashed correspondence lines (kernel covers 3 timesteps) -->
+  <g stroke="#999" stroke-width="0.7" stroke-dasharray="2 2" fill="none">
+    <line x1="60" y1="200" x2="115" y2="235"/>
+    <line x1="60" y1="240" x2="115" y2="250"/>
+    <line x1="60" y1="280" x2="115" y2="270"/>
+    <line x1="60" y1="320" x2="115" y2="285"/>
+    <line x1="153" y1="245" x2="180" y2="225"/>
+    <line x1="153" y1="255" x2="180" y2="265"/>
+    <line x1="153" y1="265" x2="180" y2="305"/>
+  </g>
+
+  <!-- Output time-series (T' x C) -->
+  <g transform="translate(180,210)">
+    <text x="30" y="-6" text-anchor="middle" font-size="11">C</text>
+    <text x="-15" y="10" text-anchor="middle" font-size="10">t_1</text>
+    <text x="-15" y="88" text-anchor="middle" font-size="10">t_T'</text>
+    <g>
+      <rect x="0" y="0" width="15" height="100" fill="#7892ad"/>
+      <rect x="15" y="0" width="15" height="100" fill="#5b7796"/>
+      <rect x="30" y="0" width="15" height="100" fill="#9bb1c9"/>
+      <rect x="45" y="0" width="15" height="100" fill="#3f5a78"/>
+    </g>
+  </g>
+
+  <text x="120" y="338" text-anchor="middle" font-size="11" fill="#444">Feature x_{v_i}</text>
+
+  <!-- Equation strip -->
+  <g transform="translate(30,360)">
+    <rect x="0" y="0" width="260" height="30" rx="6" fill="#eef1f5" stroke="#7d8a9c" stroke-width="0.6"/>
+    <text x="130" y="20" text-anchor="middle" font-size="11.5" fill="#1a2a3a">
+      x'_{v_i} = Conv1D_t(x_{v_i}; k=9, s∈{1,2})
+    </text>
+  </g>
+
+  <text x="160" y="408" text-anchor="middle" font-size="10.5" fill="#666" font-style="italic">
+    BN → Dropout, stride=2 halves T at L3, L6
+  </text>
+
+  <text x="160" y="528" text-anchor="middle" font-size="13" fill="#222" font-weight="600">(c) Temporal Module</text>
+</g>
+
+<!-- ============================================================ -->
+<!-- (d) Shuttle cross-attention (full-width strip at bottom)      -->
+<!-- ============================================================ -->
+<g font-family="system-ui,sans-serif" fill="#222" transform="translate(390,420)">
+  <rect x="0" y="0" width="700" height="90" rx="10" fill="#faf3fb" stroke="#7a3aa8" stroke-width="0.8" stroke-dasharray="5 3"/>
+
+  <!-- Q box -->
+  <rect x="20" y="22" width="120" height="46" rx="6" fill="#ffd0bf" stroke="#b04a25" stroke-width="0.8"/>
+  <text x="80" y="42" text-anchor="middle" font-size="11" fill="#5a1a06" font-weight="600">skel_emb</text>
+  <text x="80" y="58" text-anchor="middle" font-size="10" fill="#5a1a06">(B, 256) → Q</text>
+
+  <!-- shuttle TCN box -->
+  <rect x="160" y="22" width="130" height="46" rx="6" fill="#c8e0ce" stroke="#3a7a55" stroke-width="0.8"/>
+  <text x="225" y="42" text-anchor="middle" font-size="11" fill="#143924" font-weight="600">ShuttleTCN</text>
+  <text x="225" y="58" text-anchor="middle" font-size="10" fill="#143924">(B, T, 128) → K,V</text>
+
+  <!-- arrows to MHA -->
+  <line x1="140" y1="45" x2="320" y2="45" stroke="#7a3aa8" stroke-width="1.4" marker-end="url(#arrThin)"/>
+  <line x1="290" y1="45" x2="320" y2="45" stroke="#3a7a55" stroke-width="1.4" marker-end="url(#arrThin)"/>
+
+  <!-- MHA -->
+  <rect x="320" y="22" width="120" height="46" rx="6" fill="#e9d6f3" stroke="#7a3aa8" stroke-width="1"/>
+  <text x="380" y="42" text-anchor="middle" font-size="11" fill="#4a1e6e" font-weight="600">MHA (4 heads)</text>
+  <text x="380" y="58" text-anchor="middle" font-size="10" fill="#4a1e6e">+ LN + Linear</text>
+
+  <line x1="440" y1="45" x2="475" y2="45" stroke="#444" stroke-width="1.4" marker-end="url(#arrThin)"/>
+
+  <!-- residual add -->
+  <circle cx="488" cy="45" r="10" fill="#fff" stroke="#444" stroke-width="1.2"/>
+  <text x="488" y="49" text-anchor="middle" font-size="12" fill="#444">+</text>
+  <path d="M80 22 Q80 8 488 8 L488 35" fill="none" stroke="#b04a25" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#arrThin)"/>
+
+  <line x1="500" y1="45" x2="540" y2="45" stroke="#444" stroke-width="1.4" marker-end="url(#arrThin)"/>
+
+  <!-- output fused -->
+  <rect x="540" y="22" width="140" height="46" rx="6" fill="#ffe4d4" stroke="#b04a25" stroke-width="1"/>
+  <text x="610" y="42" text-anchor="middle" font-size="11" fill="#5a1a06" font-weight="600">fused emb</text>
+  <text x="610" y="58" text-anchor="middle" font-size="10" fill="#5a1a06">(B, 256) → FC → ŷ</text>
+
+  <text x="350" y="84" text-anchor="middle" font-size="13" fill="#222" font-weight="600">(d) Shuttle Cross-Attention (BST-style)</text>
+</g>
+
+</svg>

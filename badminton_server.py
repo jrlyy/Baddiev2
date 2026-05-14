@@ -1375,6 +1375,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(preds)
             return
 
+        # FB shot-type inference (all shots, cached)
+        if path == "/api/fb/infer_all":
+            self._send_json(_run_fb_inference())
+            return
+
+        # Force-clear the FB inference cache (re-runs next request)
+        if path == "/api/fb/infer_reset":
+            global _fb_infer_cache
+            _fb_infer_cache = None
+            _FB_INFER_CACHE_PATH.unlink(missing_ok=True)
+            self._send_json({"status": "cache cleared"})
+            return
+
         self._send_404()
 
 
@@ -1394,6 +1407,66 @@ def _load_predictions() -> list[dict]:
         _predictions_cache = []
         print(f"  [predictions] No file at {pred_path}")
     return _predictions_cache
+
+
+# ─── FB Shot-Type Inference ───────────────────────────────────────────────────
+_fb_predictor      = None
+_fb_infer_cache: list[dict] | None = None
+_FB_INFER_CACHE_PATH = ROOT / "results" / "fb_inference.json"
+_FB_EN_ANN = ROOT / "Datasets" / "FineBadminton-dataset" / "dataset" / "transformed_combined_rounds_output_en_evals_translated.json"
+# Prefer run6 D4 (best single-split); fall back to run6 C3 (cross-validation model)
+_FB_CKPT_CANDIDATES = [
+    ROOT / "models" / "run6" / "D4_mlp_bn.pt",
+    ROOT / "models" / "run6" / "C3_shuttle_xattn.pt",
+    ROOT / "models" / "ablation_C3_shuttle_crossattn.pt",
+    ROOT / "models" / "ablation_A1_dual_L2.pt",
+]
+
+def _get_fb_predictor():
+    global _fb_predictor
+    if _fb_predictor is not None:
+        return _fb_predictor
+    ckpt = next((p for p in _FB_CKPT_CANDIDATES if p.exists()), None)
+    if ckpt is None:
+        print("[FB infer] No checkpoint found — inference disabled")
+        return None
+    try:
+        sys.path.insert(0, str(ROOT))
+        from src.inference_shot_type import ShotTypePredictor
+        _fb_predictor = ShotTypePredictor(ckpt, roboflow_api_key=None)
+        print(f"[FB infer] Loaded predictor from {ckpt.name}")
+        return _fb_predictor
+    except Exception as exc:
+        print(f"[FB infer] Predictor load failed: {exc}")
+        return None
+
+
+def _run_fb_inference() -> list[dict]:
+    global _fb_infer_cache
+    if _fb_infer_cache is not None:
+        return _fb_infer_cache
+    if _FB_INFER_CACHE_PATH.exists():
+        _fb_infer_cache = json.loads(_FB_INFER_CACHE_PATH.read_text())
+        print(f"[FB infer] Loaded {len(_fb_infer_cache)} cached predictions from disk")
+        return _fb_infer_cache
+    predictor = _get_fb_predictor()
+    if predictor is None:
+        _fb_infer_cache = []
+        return _fb_infer_cache
+    print("[FB infer] Running inference over all annotated shots (TTA=5)…")
+    results = predictor.run_fb_inference(
+        json_path=_FB_EN_ANN,
+        skel_dir=GDINO_SKEL_DIR,
+        shuttle_dir=SHUTTLE_DIR,
+        img_dir=None,
+        default_homography=None,  # FB H uses different origin — skip to avoid bad L3 features
+        tta=5,                    # test-time augmentation: 5 passes, averaged softmax
+    )
+    _FB_INFER_CACHE_PATH.parent.mkdir(exist_ok=True)
+    _FB_INFER_CACHE_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    _fb_infer_cache = results
+    print(f"[FB infer] Done — {len(results)} predictions cached to {_FB_INFER_CACHE_PATH.name}")
+    return _fb_infer_cache
 
 
 def _write_data_table(ss_matches: list[dict]) -> None:

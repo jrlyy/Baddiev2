@@ -48,12 +48,10 @@ _VOCAB = {
         'block', 'lob_lift', 'defensive_lift', 'cross_net', 'net_shot',
         'smash_defense', 'push',
     ],
-    18: [                       # run6 (May 2025)
+    15: [                       # run6 (May 2025) — 17 classes with drive subtypes merged
         'net shot', 'return net', 'smash', 'wrist smash', 'lob',
-        'defensive return lob', 'clear', 'drive', 'driven flight',
-        'back-court drive', 'drop', 'passive drop', 'push', 'rush',
-        'defensive return drive', 'cross-court net shot',
-        'short service', 'long service',
+        'defensive return lob', 'clear', 'drive', 'drop', 'passive drop',
+        'push', 'rush', 'cross-court net shot', 'short service', 'long service',
     ],
 }
 
@@ -74,7 +72,7 @@ _FB_LABEL_MAP = {
         'net kill':             'push_rush',
         'cross-court net shot': 'cross_net',
     },
-    18: {   # run6 vocab
+    15: {   # run6 vocab (15 classes)
         'serve':                'short service',
         'kill':                 'smash',
         'clear':                'clear',
@@ -229,30 +227,47 @@ def _compute_9dim_l2(skeleton, homography=None):
 
 
 def _slice_window(arr_2tv, center, window=_SHOT_WINDOW):
-    """Slice (2, T_rally, V) → (2, window, V) centred on center; zero-pads at edges."""
+    """
+    Slice (2, T_rally, V) → (2, window, V) centred on center.
+
+    Matches SS training behaviour: when the centre is near a rally boundary, the
+    window is *shifted* to fit within [0, T_rally] rather than zero-padded. This
+    avoids dead leading frames for first-shot-of-rally cases (e.g. serves).
+    Zero-padding is only used if the rally itself is shorter than `window`.
+    """
     _, T, V = arr_2tv.shape
     half    = window // 2
-    out     = np.zeros((2, window, V), dtype=np.float32)
-    src_lo  = max(0, center - half)
-    src_hi  = min(T, center - half + window)
-    dst_lo  = src_lo - (center - half)
-    out[:, dst_lo: dst_lo + (src_hi - src_lo)] = arr_2tv[:, src_lo:src_hi]
-    return out
+    start   = max(0, center - half)
+    end     = start + window
+    if end > T:
+        end   = T
+        start = max(0, end - window)
+    segment = arr_2tv[:, start:end, :]
+    if segment.shape[1] < window:
+        out = np.zeros((2, window, V), dtype=np.float32)
+        out[:, : segment.shape[1]] = segment
+        return out
+    return segment.astype(np.float32, copy=True)
 
 
 def _slice_shuttle(arr_t3, center, window=_SHOT_WINDOW):
-    """Slice (T_rally, 3) shuttle → (window, 2) [x,y]; zeros where vis=0 or out of range."""
+    """
+    Slice (T_rally, 3) shuttle → (window, 2) [x,y]; mirrors _slice_window
+    boundary behaviour. Frames with vis=0 are zeroed.
+    """
     T    = arr_t3.shape[0]
     half = window // 2
-    out  = np.zeros((window, 2), dtype=np.float32)
-    src_lo = max(0, center - half)
-    src_hi = min(T, center - half + window)
-    dst_lo = src_lo - (center - half)
-    n      = src_hi - src_lo
-    xy     = arr_t3[src_lo:src_hi, :2].astype(np.float32)
-    vis    = arr_t3[src_lo:src_hi, 2]
+    start = max(0, center - half)
+    end   = start + window
+    if end > T:
+        end   = T
+        start = max(0, end - window)
+    out = np.zeros((window, 2), dtype=np.float32)
+    n   = end - start
+    xy  = arr_t3[start:end, :2].astype(np.float32)
+    vis = arr_t3[start:end, 2]
     xy[vis == 0] = 0.0
-    out[dst_lo: dst_lo + n] = xy
+    out[: n] = xy
     return out
 
 
@@ -375,8 +390,8 @@ class ShotTypePredictor:
     def __init__(self, checkpoint_path=None, roboflow_api_key=None, device=None):
         """
         Args:
-            checkpoint_path:  path to .pt file; defaults to the best run4 model
-                              models/ablation_C3_shuttle_crossattn.pt
+            checkpoint_path:  path to .pt file; defaults to run6 best model
+                              models/run 6/D4_mlp_bn.pt
             roboflow_api_key: API key for automatic court homography estimation.
                               Pass None to skip (L2 court features stay in pixel space).
             device:           torch device; auto-detected if None.
@@ -387,7 +402,7 @@ class ShotTypePredictor:
             'cpu'
         )
         ckpt_path = Path(checkpoint_path or
-                         (PROJECT_ROOT / 'models' / 'ablation_C3_shuttle_crossattn.pt'))
+                         (PROJECT_ROOT / 'models' / 'run6' / 'D4_mlp_bn.pt'))
         self._load_model(ckpt_path)
 
         self._rf_client     = None
@@ -407,13 +422,37 @@ class ShotTypePredictor:
     def _load_model(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        enc_sd  = ckpt['encoder_state_dict']
-        head_sd = ckpt['head_state_dict']
+        # Support run6 key format (enc/head/ca) and run4 (encoder_state_dict/...)
+        enc_sd  = ckpt.get('enc') or ckpt['encoder_state_dict']
+        head_sd = ckpt.get('head') or ckpt['head_state_dict']
+        ca_sd   = ckpt.get('ca') or ckpt.get('cross_attn_state_dict')
 
-        # Auto-detect architecture from saved weights
-        self.in_channels  = int(enc_sd['layers.0.spatial.conv.weight'].shape[1])
-        self.num_classes  = int(head_sd['weight'].shape[0])
-        self.has_cross_attn = 'cross_attn_state_dict' in ckpt
+        # num_nodes from adjacency matrix (17 = single-player, 34 = dual-player)
+        num_nodes = int(enc_sd['layers.0.spatial.A'].shape[1])
+
+        # in_channels: run6 stores bn_input shape = in_ch * num_nodes
+        if 'bn_input.weight' in enc_sd:
+            self.in_channels = int(enc_sd['bn_input.weight'].shape[0]) // num_nodes
+        else:
+            self.in_channels = int(enc_sd['layers.0.spatial.conv.weight'].shape[1])
+
+        # num_classes: D4 MLP-BN head uses key '4.weight'; linear head uses 'weight'
+        if '4.weight' in head_sd:
+            self.num_classes = int(head_sd['4.weight'].shape[0])
+            self._head_type  = 'mlp_bn'
+        else:
+            self.num_classes = int(head_sd['weight'].shape[0])
+            self._head_type  = 'linear'
+
+        self.has_cross_attn = ca_sd is not None
+
+        # shuttle TCN input channels: run6=2 (raw x,y), run4=4 (pre-normalised x,y,dx,dy)
+        if ca_sd is not None:
+            first_conv = next(v for k, v in ca_sd.items() if 'shuttle_tcn' in k and 'weight' in k and v.dim() == 3)
+            self.shuttle_in_ch = int(first_conv.shape[1])
+        else:
+            self.shuttle_in_ch = 4
+
         pooling = 'attn' if 'temporal_attn.weight' in enc_sd else 'mean'
 
         self.shot_types = _VOCAB.get(
@@ -422,12 +461,13 @@ class ShotTypePredictor:
         )
         self._label_map = _FB_LABEL_MAP.get(self.num_classes, {})
 
-        graph = GraphBuilder()
+        single_player = (num_nodes == NUM_JOINTS)
+        graph = GraphBuilder(single_player=single_player)
         adj   = graph.build_adjacency().to(self.device)
 
         self.encoder = STGCN(
             in_channels=self.in_channels,
-            num_nodes=NUM_NODES,
+            num_nodes=num_nodes,
             adjacency=adj,
             num_layers=9, base_channels=64,
             embedding_dim=256, temporal_kernel=9, dropout=0.3,
@@ -437,21 +477,28 @@ class ShotTypePredictor:
 
         self.cross_attn = None
         if self.has_cross_attn:
-            # Run4 training patched shuttle_tcn to in_channels=4 (x,y,dx,dy).
-            # The _norm_scale buffer was also not yet in the checkpoint (added later).
-            # We load strict=False and override _norm_scale to a no-op so the
-            # pre-normalised (4-ch) shuttle tensors pass through unchanged.
             from .models.shuttle_cross_attn import ShuttleTCN
             ca = ShuttleCrossAttention(d_skel=256, d_shuttle=128, nhead=4).to(self.device)
-            ca.shuttle_tcn = ShuttleTCN(in_channels=4, d_model=128).to(self.device)
-            ca.load_state_dict(ckpt['cross_attn_state_dict'], strict=False)
-            # _norm_scale may have been created as (1,2,1); resize to (1,4,1) ones
-            # so the division in forward() is a no-op for any number of channels.
-            ca._norm_scale = torch.ones(1, 4, 1, device=self.device)
+            if self.shuttle_in_ch != 2:
+                # run4: TCN was patched to 4-channel pre-normalised input
+                ca.shuttle_tcn = ShuttleTCN(in_channels=self.shuttle_in_ch, d_model=128).to(self.device)
+                ca.load_state_dict(ca_sd, strict=False)
+                ca._norm_scale = torch.ones(1, self.shuttle_in_ch, 1, device=self.device)
+            else:
+                ca.load_state_dict(ca_sd, strict=True)
             ca.eval()
             self.cross_attn = ca
 
-        self.head = nn.Linear(256, self.num_classes).to(self.device)
+        if self._head_type == 'mlp_bn':
+            self.head = nn.Sequential(
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, self.num_classes),
+            ).to(self.device)
+        else:
+            self.head = nn.Linear(256, self.num_classes).to(self.device)
         self.head.load_state_dict(head_sd)
 
         self.encoder.eval()
@@ -461,38 +508,54 @@ class ShotTypePredictor:
             f"Loaded {ckpt_path.name}  "
             f"[acc={ckpt.get('accuracy', 0):.3f}  f1={ckpt.get('macro_f1', 0):.3f}]  "
             f"in_ch={self.in_channels}  classes={self.num_classes}  "
-            f"cross_attn={self.has_cross_attn}  pooling={pooling}  "
-            f"device={self.device}"
+            f"cross_attn={self.has_cross_attn}  shuttle_in_ch={self.shuttle_in_ch}  "
+            f"head={self._head_type}  pooling={pooling}  device={self.device}"
         )
 
     # ── single-shot prediction ────────────────────────────────────────────────
 
-    def predict_shot(self, skeleton_window, shuttle_window, homography=None):
+    def predict_shot(self, skeleton_window, shuttle_window, homography=None,
+                     hitter='top', img_w=_SS_W, img_h=_SS_H, tta=1):
         """
         Predict shot type for a single pre-sliced window.
 
         Args:
-            skeleton_window: (2, T, 34) numpy array — raw pixel coords
+            skeleton_window: (2, T, 34) numpy array — raw pixel coords (always dual-player)
             shuttle_window:  (T, 2) numpy array — [x, y]; zeros = not visible
             homography:      optional (3, 3) pixel→metres transform
+            hitter:          'top' or 'bottom' — used by single-player models to select
+                             the hitter's 17 joints after feature computation
+            img_w, img_h:    source frame resolution; shuttle coords are rescaled to the
+                             model's training resolution (1920×1080) before the CA's
+                             internal _norm_scale divides them
+            tta:             test-time augmentation passes (1 = no TTA). For tta>1, runs
+                             the original plus (tta-1) augmented versions (small coord
+                             jitter + temporal frame shift) and averages softmax probs.
 
         Returns:
             dict: predicted (str), confidence (float), top5 (list of (str, float))
         """
-        feat = _compute_features(skeleton_window, self.in_channels, homography)
-        x    = torch.tensor(feat, dtype=torch.float32).unsqueeze(0).to(self.device)
+        rng    = np.random.RandomState(42)   # fixed seed for reproducible TTA
+        probs_sum = None
 
-        with torch.no_grad():
-            emb = self.encoder(x)
+        for t in range(max(1, tta)):
+            sk = skeleton_window
+            if t > 0:
+                # Coordinate jitter (~3px at SS resolution; scaled for FB if relevant)
+                jitter_sigma = 3.0 * (img_w / _SS_W)
+                sk = sk + rng.normal(0, jitter_sigma, sk.shape).astype(np.float32)
+                # Temporal frame shift by ±1-2 frames (zero-fills boundaries)
+                shift = int(rng.choice([-2, -1, 1, 2]))
+                sk    = np.roll(sk, shift, axis=1)
+                if shift > 0:
+                    sk[:, :shift] = 0
+                elif shift < 0:
+                    sk[:, shift:] = 0
 
-            if self.has_cross_attn and shuttle_window is not None:
-                sh = _build_shuttle_tensor(shuttle_window, img_w=_FB_W, img_h=_FB_H)
-                sh = torch.tensor(sh, dtype=torch.float32).unsqueeze(0).to(self.device)
-                emb = self.cross_attn(emb, sh)
+            probs = self._forward(sk, shuttle_window, homography, hitter, img_w, img_h)
+            probs_sum = probs if probs_sum is None else probs_sum + probs
 
-            logits = self.head(emb)[0]
-            probs  = torch.softmax(logits, dim=0).cpu().numpy()
-
+        probs = probs_sum / max(1, tta)
         order = probs.argsort()[::-1]
         return {
             'predicted':  self.shot_types[int(order[0])],
@@ -500,18 +563,47 @@ class ShotTypePredictor:
             'top5':       [(self.shot_types[int(i)], float(probs[i])) for i in order[:5]],
         }
 
+    def _forward(self, skeleton_window, shuttle_window, homography, hitter, img_w, img_h):
+        """Single forward pass; returns softmax probs as numpy (num_classes,)."""
+        feat = _compute_features(skeleton_window, self.in_channels, homography)
+        # Single-player model: features computed on full 34 joints (preserving opponent
+        # distances in L3), then slice to hitter's 17 joints
+        if feat.shape[2] == NUM_NODES and self.encoder.layers[0].spatial.A.shape[1] == NUM_JOINTS:
+            j_start = NUM_JOINTS if hitter == 'bottom' else 0
+            feat    = feat[:, :, j_start: j_start + NUM_JOINTS]
+        x = torch.tensor(feat, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            emb = self.encoder(x)
+            if self.has_cross_attn and shuttle_window is not None:
+                if self.shuttle_in_ch == 2:
+                    sh_xy = shuttle_window.astype(np.float32).copy()
+                    sh_xy[:, 0] *= _SS_W / img_w
+                    sh_xy[:, 1] *= _SS_H / img_h
+                    sh = torch.tensor(sh_xy.T, dtype=torch.float32).unsqueeze(0).to(self.device)
+                else:
+                    sh = _build_shuttle_tensor(shuttle_window, img_w=img_w, img_h=img_h)
+                    sh = torch.tensor(sh, dtype=torch.float32).unsqueeze(0).to(self.device)
+                emb = self.cross_attn(emb, sh)
+            logits = self.head(emb)[0]
+            return torch.softmax(logits, dim=0).cpu().numpy()
+
     # ── full FB inference pipeline ────────────────────────────────────────────
 
-    def run_fb_inference(self, json_path, skel_dir, shuttle_dir, img_dir=None):
+    def run_fb_inference(self, json_path, skel_dir, shuttle_dir, img_dir=None,
+                         default_homography=None, tta=1):
         """
         Run inference over all annotated shots in a FineBadminton JSON.
 
         Args:
-            json_path:   path to transformed_combined_rounds_zh.json
-            skel_dir:    directory of per-rally skeleton .npy  shape (2, T, 34)
-            shuttle_dir: directory of per-rally shuttle .npy   shape (T, 3)
-            img_dir:     directory of reference .jpg frames for homography.
-                         Pass None to skip homography estimation.
+            json_path:           path to transformed_combined_rounds_zh.json
+            skel_dir:            directory of per-rally skeleton .npy  shape (2, T, 34)
+            shuttle_dir:         directory of per-rally shuttle .npy   shape (T, 3)
+            img_dir:             directory of reference .jpg frames for Roboflow homography.
+                                 Pass None to skip Roboflow estimation.
+            default_homography:  pre-computed (3,3) pixel→metres H used for all matches
+                                 when Roboflow estimation is skipped. If None and img_dir
+                                 is None, L2/L3 court features run in pixel space.
 
         Returns:
             list of dicts, one per annotated shot:
@@ -538,7 +630,9 @@ class ShotTypePredictor:
                 continue
 
             match_id = rally_id.rsplit('_', 1)[0]
-            H        = self._get_homography(match_id, img_dir)
+            H = self._get_homography(match_id, img_dir)
+            if H is None:
+                H = default_homography
 
             skeleton = np.load(skel_p)
             shuttle  = np.load(shut_p) if shut_p.exists() else None
@@ -548,7 +642,16 @@ class ShotTypePredictor:
             shut_win = _slice_shuttle(shuttle, lf) if shuttle is not None \
                        else np.zeros((_SHOT_WINDOW, 2), dtype=np.float32)
 
-            pred = self.predict_shot(skel_win, shut_win, H)
+            # Rescale FB (1280×720) pixel coords to SS training resolution (1920×1080)
+            # so all pixel-space features (L0 coords, L1 velocity, L2 distances) are
+            # in the same range the model saw during training.
+            scale    = _SS_W / _FB_W          # 1.5
+            skel_win = skel_win * scale
+            shut_win = shut_win * scale
+
+            pred = self.predict_shot(skel_win, shut_win, H,
+                                     hitter=shot.get('hitter', 'top'),
+                                     img_w=_SS_W, img_h=_SS_H, tta=tta)
             pred.update({
                 'rally_id':    rally_id,
                 'hit_frame':   shot['hit_frame'],
