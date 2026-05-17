@@ -74,7 +74,7 @@ if not _SS_H_DICT:
 # ─── ShuttleSet paths ─────────────────────────────────────────────────────────
 SS_PREPROCESS      = ROOT / "datasets_preprocessing"
 SS_FRAMES_DIR      = SS_PREPROCESS / "shuttleset_frames"
-SS_SKEL_DIR        = SS_PREPROCESS / "shuttleset_skeletons"
+SS_SKEL_DIR        = SS_PREPROCESS / "shuttleset_skeletons_yolo"
 SS_SKEL_GDINO_DIR  = SS_PREPROCESS / "shuttleset_skeletons_gdino"
 SS_OUTPUTS_DIR     = SS_PREPROCESS / "shuttleset_outputs"   # legacy JSON (unused now)
 SS_SHUTTLE_DIR     = SS_PREPROCESS / "shuttleset_shuttles"  # TrackNetV4 detections
@@ -511,30 +511,13 @@ def _get_ss_gdino_fn_index(match_name: str) -> dict[int, int]:
 
 def get_ss_skeleton_frame(match_name: str, rally: int, ball_round: int,
                           frame_num: int | None = None) -> list | None:
-    """Return GDINO skeleton at the hit frame. No reordering — P0=top, P1=bottom always.
-    Hitter identity is communicated separately so the UI can color them."""
-    if frame_num is None:
+    """Return per-shot YOLO skeleton at the hit frame.
+    Per-shot files are (2, 16, 34); hit sits at index T//2.
+    P0=top, P1=bottom; no reordering."""
+    sk = load_ss_skeleton(match_name, rally, ball_round)
+    if sk is None:
         return None
-    fn_idx = _get_ss_gdino_fn_index(match_name)
-    if not fn_idx:
-        return None
-    data = _load_ss_gdino_match(match_name)
-    if data is None:
-        return None
-    sk, _ = data
-    # Find exact frame or nearest within ±4 (stride tolerance)
-    t = fn_idx.get(frame_num)
-    if t is None:
-        for offset in range(1, 5):
-            for candidate in (frame_num - offset, frame_num + offset):
-                if candidate in fn_idx:
-                    t = fn_idx[candidate]
-                    break
-            if t is not None:
-                break
-    if t is None:
-        return None
-    return _npy_to_players(sk, t)
+    return _npy_to_players(sk, sk.shape[1] // 2)
 
 def _load_ss_skel_gdino_pershot(match_name: str, rally: int, ball_round: int) -> np.ndarray | None:
     """Load old per-shot (2, 16, 34) GDINO skeleton for fallback."""

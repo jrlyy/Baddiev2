@@ -5,6 +5,7 @@ project/checkpoints/
 *.pt
 *.pth
 *.mp4
+!presentation/*.mp4
 *.avi
 __pycache__/
 .ipynb_checkpoints/
@@ -19,6 +20,3 @@ project/datasets_preprocessing/finebadminton_skeletons_gdino_v2/
 project/datasets_preprocessing/shuttleset_shuttles/
 project/utility/
 project/baddiev2_colab.zip
-
-# Presentation MP4s (large)
-presentation/*.mp4

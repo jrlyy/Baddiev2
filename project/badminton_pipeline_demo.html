@@ -1691,6 +1691,7 @@ function SSBrowser() {
   const [matchShots,   setMatchShots]   = useState([]);
   const [shotsLoading, setShotsLoading] = useState(false);
   const [splitFilter,  setSplitFilter]  = useState('all'); // 'all' | 'train' | 'test' | 'held_out'
+  const [skelMode,     setSkelMode]     = useState('gdino'); // 'original' | 'gdino'
   // Fetch match summaries once
   useEffect(() => {
     fetch(`${SERVER}/api/ss/matches`, { signal: AbortSignal.timeout(5000) })
@@ -1972,8 +1973,37 @@ function SSBrowser() {
           })()}
           {currentShot ? (
             <>
+              {/* ── Skeleton source toggle (YOLOv8 vs GDINO) ── */}
+              {(() => {
+                const matchInfo = ssMatches && ssMatches.find(x => x.match === selMatch);
+                const hasGdino  = matchInfo?.has_gdino;
+                return (
+                  <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:6}}>
+                    <span style={{fontSize:9,color:'#475569',fontFamily:M}}>Skeleton:</span>
+                    {['original','gdino'].map(mode => {
+                      const disabled = mode==='gdino' && !hasGdino;
+                      const active   = skelMode===mode;
+                      return (
+                        <button key={mode} onClick={()=>!disabled&&setSkelMode(mode)}
+                          style={{padding:'3px 9px',borderRadius:4,fontSize:9,fontFamily:M,
+                            cursor:disabled?'not-allowed':'pointer',border:'none',
+                            background:active?'#3b82f6':'#1e293b',
+                            color:active?'#fff':disabled?'#2d3748':'#94a3b8',
+                            opacity:disabled?0.4:1,fontWeight:active?600:400}}>
+                          {mode==='original'?'YOLOv8':'GDINO'}
+                        </button>
+                      );
+                    })}
+                    {!hasGdino && (
+                      <span style={{fontSize:8,color:'#64748b',fontFamily:M,marginLeft:4}}>
+                        (GDINO not extracted for this match)
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
               <div style={{display:'flex',gap:10,alignItems:'flex-start'}}>
-                <SSFrameCanvas shot={currentShot} frameNum={scrubFrame} rallyShots={rallyShots} skelMode='gdino' width={760} height={427}/>
+                <SSFrameCanvas shot={currentShot} frameNum={scrubFrame} rallyShots={rallyShots} skelMode={skelMode} width={760} height={427}/>
                 <CourtBirdseyePanel
                   shot={currentShot}
                   frameNum={scrubFrame}
