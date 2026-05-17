@@ -1414,8 +1414,9 @@ _fb_predictor      = None
 _fb_infer_cache: list[dict] | None = None
 _FB_INFER_CACHE_PATH = ROOT / "results" / "fb_inference.json"
 _FB_EN_ANN = ROOT / "Datasets" / "FineBadminton-dataset" / "dataset" / "transformed_combined_rounds_output_en_evals_translated.json"
-# Prefer run6 D4 (best single-split); fall back to run6 C3 (cross-validation model)
+# Prefer run7 C3 (best single-player L3+bones+shuttle xattn); fall back to run6.
 _FB_CKPT_CANDIDATES = [
+    ROOT / "models" / "run7" / "C3_shuttle_xattn.pt",
     ROOT / "models" / "run6" / "D4_mlp_bn.pt",
     ROOT / "models" / "run6" / "C3_shuttle_xattn.pt",
     ROOT / "models" / "ablation_C3_shuttle_crossattn.pt",

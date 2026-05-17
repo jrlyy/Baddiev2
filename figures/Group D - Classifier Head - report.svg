@@ -1,0 +1,48 @@
+<svg width="100%" viewBox="0 0 1080 172" role="img" xmlns="http://www.w3.org/2000/svg"
+     style="font-family:'Anthropic Sans', -apple-system, 'system-ui', 'Segoe UI', sans-serif">
+<title>Classifier head architectures</title>
+<desc>Four classifier heads shown as layer stacks joined by fan shapes: linear, one hidden layer, two hidden layers narrowing to 64, and a wide hidden layer with batch norm and dropout.</desc>
+
+<text x="148.5" y="20" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1A1A2E">(a) Linear · 256→15</text>
+<polygon points="73.5,64 223.5,64 165.5,88 131.5,88" fill="#E4EBE7"/>
+<rect x="73.5" y="46" width="150" height="18" rx="4" fill="#ECEAF7" stroke="#9B93D4" stroke-width="1.2"/>
+<text x="148.5" y="59" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">256</text>
+<rect x="131.5" y="88" width="34" height="18" rx="4" fill="#534AB7"/>
+<text x="148.5" y="101" text-anchor="middle" font-size="9.5" font-weight="700" fill="#FFFFFF">15</text>
+
+<text x="409.5" y="20" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1A1A2E">(b) MLP-1 · 256→128→15</text>
+<polygon points="334.5,64 484.5,64 453.5,84 365.5,84" fill="#E4EBE7"/>
+<polygon points="365.5,102 453.5,102 426.5,122 392.5,122" fill="#E4EBE7"/>
+<rect x="334.5" y="46" width="150" height="18" rx="4" fill="#ECEAF7" stroke="#9B93D4" stroke-width="1.2"/>
+<text x="409.5" y="59" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">256</text>
+<rect x="365.5" y="84" width="88" height="18" rx="4" fill="#F0F4F1" stroke="#B9C9BF" stroke-width="1.2"/>
+<text x="409.5" y="97" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">128</text>
+<rect x="392.5" y="122" width="34" height="18" rx="4" fill="#534AB7"/>
+<text x="409.5" y="135" text-anchor="middle" font-size="9.5" font-weight="700" fill="#FFFFFF">15</text>
+
+<text x="670.5" y="20" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1A1A2E">(c) MLP-2 · 256→128→64→15</text>
+<polygon points="595.5,60 745.5,60 714.5,76 626.5,76" fill="#E4EBE7"/>
+<polygon points="626.5,92 714.5,92 696.5,108 644.5,108" fill="#E4EBE7"/>
+<polygon points="644.5,124 696.5,124 687.5,140 653.5,140" fill="#E4EBE7"/>
+<rect x="595.5" y="44" width="150" height="16" rx="4" fill="#ECEAF7" stroke="#9B93D4" stroke-width="1.2"/>
+<text x="670.5" y="56" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">256</text>
+<rect x="626.5" y="76" width="88" height="16" rx="4" fill="#F0F4F1" stroke="#B9C9BF" stroke-width="1.2"/>
+<text x="670.5" y="88" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">128</text>
+<rect x="644.5" y="108" width="52" height="16" rx="4" fill="#F0F4F1" stroke="#B9C9BF" stroke-width="1.2"/>
+<text x="670.5" y="120" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">64</text>
+<rect x="653.5" y="140" width="34" height="16" rx="4" fill="#534AB7"/>
+<text x="670.5" y="152" text-anchor="middle" font-size="9.5" font-weight="700" fill="#FFFFFF">15</text>
+
+<text x="931.5" y="20" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1A1A2E">(d) MLP-BN · 256→256→15 · winner</text>
+<polygon points="856.5,64 1006.5,64 1006.5,86 856.5,86" fill="#E4EBE7"/>
+<polygon points="856.5,104 1006.5,104 948.5,128 914.5,128" fill="#E4EBE7"/>
+<rect x="856.5" y="46" width="150" height="18" rx="4" fill="#ECEAF7" stroke="#9B93D4" stroke-width="1.2"/>
+<text x="931.5" y="59" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">256</text>
+<rect x="856.5" y="86" width="150" height="18" rx="4" fill="#FCEFD9" stroke="#E8B766" stroke-width="1.4"/>
+<text x="931.5" y="99" text-anchor="middle" font-size="9.5" font-weight="600" fill="#3D3D3A">256</text>
+<text x="851" y="94" text-anchor="end" font-size="8.5" font-weight="600" fill="#BA7517">+ BN</text>
+<text x="851" y="105" text-anchor="end" font-size="8.5" font-weight="600" fill="#BA7517">+ dropout</text>
+<rect x="914.5" y="128" width="34" height="18" rx="4" fill="#534AB7"/>
+<text x="931.5" y="141" text-anchor="middle" font-size="9.5" font-weight="700" fill="#FFFFFF">15</text>
+
+</svg>

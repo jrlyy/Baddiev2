@@ -1,0 +1,139 @@
+<svg width="100%" viewBox="0 0 1620 570" role="img" xmlns="http://www.w3.org/2000/svg"
+     style="font-family:'Anthropic Sans', -apple-system, 'system-ui', 'Segoe UI', sans-serif">
+<title>Group B — Shot Window Selection (slides)</title>
+<desc>Slides version of the temporal window strategies figure: fixed ±16 frame window vs variable hit-to-hit window resampled to T = 32.</desc>
+
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+
+  <g id="s-player-prep">
+    <circle cx="0" cy="0" r="9" fill="currentColor"/>
+    <line x1="0" y1="9" x2="0" y2="42" stroke="currentColor" stroke-width="3"/>
+    <line x1="0" y1="21" x2="-12" y2="33" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="21" x2="15" y2="9"  stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="-9" y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="9"  y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="15" y1="9" x2="21" y2="-6" stroke="currentColor" stroke-width="1.4"/>
+    <ellipse cx="21" cy="-11" rx="6" ry="4.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </g>
+  <g id="s-player-hit">
+    <circle cx="0" cy="0" r="9" fill="currentColor"/>
+    <line x1="0" y1="9" x2="0" y2="42" stroke="currentColor" stroke-width="3"/>
+    <line x1="0" y1="21" x2="-13" y2="36" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="21" x2="9" y2="-3" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="-12" y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="12" y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="9" y1="-3" x2="15" y2="-18" stroke="currentColor" stroke-width="1.4"/>
+    <ellipse cx="15" cy="-22" rx="6" ry="4.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </g>
+  <g id="s-player-follow">
+    <circle cx="0" cy="0" r="9" fill="currentColor"/>
+    <line x1="0" y1="9" x2="0" y2="42" stroke="currentColor" stroke-width="3"/>
+    <line x1="0" y1="21" x2="-15" y2="9" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="21" x2="13" y2="33" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="-9" y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="0" y1="42" x2="9"  y2="63" stroke="currentColor" stroke-width="2.2"/>
+    <line x1="-15" y1="9" x2="-21" y2="-3" stroke="currentColor" stroke-width="1.4"/>
+    <ellipse cx="-21" cy="-7" rx="6" ry="4.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </g>
+</defs>
+
+<!-- ===== Header ===== -->
+<text x="810" y="42" text-anchor="middle" font-size="26" font-weight="700" fill="#1A1A2E">Group B — Shot Window Selection</text>
+<text x="810" y="72" text-anchor="middle" font-size="15" font-style="italic" fill="#6B6B66">Choosing the temporal window around each hit: fixed crop vs rally-relative span resampled to T = 32</text>
+
+<!-- ===== Card (a) Fixed window ===== -->
+<rect x="40" y="100" width="760" height="430" rx="18" fill="#E4ECE5" stroke="#9DB0A4" stroke-width="1"/>
+
+<!-- title pill -->
+<rect x="68" y="116" width="220" height="34" rx="10" fill="#FFFFFF" stroke="#9DB0A4" stroke-width="1"/>
+<text x="178" y="139" text-anchor="middle" font-size="15" font-weight="700" fill="#1A1A2E">(a) Fixed window</text>
+
+<!-- player figures: prep / contact / follow-through -->
+<g color="#534AB7"><use href="#s-player-prep" transform="translate(180,200)"/></g>
+<text x="180" y="290" text-anchor="middle" font-size="13" fill="#534AB7">prep</text>
+
+<g color="#993C1D"><use href="#s-player-hit" transform="translate(420,193)"/></g>
+<text x="420" y="290" text-anchor="middle" font-size="13" font-weight="700" fill="#993C1D">contact</text>
+
+<g color="#534AB7"><use href="#s-player-follow" transform="translate(660,200)"/></g>
+<text x="660" y="290" text-anchor="middle" font-size="13" fill="#534AB7">follow-through</text>
+
+<!-- T = 32 brace -->
+<path d="M180 330 Q180 322 188 322 L405 322 Q413 322 413 314 Q413 322 421 322 L652 322 Q660 322 660 330"
+      fill="none" stroke="#7A8C81" stroke-width="1.2"/>
+<rect x="350" y="307" width="140" height="18" fill="#E4ECE5"/>
+<text x="420" y="320" text-anchor="middle" font-size="14" fill="#4F5C53">T = 32 frames</text>
+
+<!-- timeline bar -->
+<rect x="180" y="345" width="480" height="11" rx="3" fill="#3F4744"/>
+<line x1="180" y1="338" x2="180" y2="364" stroke="#3F4744" stroke-width="2"/>
+<line x1="420" y1="338" x2="420" y2="364" stroke="#3F4744" stroke-width="2"/>
+<line x1="660" y1="338" x2="660" y2="364" stroke="#3F4744" stroke-width="2"/>
+
+<!-- frame labels -->
+<text x="180" y="385" text-anchor="middle" font-size="14" fill="#4F5C53">h − 16</text>
+<text x="420" y="385" text-anchor="middle" font-size="14" font-weight="700" fill="#1A1A2E">h (hit)</text>
+<text x="660" y="385" text-anchor="middle" font-size="14" fill="#4F5C53">h + 16</text>
+
+<!-- hit frame arrow -->
+<line x1="420" y1="425" x2="420" y2="400" stroke="#993C1D" stroke-width="2.2" marker-end="url(#arr)"/>
+<text x="420" y="442" text-anchor="middle" font-size="13" fill="#993C1D">hit frame</text>
+
+<!-- card footer text -->
+<text x="420" y="488" text-anchor="middle" font-size="17" font-weight="700" fill="#1A1A2E">symmetric crop, fixed length</text>
+<text x="420" y="512" text-anchor="middle" font-size="14" font-style="italic" fill="#6B6B66">phase-aligned across shots — simple, no resampling</text>
+
+<!-- ===== Card (b) Variable window ===== -->
+<rect x="820" y="100" width="760" height="430" rx="18" fill="#E4ECE5" stroke="#9DB0A4" stroke-width="1"/>
+
+<!-- title pill -->
+<rect x="848" y="116" width="240" height="34" rx="10" fill="#FFFFFF" stroke="#9DB0A4" stroke-width="1"/>
+<text x="968" y="139" text-anchor="middle" font-size="15" font-weight="700" fill="#1A1A2E">(b) Variable window</text>
+
+<!-- incoming / outgoing shot labels -->
+<text x="1080" y="180" text-anchor="middle" font-size="12" font-style="italic" fill="#BA7517">incoming shot</text>
+<text x="1340" y="180" text-anchor="middle" font-size="12" font-style="italic" fill="#BA7517">outgoing shot</text>
+
+<!-- shuttle arcs (dashed orange) -->
+<path d="M960 215 Q1080 165 1200 200" fill="none" stroke="#EF9F27" stroke-width="2" stroke-dasharray="6 4"/>
+<path d="M1200 200 Q1340 165 1460 215" fill="none" stroke="#EF9F27" stroke-width="2" stroke-dasharray="6 4"/>
+
+<!-- player figures -->
+<g color="#993C1D"><use href="#s-player-hit" transform="translate(960,210)"/></g>
+<text x="960" y="290" text-anchor="middle" font-size="13" fill="#993C1D">opponent hits</text>
+
+<g color="#2D8F8A"><use href="#s-player-hit" transform="translate(1200,200)"/></g>
+<text x="1200" y="290" text-anchor="middle" font-size="13" font-weight="700" fill="#2D8F8A">our hit</text>
+
+<g color="#993C1D"><use href="#s-player-follow" transform="translate(1460,210)"/></g>
+<text x="1460" y="290" text-anchor="middle" font-size="13" fill="#993C1D">opp. returns</text>
+
+<!-- full duration brace -->
+<path d="M960 330 Q960 322 968 322 L1185 322 Q1193 322 1193 314 Q1193 322 1201 322 L1452 322 Q1460 322 1460 330"
+      fill="none" stroke="#7A8C81" stroke-width="1.2"/>
+<rect x="1010" y="307" width="380" height="18" fill="#E4ECE5"/>
+<text x="1200" y="320" text-anchor="middle" font-size="14" fill="#4F5C53">full shot duration → resampled to T = 32</text>
+
+<!-- timeline bar -->
+<rect x="960" y="345" width="500" height="11" rx="3" fill="#3F4744"/>
+<line x1="960" y1="338" x2="960" y2="364" stroke="#3F4744" stroke-width="2"/>
+<line x1="1200" y1="338" x2="1200" y2="364" stroke="#3F4744" stroke-width="2"/>
+<line x1="1460" y1="338" x2="1460" y2="364" stroke="#3F4744" stroke-width="2"/>
+
+<!-- frame labels -->
+<text x="960" y="385" text-anchor="middle" font-size="14" fill="#4F5C53">h(prev)</text>
+<text x="1200" y="385" text-anchor="middle" font-size="14" font-weight="700" fill="#1A1A2E">h (hit)</text>
+<text x="1460" y="385" text-anchor="middle" font-size="14" fill="#4F5C53">h(next)</text>
+
+<!-- hit frame arrow -->
+<line x1="1200" y1="425" x2="1200" y2="400" stroke="#2D8F8A" stroke-width="2.2" marker-end="url(#arr)"/>
+<text x="1200" y="442" text-anchor="middle" font-size="13" fill="#2D8F8A">hit frame</text>
+
+<!-- card footer text -->
+<text x="1200" y="488" text-anchor="middle" font-size="17" font-weight="700" fill="#1A1A2E">rally-relative crop, variable length</text>
+<text x="1200" y="512" text-anchor="middle" font-size="14" font-style="italic" fill="#6B6B66">preserves shot-cycle context — duration encodes shot type</text>
+
+</svg>

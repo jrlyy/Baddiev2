@@ -3,12 +3,13 @@ Shot type inference on unseen FineBadminton rallies.
 
 Loads any ablation checkpoint and auto-detects its architecture (in_channels,
 num_classes, pooling, cross-attention) from the saved weights.  Works with
-run4 checkpoints (17 cls, 9-dim L2) and run6 checkpoints (18 cls, 10-dim L2)
-without any manual configuration.
+run4 checkpoints (17 cls, 9-dim L2), run6 (15 cls, 10-dim L2), and run7
+(15 cls, single-player L3+bones=16-dim, shuttle cross-attn) without any
+manual configuration.
 
 Usage:
     predictor = ShotTypePredictor(
-        "models/ablation_C3_shuttle_crossattn.pt",
+        "models/run7/C3_shuttle_xattn.pt",
         roboflow_api_key="...",
     )
     results = predictor.run_fb_inference(
@@ -93,6 +94,15 @@ _FB_LABEL_MAP = {
 _LAYER_BY_BASEDIM = {2: 'L0', 6: 'L1', 9: 'L2_v1', 10: 'L2', 13: 'L3_v1', 14: 'L3'}
 
 _SHOT_WINDOW = 32
+
+# Temporal sampling. SS skeletons were extracted at 30 fps with frame_stride=4
+# → 7.5 effective fps. FineBadminton videos are 25 fps sampled every frame.
+# FB rallies must be subsampled by 25 / 7.5 ≈ 3.33 so velocity/acceleration
+# magnitudes and the 32-frame window's real-time extent match training.
+_FB_FPS            = 25.0
+_SS_FPS            = 30.0
+_SS_FRAME_STRIDE   = 4
+_SS_EFFECTIVE_FPS  = _SS_FPS / _SS_FRAME_STRIDE   # 7.5
 
 # FineBadminton frames: 1280×720; SS training frames: 1920×1080.
 # Shuttle coords are rescaled so the cross-attention _norm_scale matches training.
@@ -226,48 +236,135 @@ def _compute_9dim_l2(skeleton, homography=None):
     return np.concatenate([feats, ctx], axis=0)                 # (9, T, V)
 
 
-def _slice_window(arr_2tv, center, window=_SHOT_WINDOW):
+def _resample_time(skeleton, shuttle, local_hit_frame, factor):
+    """
+    Subsample a rally along the time axis by `factor` so its effective frame
+    rate matches SS training (7.5 fps).
+
+    factor > 1 keeps every `factor`-th frame (nearest-index). The hit frame is
+    re-expressed in the resampled index space.
+
+    Args:
+        skeleton:        (2, T, V) raw pixel coords
+        shuttle:         (T, 3) [x, y, vis] or None
+        local_hit_frame: hit frame index in the original (dense) rally
+        factor:          resample stride (e.g. 25 fps → 7.5 fps ⇒ 3.33)
+
+    Returns:
+        (skeleton_rs, shuttle_rs, local_hit_frame_rs)
+    """
+    if factor is None or factor <= 1.0:
+        return skeleton, shuttle, local_hit_frame
+
+    T = skeleton.shape[1]
+    idx = np.round(np.arange(0, T, factor)).astype(int)
+    idx = idx[idx < T]
+    skeleton_rs = skeleton[:, idx, :]
+
+    shuttle_rs = shuttle
+    if shuttle is not None:
+        sidx = np.round(np.arange(0, shuttle.shape[0], factor)).astype(int)
+        sidx = sidx[sidx < shuttle.shape[0]]
+        shuttle_rs = shuttle[sidx]
+
+    lf_rs = int(round(local_hit_frame / factor))
+    return skeleton_rs, shuttle_rs, lf_rs
+
+
+def _slice_window(arr_2tv, center, window=_SHOT_WINDOW, pad_mode='shift'):
     """
     Slice (2, T_rally, V) → (2, window, V) centred on center.
 
-    Matches SS training behaviour: when the centre is near a rally boundary, the
-    window is *shifted* to fit within [0, T_rally] rather than zero-padded. This
-    avoids dead leading frames for first-shot-of-rally cases (e.g. serves).
-    Zero-padding is only used if the rally itself is shorter than `window`.
+    pad_mode:
+        'shift'  — SS training behaviour: when the centre is near a rally
+                   boundary, shift the window to fit within [0, T_rally]; only
+                   zero-pad if rally < window.
+        'center' — always place the hit at index `window//2`; replicate the
+                   first/last available frame to fill the missing side. Use
+                   this when the rally clip lacks pre-/post-hit context (e.g.
+                   FB serves with local_hit_frame≈0).
     """
     _, T, V = arr_2tv.shape
     half    = window // 2
-    start   = max(0, center - half)
-    end     = start + window
-    if end > T:
-        end   = T
-        start = max(0, end - window)
-    segment = arr_2tv[:, start:end, :]
-    if segment.shape[1] < window:
-        out = np.zeros((2, window, V), dtype=np.float32)
-        out[:, : segment.shape[1]] = segment
-        return out
-    return segment.astype(np.float32, copy=True)
+
+    if pad_mode == 'shift' or T < window:
+        start = max(0, center - half)
+        end   = start + window
+        if end > T:
+            end   = T
+            start = max(0, end - window)
+        segment = arr_2tv[:, start:end, :]
+        if segment.shape[1] < window:
+            out = np.zeros((arr_2tv.shape[0], window, V), dtype=np.float32)
+            out[:, : segment.shape[1]] = segment
+            return out
+        return segment.astype(np.float32, copy=True)
+
+    # pad_mode == 'center': hit always at index `half`; replicate-pad the sides
+    start = center - half
+    end   = center + half
+    src_start = max(0, start)
+    src_end   = min(T, end)
+    dst_start = src_start - start
+    dst_end   = src_end - start
+    out = np.empty((arr_2tv.shape[0], window, V), dtype=np.float32)
+    out[:, dst_start:dst_end, :] = arr_2tv[:, src_start:src_end, :]
+    if dst_start > 0:
+        out[:, :dst_start, :] = arr_2tv[:, src_start:src_start + 1, :]
+    if dst_end < window:
+        out[:, dst_end:, :]   = arr_2tv[:, src_end - 1:src_end, :]
+    return out
 
 
-def _slice_shuttle(arr_t3, center, window=_SHOT_WINDOW):
+def _slice_shuttle(arr_t3, center, window=_SHOT_WINDOW, pad_mode='shift'):
     """
     Slice (T_rally, 3) shuttle → (window, 2) [x,y]; mirrors _slice_window
     boundary behaviour. Frames with vis=0 are zeroed.
+
+    See `_slice_window` for `pad_mode` semantics. In 'center' mode, the
+    first/last *visible* xy is replicated for padding so velocity (dx/dy in
+    the cross-attention TCN) doesn't see a fake teleport at the seam.
     """
     T    = arr_t3.shape[0]
     half = window // 2
-    start = max(0, center - half)
-    end   = start + window
-    if end > T:
-        end   = T
-        start = max(0, end - window)
+
+    if pad_mode == 'shift' or T < window:
+        start = max(0, center - half)
+        end   = start + window
+        if end > T:
+            end   = T
+            start = max(0, end - window)
+        out = np.zeros((window, 2), dtype=np.float32)
+        n   = end - start
+        xy  = arr_t3[start:end, :2].astype(np.float32)
+        vis = arr_t3[start:end, 2]
+        xy[vis == 0] = 0.0
+        out[: n] = xy
+        return out
+
+    # pad_mode == 'center'
+    start = center - half
+    end   = center + half
+    src_start = max(0, start)
+    src_end   = min(T, end)
+    dst_start = src_start - start
+    dst_end   = src_end - start
+
+    xy_src  = arr_t3[src_start:src_end, :2].astype(np.float32).copy()
+    vis_src = arr_t3[src_start:src_end, 2]
+    xy_src[vis_src == 0] = 0.0
+
     out = np.zeros((window, 2), dtype=np.float32)
-    n   = end - start
-    xy  = arr_t3[start:end, :2].astype(np.float32)
-    vis = arr_t3[start:end, 2]
-    xy[vis == 0] = 0.0
-    out[: n] = xy
+    out[dst_start:dst_end] = xy_src
+    if dst_start > 0:
+        # replicate the first visible xy (skip leading zero-vis frames)
+        nz = np.where((xy_src[:, 0] != 0) | (xy_src[:, 1] != 0))[0]
+        if len(nz):
+            out[:dst_start] = xy_src[nz[0]]
+    if dst_end < window:
+        nz = np.where((xy_src[:, 0] != 0) | (xy_src[:, 1] != 0))[0]
+        if len(nz):
+            out[dst_end:] = xy_src[nz[-1]]
     return out
 
 
@@ -390,8 +487,8 @@ class ShotTypePredictor:
     def __init__(self, checkpoint_path=None, roboflow_api_key=None, device=None):
         """
         Args:
-            checkpoint_path:  path to .pt file; defaults to run6 best model
-                              models/run 6/D4_mlp_bn.pt
+            checkpoint_path:  path to .pt file; defaults to run7 best model
+                              models/run7/C3_shuttle_xattn.pt
             roboflow_api_key: API key for automatic court homography estimation.
                               Pass None to skip (L2 court features stay in pixel space).
             device:           torch device; auto-detected if None.
@@ -402,7 +499,7 @@ class ShotTypePredictor:
             'cpu'
         )
         ckpt_path = Path(checkpoint_path or
-                         (PROJECT_ROOT / 'models' / 'run6' / 'D4_mlp_bn.pt'))
+                         (PROJECT_ROOT / 'models' / 'run7' / 'C3_shuttle_xattn.pt'))
         self._load_model(ckpt_path)
 
         self._rf_client     = None
@@ -591,7 +688,8 @@ class ShotTypePredictor:
     # ── full FB inference pipeline ────────────────────────────────────────────
 
     def run_fb_inference(self, json_path, skel_dir, shuttle_dir, img_dir=None,
-                         default_homography=None, tta=1):
+                         default_homography=None, tta=1, fb_fps=_FB_FPS,
+                         pad_mode='center'):
         """
         Run inference over all annotated shots in a FineBadminton JSON.
 
@@ -604,6 +702,9 @@ class ShotTypePredictor:
             default_homography:  pre-computed (3,3) pixel→metres H used for all matches
                                  when Roboflow estimation is skipped. If None and img_dir
                                  is None, L2/L3 court features run in pixel space.
+            fb_fps:              source frame rate of the FB skeletons. Each rally is
+                                 subsampled by fb_fps / 7.5 so its effective rate matches
+                                 SS training (30 fps / stride 4). Pass None to disable.
 
         Returns:
             list of dicts, one per annotated shot:
@@ -615,6 +716,8 @@ class ShotTypePredictor:
         skel_dir    = Path(skel_dir)
         shuttle_dir = Path(shuttle_dir)
         img_dir     = Path(img_dir) if img_dir else None
+
+        resample_factor = (fb_fps / _SS_EFFECTIVE_FPS) if fb_fps else None
 
         shots   = _parse_fb_annotations(json_path)
         results = []
@@ -637,9 +740,12 @@ class ShotTypePredictor:
             skeleton = np.load(skel_p)
             shuttle  = np.load(shut_p) if shut_p.exists() else None
 
-            lf       = shot['local_hit_frame']
-            skel_win = _slice_window(skeleton, lf)
-            shut_win = _slice_shuttle(shuttle, lf) if shuttle is not None \
+            # Subsample 25 fps FB rally → 7.5 fps effective to match SS training.
+            skeleton, shuttle, lf = _resample_time(
+                skeleton, shuttle, shot['local_hit_frame'], resample_factor)
+
+            skel_win = _slice_window(skeleton, lf, pad_mode=pad_mode)
+            shut_win = _slice_shuttle(shuttle, lf, pad_mode=pad_mode) if shuttle is not None \
                        else np.zeros((_SHOT_WINDOW, 2), dtype=np.float32)
 
             # Rescale FB (1280×720) pixel coords to SS training resolution (1920×1080)
