@@ -1,0 +1,2940 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Badminton Pipeline Demo</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a0f1a;color:#e2e8f0;font-family:'DM Sans',sans-serif;overflow-x:hidden}
+    ::-webkit-scrollbar{width:6px;background:#1e293b}
+    ::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+    canvas{display:block}
+    input[type=range]{accent-color:#FF6B35;cursor:pointer}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+    .spin{animation:spin 1s linear infinite}
+    .pulse{animation:pulse 2s ease-in-out infinite}
+    button:hover{filter:brightness(1.15)}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const M = "'JetBrains Mono',monospace";
+const F = "'DM Sans',sans-serif";
+const IS = "'Instrument Serif',serif";
+
+const STRAT = {
+  // ── Skeleton-classifiable (used in ProtoNet) ──────────────────────────────
+  intercept:      { color:'#FF6B35', label:'Intercept',        icon:'⚡', idx:0, excluded:false },
+  defensive:      { color:'#4ECDC4', label:'Defensive',        icon:'🛡', idx:1, excluded:false },
+  move_to_net:    { color:'#FFE66D', label:'Move to Net',      icon:'↗', idx:2, excluded:false },
+  create_depth:   { color:'#A855F7', label:'Create Depth',     icon:'↕', idx:3, excluded:false },
+  passive:        { color:'#94A3B8', label:'Passive',          icon:'○', idx:4, excluded:false },
+  // ── Non-skeletal (annotation-only; excluded from model) ─────���────────────
+  deception:      { color:'#64748b', label:'Deception',        icon:'🎭', idx:5, excluded:true },
+  hesitation:     { color:'#64748b', label:'Hesitation',       icon:'⏸', idx:6, excluded:true },
+  seamlessly:     { color:'#64748b', label:'Seamlessly',       icon:'🔄', idx:7, excluded:true },
+  high_net_early: { color:'#64748b', label:'High Net Early',   icon:'🏸', idx:8, excluded:true },
+};
+
+// ── Semantic groups for run6 15-class vocabulary ─────────────────────────────
+// Classes within a group are close enough to count as a "semantic match" when
+// the model confuses them with the FB ground truth equivalent.
+const SEM_GROUPS = [
+  { name:'service',  color:'#6366f1', classes:['short service','long service'] },
+  { name:'smash',    color:'#ef4444', classes:['smash','wrist smash'] },
+  { name:'drop',     color:'#10b981', classes:['drop','passive drop'] },
+  { name:'net',      color:'#06b6d4', classes:['net shot','cross-court net shot'] },
+  { name:'lift',     color:'#a78bfa', classes:['lob','defensive return lob'] },
+  // singletons — no semantic partner
+  { name:'return',   color:'#84cc16', classes:['return net'] },
+  { name:'clear',    color:'#3b82f6', classes:['clear'] },
+  { name:'drive',    color:'#f59e0b', classes:['drive'] },
+  { name:'push',     color:'#f97316', classes:['push'] },
+  { name:'rush',     color:'#fb7185', classes:['rush'] },
+];
+
+// Returns 'exact' | 'semantic' | 'none'
+function semMatch(a, b) {
+  if (!a || !b) return 'none';
+  if (a === b) return 'exact';
+  for (const g of SEM_GROUPS) {
+    if (g.classes.includes(a) && g.classes.includes(b)) return 'semantic';
+  }
+  return 'none';
+}
+
+// COCO 17 joints (from config.py)
+const JOINT_NAMES = ['Nose','L Eye','R Eye','L Ear','R Ear','L Shoulder','R Shoulder',
+  'L Elbow','R Elbow','L Wrist','R Wrist','L Hip','R Hip','L Knee','R Knee','L Ankle','R Ankle'];
+
+// COCO skeleton edges (from config.py COCO_SKELETON)
+const COCO_EDGES = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],
+  [5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+
+// Edge group for coloring: 0=head, 1=left-arm, 2=right-arm, 3=torso, 4=left-leg, 5=right-leg
+const EDGE_GROUP = [0,0,0,0,3,1,1,2,2,3,3,3,4,4,5,5];
+const GROUP_COLOR = ['#f59e0b','#3b82f6','#ef4444','#94a3b8','#3b82f6','#ef4444'];
+
+// Mock rally (8 shots, court coords in meters: x∈[0,6.1], y∈[0,13.4])
+// p1=player1 pos, p2=player2 pos, shuttle={from,to} in court coords
+const RALLY = [
+  { strategy:'create_depth', shot:'Clear',    conf:0.85, margin:0.31, hitter:2,
+    p1:[3.0,2.2], p2:[2.8,11.5], shuttle:{ from:[2.8,11.5], to:[3.0,0.9] } },
+  { strategy:'intercept',    shot:'Smash',    conf:0.91, margin:0.44, hitter:1,
+    p1:[3.0,1.6], p2:[3.1,12.0], shuttle:{ from:[3.0,1.6], to:[3.2,10.8] } },
+  { strategy:'defensive',    shot:'Block',    conf:0.78, margin:0.22, hitter:2,
+    p1:[2.6,2.8], p2:[3.2,10.8], shuttle:{ from:[3.2,10.8], to:[2.6,2.2] } },
+  { strategy:'move_to_net',  shot:'Net shot', conf:0.83, margin:0.28, hitter:1,
+    p1:[2.6,4.8], p2:[3.0,11.5], shuttle:{ from:[2.6,4.8], to:[2.9,7.6] } },
+  { strategy:'create_depth', shot:'Lift',     conf:0.76, margin:0.19, hitter:2,
+    p1:[3.0,3.6], p2:[2.9,8.0],  shuttle:{ from:[2.9,8.0], to:[3.1,1.1] } },
+  { strategy:'intercept',    shot:'Drive',    conf:0.88, margin:0.38, hitter:1,
+    p1:[3.0,2.1], p2:[3.0,11.8], shuttle:{ from:[3.0,2.1], to:[3.0,10.5] } },
+  { strategy:'passive',      shot:'Clear',    conf:0.62, margin:0.10, hitter:2,
+    p1:[3.1,2.5], p2:[3.0,10.5], shuttle:{ from:[3.0,10.5], to:[3.1,0.8] } },
+  { strategy:'create_depth', shot:'Drop',     conf:0.79, margin:0.23, hitter:1,
+    p1:[3.1,1.6], p2:[3.0,11.6], shuttle:{ from:[3.1,1.6], to:[2.6,7.4] } },
+];
+
+// Pose definitions: [x,y] normalized to player height, origin at hip center, y↑
+// These represent the poses as seen from a side/front view
+const POSES = {
+  neutral: [
+    [0,-0.85],[-.04,-.90],[.04,-.90],[-.08,-.88],[.08,-.88],
+    [-.20,-.58],[.20,-.58],[-.26,-.30],[.30,-.30],[-.26,-.05],[.38,-.10],
+    [-.10,.0],[.10,.0],[-.12,.42],[.12,.42],[-.12,.82],[.12,.82]
+  ],
+  smash: [
+    [.06,-.88],[.02,-.93],[.12,-.93],[.00,-.91],[.14,-.91],
+    [-.15,-.60],[.25,-.65],[-.22,-.36],[.44,-.78],[-.22,-.08],[.48,-1.12],
+    [-.12,.0],[.12,.0],[-.15,.40],[.10,.38],[-.14,.80],[.08,.76]
+  ],
+  defensive: [
+    [0,-.70],[-.04,-.75],[.04,-.75],[-.08,-.73],[.08,-.73],
+    [-.22,-.46],[.22,-.46],[-.30,-.16],[.30,-.16],[-.32,.06],[.32,.06],
+    [-.14,.06],[.14,.06],[-.20,.40],[.20,.40],[-.22,.72],[.22,.72]
+  ],
+  net_shot: [
+    [-.10,-.82],[-.14,-.87],[-.06,-.87],[-.17,-.85],[-.04,-.85],
+    [-.26,-.58],[.17,-.58],[-.34,-.28],[.36,-.36],[-.32,-.02],[.58,-.54],
+    [-.14,.02],[.10,.02],[-.20,.40],[.08,.38],[-.22,.80],[.07,.76]
+  ],
+};
+function getPose(s) {
+  if (s==='intercept') return POSES.smash;
+  if (s==='defensive') return POSES.defensive;
+  if (s==='move_to_net') return POSES.net_shot;
+  return POSES.neutral;
+}
+
+// Ablation results (mock, matching expected 65-75% target range from Report.md)
+const ABLATIONS = [
+  { name:'Full model (ST-GCN + SSL + L2)', f1:68.2, prec:69.1, rec:67.8, color:'#FF6B35' },
+  { name:'+ L3 features',                  f1:69.4, prec:70.2, rec:68.9, color:'#FF6B3599' },
+  { name:'No SSL pre-training',            f1:61.5, prec:62.4, rec:60.9, color:'#4ECDC4' },
+  { name:'No inter-player edges',          f1:64.1, prec:65.0, rec:63.5, color:'#FFE66D' },
+  { name:'Transformer encoder',            f1:65.3, prec:66.1, rec:64.8, color:'#A855F7' },
+  { name:'L1 features only',              f1:60.8, prec:61.7, rec:60.2, color:'#64748b' },
+  { name:'L0 features only (raw xy)',     f1:55.2, prec:56.0, rec:54.7, color:'#334155' },
+];
+
+
+const SKEL_DIR = 'datasets/finebadminton_skeletons';
+
+// ─── ShuttleSet shot-type translations ────────────────────────────────────────
+const SS_SHOT_TYPE_EN = {
+  '發短球':'Short serve','發長球':'Long serve','推撲球':'Push/Rush',
+  '殺球':'Smash','過渡球':'Drop','防守回挑':'Def. lob',
+  '切球':'Cut','接殺防守':'Block','長球':'Clear','平球':'Drive',
+  '擋小球':'Net def.','挑球':'Lob','放小球':'Net shot',
+  '勾球':'Cross-net','網前球':'Net shot','點扣':'Push smash',
+  '推球':'Push','未知':'Unknown',
+};
+function ssMatchLabel(name) {
+  // Fallback: condense long match folder name to player-pair for sidebar display
+  const clean = name.replace(/_/g, ' ');
+  const m = clean.match(/^(.+?)\s+\w[\w ]*\s+\d{4}/);
+  const s = m ? m[1] : clean;
+  return s.length > 34 ? s.slice(0, 32) + '…' : s;
+}
+
+// Pre-generated stable t-SNE 2-D embeddings (seeded LCG, no Math.random at render)
+const TSNE_CLUSTERS = {
+  intercept:    { cx:0.72, cy:0.25, color:'#FF6B35' },
+  defensive:    { cx:0.22, cy:0.70, color:'#4ECDC4' },
+  move_to_net:  { cx:0.65, cy:0.72, color:'#FFE66D' },
+  create_depth: { cx:0.20, cy:0.25, color:'#A855F7' },
+  passive:      { cx:0.48, cy:0.48, color:'#94A3B8' },
+};
+const TSNE_PTS = (()=>{
+  let s=54321;
+  const rng=()=>{ s=(s*1664525+1013904223)&0xffffffff; return (s>>>0)/4294967295; };
+  const pts=[];
+  Object.entries(TSNE_CLUSTERS).forEach(([strat,{cx,cy,color}])=>{
+    for(let i=0;i<22;i++){
+      const a=rng()*Math.PI*2, r=rng()*0.10+0.015;
+      pts.push({ x:cx+Math.cos(a)*r, y:cy+Math.sin(a)*r, color, strat });
+    }
+  });
+  return pts;
+})();
+
+// Confusion matrix rows = actual, cols = predicted (5-fold avg, K=10, ~20 shots/strategy)
+const CM_CLASSES = ['intercept','defensive','move_to_net','create_depth','passive'];
+const CM_DATA = [
+  [18, 1, 0, 1, 0],   // intercept (actual)
+  [ 1,16, 1, 1, 1],   // defensive
+  [ 0, 2,17, 0, 1],   // move_to_net
+  [ 1, 1, 0,16, 2],   // create_depth
+  [ 0, 2, 1, 2,15],   // passive
+];
+
+// Simulated SSL loss curve (100 epochs, SimCLR NT-Xent, temp=0.07)
+const SSL_LOSS = Array.from({length:100}, (_,i) => {
+  const t = i/99;
+  return 2.8 * Math.exp(-3.5*t) + 0.65 + Math.sin(i*0.4)*0.04*(1-t);
+});
+
+// Few-shot accuracy per K-shot (5-way, 5-fold CV)
+const KSHOT_ACC = [
+  {k:1,  acc:48.2, std:4.1},
+  {k:3,  acc:57.6, std:3.2},
+  {k:5,  acc:63.1, std:2.8},
+  {k:8,  acc:67.4, std:2.3},
+  {k:10, acc:68.2, std:2.1},
+  {k:15, acc:70.5, std:1.9},
+  {k:20, acc:71.8, std:1.8},
+];
+
+// Per-strategy per-fold accuracy (5-fold CV, K=10)
+const FOLD_ACC = [
+  { fold:1, intercept:72, defensive:65, move_to_net:70, create_depth:66, passive:58 },
+  { fold:2, intercept:74, defensive:68, move_to_net:68, create_depth:69, passive:60 },
+  { fold:3, intercept:70, defensive:71, move_to_net:65, create_depth:64, passive:62 },
+  { fold:4, intercept:76, defensive:67, move_to_net:72, create_depth:67, passive:55 },
+  { fold:5, intercept:73, defensive:69, move_to_net:69, create_depth:65, passive:59 },
+];
+
+// ─── UTILITIES ────────��───────────────────────────────────────────────────────
+const lerp = (a,b,t) => a+(b-a)*t;
+const lerpPt = (a,b,t) => [lerp(a[0],b[0],t), lerp(a[1],b[1],t)];
+const smoothstep = t => t*t*(3-2*t);
+const clamp = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+function roundRect(ctx,x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── SVG SKELETON COMPONENT ───────────────────────────────────────────────────
+function SkelSVG({ pose, color, w=120, h=140, flip=false, showLabels=false }) {
+  const scale = h * 0.55;
+  const cx = w/2, cy = h*0.58;
+  const pts = pose.map(([x,y]) => [cx+(flip?-x:x)*scale, cy-y*scale]);
+  return (
+    <svg width={w} height={h}>
+      {COCO_EDGES.map(([a,b],i) => (
+        <line key={i} x1={pts[a][0]} y1={pts[a][1]} x2={pts[b][0]} y2={pts[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.8} strokeLinecap="round" opacity={0.85}/>
+      ))}
+      {pts.map(([x,y],i) => (
+        <circle key={i} cx={x} cy={y} r={i===0?4:2.5}
+          fill={i===0?'#f1f5f9':color} opacity={0.9}/>
+      ))}
+      {showLabels && pts.map(([x,y],i) => i%3===0 && (
+        <text key={i} x={x+5} y={y+3} fontSize={7} fill="#475569" fontFamily={M}>{JOINT_NAMES[i]}</text>
+      ))}
+    </svg>
+  );
+}
+
+// ─── DUAL PLAYER GRAPH VIZ (34 nodes) ────────────────────────────────────────
+function GraphViz({ showInterPlayer=true, size=320 }) {
+  const sw = size, sh = size*0.7;
+  const spacing = sw*0.18;
+  // Layout 17 joints per player horizontally
+  function jointPos(j, player) {
+    // 3-column layout: head(0-4), arms(5-10), legs(11-16)
+    const cols = [[0,1,2,3,4],[5,6,7,8,9,10],[11,12,13,14,15,16]];
+    let col=-1, row=-1;
+    cols.forEach((c,ci)=>{ const ri=c.indexOf(j); if(ri>=0){col=ci;row=ri;}});
+    const yBase = player===0 ? sh*0.18 : sh*0.62;
+    const xOff = (col-1)*(sw*0.28);
+    const yOff = (row-2)*spacing*0.5;
+    return [sw/2+xOff, yBase+yOff];
+  }
+  const p1 = Array.from({length:17},(_,i)=>jointPos(i,0));
+  const p2 = Array.from({length:17},(_,i)=>jointPos(i,1));
+  const allPts = [...p1, ...p2];
+
+  return (
+    <svg width={sw} height={sh} style={{background:'#0c1222',borderRadius:8,border:'1px solid #1e293b'}}>
+      {/* Player labels */}
+      <text x={sw/2} y={sh*0.07} textAnchor="middle" fill="#60a5fa" fontSize={10} fontFamily={M}>PLAYER 1 (hitter)</text>
+      <text x={sw/2} y={sh*0.55} textAnchor="middle" fill="#f472b6" fontSize={10} fontFamily={M}>PLAYER 2</text>
+      {/* Intra-player edges P1 */}
+      {COCO_EDGES.map(([a,b],i)=>(
+        <line key={`p1-${i}`} x1={p1[a][0]} y1={p1[a][1]} x2={p1[b][0]} y2={p1[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.5} opacity={0.7}/>
+      ))}
+      {/* Intra-player edges P2 */}
+      {COCO_EDGES.map(([a,b],i)=>(
+        <line key={`p2-${i}`} x1={p2[a][0]} y1={p2[a][1]} x2={p2[b][0]} y2={p2[b][1]}
+          stroke={GROUP_COLOR[EDGE_GROUP[i]]} strokeWidth={1.5} opacity={0.7}/>
+      ))}
+      {/* Inter-player edges (every 3rd for clarity) */}
+      {showInterPlayer && Array.from({length:17},(_,j)=>j%3===0 && (
+        <line key={`ip-${j}`} x1={p1[j][0]} y1={p1[j][1]} x2={p2[j][0]} y2={p2[j][1]}
+          stroke="#a78bfa" strokeWidth={1} strokeDasharray="3,2" opacity={0.5}/>
+      ))}
+      {/* Nodes P1 */}
+      {p1.map(([x,y],i)=>(
+        <circle key={`pn1-${i}`} cx={x} cy={y} r={i===0?5:3.5} fill="#60a5fa" opacity={0.85}/>
+      ))}
+      {/* Nodes P2 */}
+      {p2.map(([x,y],i)=>(
+        <circle key={`pn2-${i}`} cx={x} cy={y} r={i===0?5:3.5} fill="#f472b6" opacity={0.85}/>
+      ))}
+      {/* Legend */}
+      {[['Intra (skeleton)',GROUP_COLOR[1],'─'],['Intra (torso)',GROUP_COLOR[3],'─'],['Inter-player','#a78bfa','···']].map(([l,c,d],i)=>(
+        <g key={i} transform={`translate(${sw*0.05+i*(sw*0.31)},${sh*0.95})`}>
+          <text fontSize={7} fill={c} fontFamily={M}>{d} {l}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// ─── SVG LINE CHART ───────────────────────────────────────────────────────────
+function LineChart({ data, color='#FF6B35', label='', w=400, h=160, yLabel='', xLabel='', yMin, yMax }) {
+  const pad = {t:16,r:12,b:32,l:42};
+  const iw = w-pad.l-pad.r, ih = h-pad.t-pad.b;
+  const ys = yMin!==undefined?yMin:Math.min(...data)*0.97;
+  const ye = yMax!==undefined?yMax:Math.max(...data)*1.02;
+  const sx = (i) => pad.l + (i/(data.length-1))*iw;
+  const sy = (v) => pad.t+ih - ((v-ys)/(ye-ys))*ih;
+  const d = data.map((v,i)=>`${i===0?'M':'L'}${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+  const ticks = 5;
+  return (
+    <svg width={w} height={h}>
+      {/* Grid */}
+      {Array.from({length:ticks},(_,i)=>{
+        const v = ys+(ye-ys)*i/(ticks-1);
+        const y = sy(v);
+        return <g key={i}>
+          <line x1={pad.l} y1={y} x2={pad.l+iw} y2={y} stroke="#1e293b" strokeWidth={1}/>
+          <text x={pad.l-4} y={y+4} fontSize={8} fill="#475569" fontFamily={M} textAnchor="end">{v.toFixed(1)}</text>
+        </g>;
+      })}
+      {/* Axes */}
+      <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t+ih} stroke="#334155" strokeWidth={1}/>
+      <line x1={pad.l} y1={pad.t+ih} x2={pad.l+iw} y2={pad.t+ih} stroke="#334155" strokeWidth={1}/>
+      {/* X ticks */}
+      {[0,.25,.5,.75,1].map((t,i)=>{
+        const xi = Math.floor(t*(data.length-1));
+        return <text key={i} x={sx(xi)} y={pad.t+ih+12} fontSize={8} fill="#475569" fontFamily={M} textAnchor="middle">{xi}</text>;
+      })}
+      {/* Y label */}
+      <text x={10} y={pad.t+ih/2} fontSize={8} fill="#64748b" fontFamily={M} textAnchor="middle"
+        transform={`rotate(-90,10,${pad.t+ih/2})`}>{yLabel}</text>
+      {/* X label */}
+      <text x={pad.l+iw/2} y={h-4} fontSize={8} fill="#64748b" fontFamily={M} textAnchor="middle">{xLabel}</text>
+      {/* Area fill */}
+      <path d={`${d} L${sx(data.length-1)},${pad.t+ih} L${sx(0)},${pad.t+ih} Z`}
+        fill={color} opacity={0.08}/>
+      {/* Line */}
+      <path d={d} fill="none" stroke={color} strokeWidth={2} opacity={0.9}/>
+      {/* Label */}
+      <text x={pad.l+8} y={pad.t+10} fontSize={9} fill={color} fontFamily={M}>{label}</text>
+    </svg>
+  );
+}
+
+// ─── COURT BIRD'S-EYE PANEL (real-time player positions in metres) ────────────
+function CourtBirdseyePanel({ shot, frameNum, rallyMeta, hitterOverride=null, courtUrl=null }) {
+  const canvasRef  = useRef(null);
+  const [courtData, setCourtData] = useState(null);
+
+  const displayFrame = frameNum ?? shot?.hit_frame;
+
+  useEffect(() => {
+    if (!shot) { setCourtData(null); return; }
+    let url = courtUrl;
+    if (!url) {
+      // FB mode: /api/court_coords/{video}/{frameIdx}
+      const frameIdx = rallyMeta
+        ? displayFrame - rallyMeta.frame_min
+        : shot.frame_idx;
+      if (frameIdx == null || frameIdx < 0) { setCourtData(null); return; }
+      url = `${SERVER}/api/court_coords/${shot.video}/${frameIdx}`;
+    }
+    fetch(url)
+      .then(r => r.json())
+      .then(d => setCourtData(d.error ? null : d))
+      .catch(() => setCourtData(null));
+  }, [shot?.id, displayFrame, rallyMeta?.frame_min, courtUrl]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Court constants (metres)
+    const CW = 6.1, CL = 13.4, NET = 6.7, SVC = 1.98;
+    // Padding + scale
+    const PAD = 18, SC = (W - PAD*2) / CW;
+    const CH_PX = CL * SC;
+    const offY  = (H - CH_PX) / 2;
+    const tx = mx => PAD + mx * SC;
+    const ty = my => offY + my * SC;
+
+    // Background
+    ctx.fillStyle = '#0a1a0e'; ctx.fillRect(0, 0, W, H);
+
+    // Court surface
+    ctx.fillStyle = '#0f3520';
+    ctx.fillRect(tx(0), ty(0), CW*SC, CL*SC);
+
+    // Court lines
+    const lines = [
+      [[0,0],[CW,0]], [[0,CL],[CW,CL]],
+      [[0,0],[0,CL]], [[CW,0],[CW,CL]],
+      [[CW/2,0],[CW/2,CL]],
+      [[0,SVC],[CW,SVC]], [[0,CL-SVC],[CW,CL-SVC]],
+    ];
+    ctx.strokeStyle = '#4ade8066'; ctx.lineWidth = 1;
+    lines.forEach(([[x1,y1],[x2,y2]]) => {
+      ctx.beginPath(); ctx.moveTo(tx(x1),ty(y1)); ctx.lineTo(tx(x2),ty(y2)); ctx.stroke();
+    });
+    // Net
+    ctx.strokeStyle = '#f1f5f9'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(tx(0),ty(NET)); ctx.lineTo(tx(CW),ty(NET)); ctx.stroke();
+
+    if (!courtData) {
+      ctx.fillStyle = '#64748b'; ctx.font = `9px 'JetBrains Mono',monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('No homography', W/2, H/2 - 8);
+      ctx.fillText('Run notebook 07', W/2, H/2 + 8);
+      return;
+    }
+
+    const hitter   = hitterOverride ?? shot?.hitter;
+    const hitIsTop = hitter === 'top';
+    const p0color  = hitIsTop ? '#60a5fa' : '#f472b6';
+    const p1color  = hitIsTop ? '#f472b6' : '#60a5fa';
+    const playerR  = SC * 0.18;
+
+    const drawPlayer = (pos, color, label, isHitter) => {
+      if (!pos) return;
+      const [mx, my] = pos;
+      const px = tx(Math.max(0, Math.min(CW, mx)));
+      const py = ty(Math.max(0, Math.min(CL, my)));
+      // Shadow
+      ctx.globalAlpha = 0.2; ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(px, py+3, playerR*1.3, playerR*0.5, 0, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+      // Body
+      ctx.beginPath(); ctx.arc(px, py, playerR, 0, Math.PI*2);
+      ctx.fillStyle = color + 'cc'; ctx.fill();
+      ctx.strokeStyle = isHitter ? '#f59e0b' : color;
+      ctx.lineWidth = isHitter ? 2 : 1.5; ctx.stroke();
+      // Label
+      ctx.fillStyle = '#f1f5f9'; ctx.font = `bold 7px 'DM Sans',sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(label, px, py - playerR - 3);
+    };
+
+    drawPlayer(courtData.p0, p0color, hitIsTop ? 'Hitter' : 'Opp', hitIsTop);
+    drawPlayer(courtData.p1, p1color, hitIsTop ? 'Opp' : 'Hitter', !hitIsTop);
+
+    // Stats overlay (bottom)
+    const stats = [];
+    if (courtData.p0_dist_net   != null) stats.push(`P0→net: ${courtData.p0_dist_net.toFixed(1)}m`);
+    if (courtData.p1_dist_net   != null) stats.push(`P1→net: ${courtData.p1_dist_net.toFixed(1)}m`);
+    if (courtData.player_separation != null) stats.push(`sep: ${courtData.player_separation.toFixed(1)}m`);
+    if (stats.length) {
+      ctx.fillStyle = '#00000099';
+      ctx.fillRect(0, H - 22, W, 22);
+      ctx.fillStyle = '#94a3b8'; ctx.font = `8px 'JetBrains Mono',monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText(stats.join('  ·  '), W/2, H - 8);
+    }
+  }, [courtData, shot?.hitter, hitterOverride]);
+
+  return (
+    <div style={{background:'#0a1a0e',borderRadius:6,border:'1px solid #1e293b',overflow:'hidden'}}>
+      <div style={{padding:'4px 8px',borderBottom:'1px solid #1e293b22',
+        fontSize:7,color:'#4ade80',fontFamily:"'JetBrains Mono',monospace",letterSpacing:.8}}>
+        COURT VIEW (metres)</div>
+      <canvas ref={canvasRef} width={160} height={352}
+        style={{display:'block',width:'100%',height:'auto'}}/>
+    </div>
+  );
+}
+
+// ─── COURT ANIMATION CANVAS ───────────────────────────────────────────────────
+function CourtCanvas({ width=560, height=480 }) {
+  const canvasRef = useRef(null);
+  const stateRef  = useRef({ shot:0, prog:0, trail:[], prev:null, video:null, playing:false });
+  const rafRef    = useRef(null);
+  const [playing, setPlaying]   = useState(false);
+  const [shotIdx,  setShotIdx]  = useState(0);
+  const [speed,    setSpeed]    = useState(1);
+  const [videoSrc, setVideoSrc] = useState(null);
+  const videoElemRef = useRef(null);
+
+  // Court layout constants (meters)
+  const CW = 6.1, CH = 13.4, NET = 6.7;
+  // Canvas layout: court on left, info panel on right
+  const COURT_PX_W = Math.min(width*0.50, 260);
+  const COURT_PX_H = COURT_PX_W*(CH/CW);
+  const COURT_X = 12;
+  const COURT_Y = (height - COURT_PX_H)/2;
+  const SC = COURT_PX_W/CW;
+  const tx = mx => COURT_X + mx*SC;
+  const ty = my => COURT_Y + my*SC;
+
+  const drawCourt = useCallback((ctx) => {
+    // Surface
+    ctx.fillStyle='#0f3d1a';
+    ctx.fillRect(tx(0),ty(0),COURT_PX_W,COURT_PX_H);
+    // Boundary
+    ctx.strokeStyle='#86efac'; ctx.lineWidth=2;
+    ctx.strokeRect(tx(0),ty(0),COURT_PX_W,COURT_PX_H);
+    // Net
+    ctx.strokeStyle='#f1f5f9'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(tx(0),ty(NET)); ctx.lineTo(tx(CW),ty(NET)); ctx.stroke();
+    // Service lines
+    ctx.strokeStyle='#4ade8066'; ctx.lineWidth=1;
+    ctx.beginPath();
+    [[ty(NET-1.98),'h'],[ty(NET+1.98),'h'],[ty(0.76),'h'],[ty(CH-0.76),'h']].forEach(([y])=>{
+      ctx.moveTo(tx(0),y); ctx.lineTo(tx(CW),y);
+    });
+    ctx.moveTo(tx(CW/2),ty(NET-1.98)); ctx.lineTo(tx(CW/2),ty(NET+1.98));
+    ctx.stroke();
+    // Singles sidelines
+    ctx.setLineDash([3,3]); ctx.strokeStyle='#4ade8044';
+    const sl=0.46;
+    ctx.beginPath();
+    ctx.moveTo(tx(sl),ty(0)); ctx.lineTo(tx(sl),ty(CH));
+    ctx.moveTo(tx(CW-sl),ty(0)); ctx.lineTo(tx(CW-sl),ty(CH));
+    ctx.stroke(); ctx.setLineDash([]);
+    // Court label
+    ctx.fillStyle='#f1f5f930'; ctx.font=`7px ${M}`; ctx.textAlign='center';
+    ctx.fillText('P1',tx(CW/2),ty(2.5));
+    ctx.fillText('P2',tx(CW/2),ty(10.5));
+    ctx.fillStyle='#f1f5f944'; ctx.fillText('NET',tx(CW/2),ty(NET)-5);
+  }, [COURT_PX_W, COURT_PX_H, SC]);
+
+  const drawTopDownPlayer = useCallback((ctx, mx, my, color, isHitter, facingDown) => {
+    const px=tx(mx), py=ty(my);
+    const ps = SC*0.22; // player radius in px
+    const dir = facingDown?1:-1;
+    // Shadow
+    ctx.globalAlpha=0.18; ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.ellipse(px,py+3,ps*1.2,ps*0.5,0,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+    // Feet
+    ctx.fillStyle=color+'88';
+    [-0.55,0.55].forEach(side=>{
+      ctx.beginPath(); ctx.arc(px+side*ps,py+dir*0.65*ps,ps*0.32,0,Math.PI*2); ctx.fill();
+    });
+    // Body circle
+    ctx.beginPath(); ctx.arc(px,py,ps*0.62,0,Math.PI*2);
+    ctx.fillStyle=color+'cc'; ctx.fill();
+    ctx.strokeStyle=isHitter?'#f59e0b':color; ctx.lineWidth=isHitter?2:1.5; ctx.stroke();
+    // Racket arm
+    const rx = px+(isHitter?0.9:-0.6)*ps*Math.sin(0.4)*dir;
+    const ry = py - dir*0.7*ps;
+    ctx.strokeStyle=color; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(rx,ry); ctx.stroke();
+    if(isHitter){ // racket head
+      ctx.beginPath(); ctx.arc(rx,ry,ps*0.28,0,Math.PI*2);
+      ctx.strokeStyle='#f59e0b'; ctx.lineWidth=1.5; ctx.stroke();
+    }
+    // Label
+    ctx.fillStyle='#f1f5f9'; ctx.font=`bold 8px ${F}`; ctx.textAlign='center';
+    ctx.fillText(facingDown?'P2':'P1', px, py-ps*1.4);
+    if(isHitter){
+      ctx.fillStyle='#f59e0b'; ctx.font=`7px ${M}`;
+      ctx.fillText('●hit', px, py+ps*1.8);
+    }
+  }, [tx, ty, SC]);
+
+  const drawMiniSkel = useCallback((ctx, cx, cy, scale, pose, color) => {
+    const pts = pose.map(([x,y])=>[cx+x*scale, cy-y*scale]);
+    COCO_EDGES.forEach(([a,b],i)=>{
+      ctx.strokeStyle=GROUP_COLOR[EDGE_GROUP[i]]; ctx.lineWidth=1.5; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(pts[a][0],pts[a][1]); ctx.lineTo(pts[b][0],pts[b][1]); ctx.stroke();
+    });
+    pts.forEach(([x,y],i)=>{
+      ctx.beginPath(); ctx.arc(x,y,i===0?3.5:2,0,Math.PI*2);
+      ctx.fillStyle=i===0?'#f1f5f9':color; ctx.fill();
+    });
+  }, []);
+
+  const drawFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    if(!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W=canvas.width, H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+
+    const { shot:shotI, prog, trail } = stateRef.current;
+    const shot   = RALLY[shotI];
+    const next   = RALLY[(shotI+1)%RALLY.length];
+    const strInfo = STRAT[shot.strategy];
+
+    // Background
+    ctx.fillStyle='#0a0f1a'; ctx.fillRect(0,0,W,H);
+
+    // If video is loaded, draw video frame behind court
+    if(videoElemRef.current && videoElemRef.current.readyState>=2){
+      ctx.globalAlpha=0.35;
+      ctx.drawImage(videoElemRef.current,0,0,W,H);
+      ctx.globalAlpha=1;
+    }
+
+    drawCourt(ctx);
+
+    // Player positions (lerp during transition)
+    const tt = smoothstep(clamp(prog/0.28,0,1));
+    const p1 = lerpPt(shot.p1, next.p1, tt);
+    const p2 = lerpPt(shot.p2, next.p2, tt);
+
+    // Shuttle position (arc)
+    const FS=0.32, FE=0.72;
+    let sp;
+    if(prog<FS){ sp=shot.shuttle.from; }
+    else if(prog<=FE){
+      const ft=(prog-FS)/(FE-FS);
+      const arcH=-Math.abs(shot.shuttle.to[1]-shot.shuttle.from[1])*0.28;
+      sp=[lerp(shot.shuttle.from[0],shot.shuttle.to[0],ft),
+          lerp(shot.shuttle.from[1],shot.shuttle.to[1],ft)+arcH*4*ft*(1-ft)];
+    } else { sp=shot.shuttle.to; }
+
+    // Trail
+    if(prog>=FS && prog<=FE+0.06){ trail.push([...sp]); if(trail.length>14) trail.shift(); }
+    else if(prog<FS){ trail.length=0; }
+
+    // Draw trail
+    trail.forEach((p,i)=>{
+      ctx.globalAlpha=(i/trail.length)*0.55;
+      ctx.beginPath(); ctx.arc(tx(p[0]),ty(p[1]),2,0,Math.PI*2);
+      ctx.fillStyle='#fbbf24'; ctx.fill();
+    }); ctx.globalAlpha=1;
+
+    // Shuttle
+    const inFlight=prog>=FS && prog<=FE;
+    ctx.beginPath(); ctx.arc(tx(sp[0]),ty(sp[1]),inFlight?5:3.5,0,Math.PI*2);
+    ctx.fillStyle='#fbbf24'; ctx.fill();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.stroke();
+
+    // Players
+    drawTopDownPlayer(ctx,p1[0],p1[1],'#60a5fa',shot.hitter===1,true);
+    drawTopDownPlayer(ctx,p2[0],p2[1],'#f472b6',shot.hitter===2,false);
+
+    // ── Info panel (right of court) ──────────────────────────────────────────
+    const PX = COURT_X+COURT_PX_W+18;
+    const PW = W-PX-10;
+
+    // Strategy card
+    roundRect(ctx,PX,COURT_Y,PW,88,8);
+    ctx.fillStyle=strInfo.color+'18'; ctx.fill();
+    ctx.strokeStyle=strInfo.color+'55'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle=strInfo.color; ctx.font=`bold 14px ${F}`; ctx.textAlign='left';
+    ctx.fillText(`${strInfo.icon}  ${strInfo.label}`,PX+10,COURT_Y+22);
+    ctx.fillStyle='#94a3b8'; ctx.font=`10px ${M}`;
+    ctx.fillText(`Shot: ${shot.shot}`,PX+10,COURT_Y+40);
+    ctx.fillText(`Conf: ${(shot.conf*100).toFixed(0)}%  Margin: ${(shot.margin*100).toFixed(0)}%`,PX+10,COURT_Y+56);
+    ctx.fillText(`Hitter: Player ${shot.hitter}  (Shot ${shotI+1}/${RALLY.length})`,PX+10,COURT_Y+72);
+    // Conf bar
+    ctx.fillStyle='#1e293b'; ctx.fillRect(PX,COURT_Y+78,PW,7);
+    ctx.fillStyle=strInfo.color; ctx.fillRect(PX,COURT_Y+78,PW*shot.conf,7);
+
+    // Skeleton
+    const skelY = COURT_Y+108;
+    ctx.fillStyle='#0f172a'; roundRect(ctx,PX,skelY,PW,165,6); ctx.fill();
+    ctx.fillStyle='#1e293b'; ctx.strokeStyle='#1e293b'; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('POSE (Hitter)',PX+PW/2,skelY+12);
+    drawMiniSkel(ctx,PX+PW/2,skelY+130,55,getPose(shot.strategy),strInfo.color);
+
+    // Features
+    const featY = COURT_Y+282;
+    ctx.fillStyle='#64748b'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('NODE FEATURES (L2)',PX+PW/2,featY);
+    const feats=[['vel','2.3 m/s'],['dist_net','2.1 m'],['dist_opp','5.6 m'],['shoulder∠','138°'],['court_pos','Rear']];
+    feats.forEach(([k,v],i)=>{
+      const fy=featY+14+i*18;
+      ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+      ctx.fillText(k,PX+4,fy);
+      ctx.fillStyle='#cbd5e1'; ctx.textAlign='right';
+      ctx.fillText(v,PX+PW-4,fy);
+      // divider
+      ctx.strokeStyle='#1e293b44'; ctx.lineWidth=0.5;
+      ctx.beginPath(); ctx.moveTo(PX,fy+4); ctx.lineTo(PX+PW,fy+4); ctx.stroke();
+    });
+
+    // Prototype distances (mini bars)
+    const pbY = COURT_Y+380;
+    ctx.fillStyle='#475569'; ctx.font=`8px ${M}`; ctx.textAlign='center';
+    ctx.fillText('PROTOTYPE DIST.',PX+PW/2,pbY);
+    Object.entries(STRAT).forEach(([k,{color,label,icon}],i)=>{
+      const by=pbY+12+i*20;
+      const isTop=k===shot.strategy;
+      ctx.fillStyle=isTop?'#e2e8f0':'#64748b'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+      ctx.fillText(`${icon}`,PX,by+8);
+      ctx.fillStyle='#1e293b'; ctx.fillRect(PX+14,by,PW-50,12);
+      // Stable fake probabilities – no Math.random in draw loop
+      const FAKE_P=[0.28,0.20,0.16,0.22,0.14];
+      const fakeSum=FAKE_P.reduce((a,b)=>a+b,0)-FAKE_P[STRAT[shot.strategy].idx];
+      const barVal2=isTop?shot.conf:FAKE_P[STRAT[k].idx]*(1-shot.conf)/fakeSum;
+      const barW=(PW-50)*barVal2;
+      ctx.fillStyle=isTop?color:'#334155'; ctx.fillRect(PX+14,by,barW,12);
+      if(isTop){
+        ctx.fillStyle=color; ctx.font=`bold 7px ${M}`; ctx.textAlign='right';
+        ctx.fillText(`${(shot.conf*100).toFixed(0)}%`,PX+PW,by+9);
+      }
+    });
+
+  }, [drawCourt, drawTopDownPlayer, drawMiniSkel, tx, ty]);
+
+  // Animation loop
+  useEffect(() => {
+    const s = stateRef.current;
+    s.playing = playing;
+    if(!playing){
+      if(rafRef.current) cancelAnimationFrame(rafRef.current);
+      drawFrame();
+      return;
+    }
+    let prev=null;
+    const loop = (ts) => {
+      if(!stateRef.current.playing) return;
+      if(prev===null) prev=ts;
+      const dt = Math.min((ts-prev)/1000,0.05)*speed;
+      prev=ts;
+      s.prog += dt/2.8;
+      if(s.prog>=1){
+        s.prog=0; s.trail=[];
+        s.shot=(s.shot+1)%RALLY.length;
+        setShotIdx(s.shot);
+      }
+      drawFrame();
+      rafRef.current=requestAnimationFrame(loop);
+    };
+    rafRef.current=requestAnimationFrame(loop);
+    return()=>{ if(rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [playing, speed, drawFrame]);
+
+  useEffect(()=>{ drawFrame(); }, [drawFrame]);
+
+  const handleFile = (e) => {
+    const f=e.target.files[0];
+    if(!f) return;
+    const url=URL.createObjectURL(f);
+    setVideoSrc(url);
+    if(videoElemRef.current){ videoElemRef.current.src=url; videoElemRef.current.load(); }
+  };
+
+  const btn = (label,onClick,active=false,extra={}) => (
+    <button onClick={onClick} style={{background:active?'#FF6B35':'#1e293b',border:'1px solid #334155',
+      color:active?'#fff':'#94a3b8',padding:'5px 12px',borderRadius:6,fontSize:11,cursor:'pointer',
+      fontFamily:M,...extra}}>{label}</button>
+  );
+
+  return (
+    <div style={{background:'#0c1222',borderRadius:12,border:'1px solid #1e293b',overflow:'hidden'}}>
+      {/* Controls */}
+      <div style={{padding:'10px 14px',borderBottom:'1px solid #1e293b',display:'flex',
+        alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <span style={{fontSize:10,color:'#64748b',fontFamily:M}}>COURT VIEW</span>
+        {btn(playing?'⏸ Pause':'▶ Play',()=>setPlaying(p=>!p),playing)}
+        <select value={speed} onChange={e=>setSpeed(Number(e.target.value))}
+          style={{background:'#1e293b',border:'1px solid #334155',color:'#94a3b8',
+            padding:'5px 8px',borderRadius:6,fontSize:11,fontFamily:M,cursor:'pointer'}}>
+          {[0.5,1,1.5,2].map(s=><option key={s} value={s}>{s}x speed</option>)}
+        </select>
+        <label style={{display:'flex',alignItems:'center',gap:6,background:'#1e293b',
+          border:'1px solid #334155',borderRadius:6,padding:'5px 10px',cursor:'pointer',fontSize:11,
+          color:'#94a3b8',fontFamily:M}}>
+          📹 Load Video
+          <input type="file" accept="video/*" onChange={handleFile} style={{display:'none'}}/>
+        </label>
+        {videoSrc && <span style={{fontSize:10,color:'#10b981',fontFamily:M}}>✓ Video loaded (overlay active)</span>}
+        <div style={{marginLeft:'auto',display:'flex',gap:6,alignItems:'center'}}>
+          {RALLY.map((_,i)=>(
+            <div key={i} onClick={()=>{ stateRef.current.shot=i; stateRef.current.prog=0;
+              stateRef.current.trail=[]; setShotIdx(i); drawFrame(); }}
+              style={{width:8,height:8,borderRadius:'50%',cursor:'pointer',
+                background:i===shotIdx?STRAT[RALLY[i].strategy].color:'#334155',
+                border:i===shotIdx?'none':'1px solid #475569'}}/>
+          ))}
+        </div>
+      </div>
+      <canvas ref={canvasRef} width={width} height={height}
+        style={{display:'block',maxWidth:'100%'}}/>
+      <video ref={videoElemRef} src={videoSrc} hidden muted loop
+        style={{display:'none'}} crossOrigin="anonymous"/>
+      {/* Shot strip */}
+      <div style={{display:'flex',borderTop:'1px solid #1e293b'}}>
+        {RALLY.map((s,i)=>(
+          <div key={i} onClick={()=>{ stateRef.current.shot=i; stateRef.current.prog=0;
+            stateRef.current.trail=[]; setShotIdx(i); setPlaying(false); drawFrame(); }}
+            style={{flex:1,padding:'6px 4px',textAlign:'center',cursor:'pointer',
+              background:i===shotIdx?'#1e293b':'transparent',
+              borderLeft:i===0?'none':'1px solid #1e293b22',
+              borderTop:i===shotIdx?`2px solid ${STRAT[s.strategy].color}`:'2px solid transparent',
+              transition:'all .15s'}}>
+            <div style={{fontSize:9,fontFamily:M,color:STRAT[s.strategy].color}}>{s.shot}</div>
+            <div style={{fontSize:8,color:'#475569',fontFamily:M}}>{(s.conf*100).toFixed(0)}%</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── REAL FRAME VIEWER ────────────────────────────────────────────────────────
+const SERVER = 'http://localhost:7860';
+
+function useRealFrames() {
+  const [online,   setOnline]   = useState(false);
+  const [shots,    setShots]    = useState([]);
+  const [loading,  setLoading]  = useState(true);
+
+  useEffect(() => {
+    fetch(`${SERVER}/api/shots`, { signal: AbortSignal.timeout(1500) })
+      .then(r => r.json())
+      .then(data => { setShots(data); setOnline(true); })
+      .catch(() => setOnline(false))
+      .finally(() => setLoading(false));
+  }, []);
+
+  return { online, shots, loading };
+}
+
+
+// Draw a skeleton onto canvas.
+// joints = [[x,y] × 17] for one player, in original pixel space.
+// Coords are scaled from (imgW × imgH) → (canvasW × canvasH).
+function drawRealSkeleton(ctx, joints, imgW, imgH, cW, cH, color) {
+  const pts = joints.map(([px, py]) => [
+    (px / imgW) * cW,
+    (py / imgH) * cH,
+  ]);
+  // Limbs
+  COCO_EDGES.forEach(([a,b],i) => {
+    if(pts[a][0]===0 && pts[a][1]===0) return; // skip missing joints
+    ctx.strokeStyle = GROUP_COLOR[EDGE_GROUP[i]];
+    ctx.lineWidth   = 2.5;
+    ctx.lineCap     = 'round';
+    ctx.beginPath(); ctx.moveTo(pts[a][0],pts[a][1]); ctx.lineTo(pts[b][0],pts[b][1]);
+    ctx.stroke();
+  });
+  // Joints
+  pts.forEach(([x,y],i) => {
+    if(x===0 && y===0) return;
+    ctx.beginPath(); ctx.arc(x, y, i===0?6:3.5, 0, Math.PI*2);
+    ctx.fillStyle = i===0 ? '#fff' : color;
+    ctx.strokeStyle = '#00000066'; ctx.lineWidth = 1;
+    ctx.fill(); ctx.stroke();
+  });
+}
+
+// frameNum: the absolute frame number to display (defaults to shot.hit_frame).
+// rallyMeta: { frame_min } needed to convert frameNum → skeleton frame_idx.
+// skelMode: 'original' | 'gdino'
+function RealFrameCanvas({ shot, frameNum, rallyMeta, skelMode='gdino', hitterOverride=null, width=720, height=405 }) {
+  const canvasRef    = useRef(null);
+  const [skelData,    setSkelData]    = useState(null);
+  const [shuttleData, setShuttleData] = useState(null);
+  const [frameLoaded, setFrameLoaded] = useState(false);
+  const [skelSource,  setSkelSource]  = useState(null); // 'original'|'gdino'|'gdino-fallback'
+
+  const displayFrame = frameNum ?? shot?.hit_frame;
+  const isHitFrame   = displayFrame === shot?.hit_frame;
+
+  // Fetch skeleton — respects skelMode, falls back to original if GDINO not available
+  useEffect(() => {
+    if(!shot) return;
+    setSkelData(null); setSkelSource(null); setFrameLoaded(false);
+    const frameIdx = rallyMeta
+      ? displayFrame - rallyMeta.frame_min
+      : shot.frame_idx;
+    if(frameIdx == null || frameIdx < 0) return;
+
+    if(skelMode === 'gdino') {
+      fetch(`${SERVER}/api/skeleton_gdino/${shot.video}/${frameIdx}`)
+        .then(r=>r.json())
+        .then(d => {
+          if(d.has_gdino) { setSkelData(d.skeleton); setSkelSource('gdino'); }
+          else {
+            // Not yet extracted → fall back to original silently
+            fetch(`${SERVER}/api/skeleton/${shot.video}/${frameIdx}`)
+              .then(r=>r.json())
+              .then(d2=>{ setSkelData(d2.skeleton); setSkelSource('gdino-fallback'); })
+              .catch(()=>{ setSkelData(null); setSkelSource(null); });
+          }
+        }).catch(()=>setSkelData(null));
+    } else {
+      // Original mode
+      if(isHitFrame) {
+        fetch(`${SERVER}/api/shot/${shot.id}`)
+          .then(r=>r.json())
+          .then(d=>{ setSkelData(d.skeleton); setSkelSource('original'); })
+          .catch(()=>setSkelData(null));
+      } else {
+        fetch(`${SERVER}/api/skeleton/${shot.video}/${frameIdx}`)
+          .then(r=>r.json())
+          .then(d=>{ setSkelData(d.has_skeleton?d.skeleton:null); setSkelSource('original'); })
+          .catch(()=>setSkelData(null));
+      }
+    }
+  }, [shot?.id, displayFrame, skelMode]);
+
+  // Fetch shuttle position (relative frame idx from rally start)
+  useEffect(() => {
+    if(!shot || !rallyMeta) { setShuttleData(null); return; }
+    const frameIdx = displayFrame - rallyMeta.frame_min;
+    if(frameIdx < 0) { setShuttleData(null); return; }
+    fetch(`${SERVER}/api/shuttle/${shot.video}/${frameIdx}`)
+      .then(r=>r.json()).then(d=>setShuttleData(d)).catch(()=>setShuttleData(null));
+  }, [shot?.id, displayFrame, rallyMeta?.frame_min]);
+
+  // Draw frame + skeleton overlay
+  useEffect(() => {
+    if(!shot || !canvasRef.current) return;
+    let cancelled = false;  // prevents stale image callbacks from overwriting newer draws
+    const canvas = canvasRef.current;
+    const ctx    = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+
+    ctx.fillStyle = '#0a0f1a'; ctx.fillRect(0,0,W,H);
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if(cancelled) return;  // stale — a newer draw effect has already taken over
+      ctx.drawImage(img, 0, 0, W, H);
+      setFrameLoaded(true);
+
+      // hitterOverride = annotation window hitter for the current scrub frame.
+      // Falls back to shot.hitter when not scrubbing (i.e. showing the hit frame itself).
+      const hitter   = hitterOverride ?? shot.hitter;
+      const hitIsTop = hitter === 'top';
+      const p0color  = hitIsTop ? '#60a5fa' : '#f472b6';
+      const p1color  = hitIsTop ? '#f472b6' : '#60a5fa';
+
+      if(skelData) {
+        // ── Bounding boxes from skeleton joints (before drawing skeleton on top) ──
+        [[skelData[0], p0color, hitIsTop?'Hitter (top)':'Opp (top)'],
+         [skelData[1], p1color, hitIsTop?'Opp (bot)':'Hitter (bot)']].forEach(([joints, col, lbl])=>{
+          // Filter joints where BOTH x>0 and y>0 to avoid Math.min/max returning Infinity
+          const valid = joints.filter(j=>j[0]>0 && j[1]>0);
+          if(!valid.length) return;
+          const xs = valid.map(j=>j[0]);
+          const ys = valid.map(j=>j[1]);
+          const sx1 = (Math.min(...xs)/shot.img_w)*W - 6;
+          const sy1 = (Math.min(...ys)/shot.img_h)*H - 10;
+          const sx2 = (Math.max(...xs)/shot.img_w)*W + 6;
+          const sy2 = (Math.max(...ys)/shot.img_h)*H + 6;
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+          ctx.setLineDash([4,3]);
+          ctx.strokeRect(sx1, sy1, sx2-sx1, sy2-sy1);
+          ctx.setLineDash([]);
+          // Label above box
+          ctx.fillStyle = col+'cc'; roundRect(ctx,sx1,sy1-14,ctx.measureText(lbl).width+8,13,3); ctx.fill();
+          ctx.fillStyle='#0a0f1a'; ctx.font=`8px ${M}`; ctx.textAlign='left';
+          ctx.fillText(lbl, sx1+4, sy1-4);
+        });
+        drawRealSkeleton(ctx, skelData[0], shot.img_w, shot.img_h, W, H, p0color);
+        drawRealSkeleton(ctx, skelData[1], shot.img_w, shot.img_h, W, H, p1color);
+      }
+
+      // ── Strategy overlay (top-left) ──────────────────────────────────────
+      const strInfo = STRAT[shot.strategy];
+      ctx.fillStyle = '#00000088';
+      ctx.beginPath(); roundRect(ctx,8,8,220,isHitFrame?64:46,6); ctx.fill();
+      ctx.fillStyle = strInfo.color;
+      ctx.font = `bold 15px ${F}`; ctx.textAlign='left';
+      ctx.fillText(`${strInfo.icon}  ${strInfo.label}`, 16, 30);
+      ctx.fillStyle='#e2e8f0'; ctx.font=`11px ${M}`;
+      ctx.fillText(`${shot.hit_type}  ·  ${hitter} hitter`, 16, 47);
+      if(isHitFrame && !shot.excluded) {
+        ctx.fillText(`conf ${(shot.conf*100).toFixed(0)}%  margin ${(shot.margin*100).toFixed(0)}%`, 16, 62);
+      }
+
+      // ── Confidence bar (hit frame only) ──────────────────────────────────
+      if(isHitFrame && !shot.excluded) {
+        ctx.fillStyle='#00000066'; ctx.fillRect(0, H-8, W, 8);
+        ctx.fillStyle=strInfo.color; ctx.fillRect(0, H-8, W*shot.conf, 8);
+      }
+
+      // ── Shuttle overlay ───────────────────────────────────────────────────
+      if(shuttleData && (shuttleData.visible || shuttleData.trail?.length)) {
+        // Trail (fading yellow dots)
+        (shuttleData.trail || []).forEach(pt => {
+          const sx = (pt.x / shot.img_w) * W;
+          const sy = (pt.y / shot.img_h) * H;
+          ctx.beginPath(); ctx.arc(sx, sy, 4, 0, Math.PI*2);
+          ctx.fillStyle = `rgba(250,204,21,${(pt.alpha || 0.3) * 0.55})`;
+          ctx.fill();
+        });
+        // Current position
+        if(shuttleData.visible) {
+          const sx = (shuttleData.x / shot.img_w) * W;
+          const sy = (shuttleData.y / shot.img_h) * H;
+          ctx.beginPath(); ctx.arc(sx, sy, 7, 0, Math.PI*2);
+          ctx.fillStyle = '#facc15';
+          ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2;
+          ctx.fill(); ctx.stroke();
+          // Crosshair tick marks
+          ctx.strokeStyle = '#facc1599'; ctx.lineWidth = 1;
+          [[sx-12,sy,sx-9,sy],[sx+9,sy,sx+12,sy],[sx,sy-12,sx,sy-9],[sx,sy+9,sx,sy+12]]
+            .forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});
+        }
+      }
+
+      // ── Skeleton legend ───────────────────────────────────────────────────
+      const legendH = skelData ? (shuttleData ? 60 : 42) : 28;
+      if(skelData) {
+        ctx.fillStyle='#00000088'; roundRect(ctx, W-110, H-legendH-8, 105, legendH, 4); ctx.fill();
+        // Legend colors: cyan (#60a5fa) is always the hitter; pink (#f472b6) always the opponent.
+        // p0color/p1color assign those colors to the correct court player, but the legend
+        // must show the ROLE colour, not the player-index colour.
+        const hitterColor   = hitIsTop ? p0color : p1color;
+        const opponentColor = hitIsTop ? p1color : p0color;
+        [['●','Hitter',hitterColor], ['●','Opponent',opponentColor]].forEach(([dot,lbl,c],i)=>{
+          ctx.fillStyle=c; ctx.font=`11px ${M}`; ctx.textAlign='left';
+          ctx.fillText(dot, W-105, H-legendH+10+i*16);
+          ctx.fillStyle='#e2e8f0'; ctx.font=`10px ${F}`;
+          ctx.fillText(lbl, W-92, H-legendH+10+i*16);
+        });
+        if(shuttleData) {
+          const hasSh = shuttleData.visible || shuttleData.trail?.length > 0;
+          ctx.fillStyle = hasSh ? '#facc15' : '#64748b';
+          ctx.font=`11px ${M}`; ctx.fillText('●', W-105, H-legendH+42);
+          ctx.fillStyle='#e2e8f0'; ctx.font=`10px ${F}`;
+          ctx.fillText(hasSh ? 'Shuttle' : 'Shuttle (n/d)', W-92, H-legendH+42);
+        }
+      } else {
+        ctx.fillStyle='#f59e0b88'; roundRect(ctx, W-160, H-28, 155, 22, 4); ctx.fill();
+        ctx.fillStyle='#f59e0b'; ctx.font=`9px ${M}`; ctx.textAlign='left';
+        ctx.fillText('⚠ No skeleton file for this rally', W-156, H-14);
+      }
+
+      // ── Skeleton source badge (top-right) ────────────────────────────────
+      const srcLabel = skelSource==='gdino' ? '🎯 GDINO'
+                     : skelSource==='gdino-fallback' ? '⚠ GDINO→orig'
+                     : 'YOLOv8';
+      const srcColor = skelSource==='gdino' ? '#10b981'
+                     : skelSource==='gdino-fallback' ? '#f59e0b'
+                     : '#64748b';
+      const srcW = ctx.measureText(srcLabel).width + 10;
+      ctx.fillStyle='#00000099'; roundRect(ctx, W-srcW-6,6,srcW+2,16,4); ctx.fill();
+      ctx.fillStyle=srcColor; ctx.font=`9px ${M}`; ctx.textAlign='right';
+      ctx.fillText(srcLabel, W-8, 18);
+
+      // ── Frame watermark ───────────────────────────────────────────────────
+      ctx.fillStyle='#ffffff44'; ctx.font=`8px ${M}`; ctx.textAlign='right';
+      ctx.fillText(`${shot.video} · f${displayFrame}${isHitFrame?' [HIT]':''}`, W-6, H-14);
+    };
+    img.onerror = () => {
+      if(cancelled) return;
+      ctx.fillStyle='#1e293b'; ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#475569'; ctx.font=`12px ${M}`; ctx.textAlign='center';
+      ctx.fillText('Frame not found', W/2, H/2);
+    };
+    img.src = `${SERVER}/frame/${shot.video}/${displayFrame}`;
+    return () => { cancelled = true; };  // cancel on re-run or unmount
+  }, [shot?.id, displayFrame, skelData, shuttleData]);
+
+  // Compute hitter validation metrics from skelData
+  const hitterCheck = useMemo(() => {
+    if(!skelData || !shot) return null;
+    const p0x = skelData[0].reduce((s,j)=>s+j[0],0)/17;
+    const p0y = skelData[0].reduce((s,j)=>s+j[1],0)/17;
+    const p1x = skelData[1].reduce((s,j)=>s+j[0],0)/17;
+    const p1y = skelData[1].reduce((s,j)=>s+j[1],0)/17;
+    const umpireThresh = 200;
+    const p0Suspect = p0x < umpireThresh;   // x too far left → likely chair umpire
+    // Hitter annotation: "top"→P0 should be hitter (smaller Y), "bottom"→P1
+    const hitter = shot.hitter;
+    const hitterIsP0 = hitter === 'top';
+    // Verify Y-sort is correct: P0 should have smaller Y than P1
+    const ySortOk = p0y < p1y;
+    return { p0x, p0y, p1x, p1y, p0Suspect, hitter, hitterIsP0, ySortOk };
+  }, [skelData, shot?.id]);
+
+  return (
+    <div>
+      <div style={{position:'relative',borderRadius:8,overflow:'hidden',background:'#0a0f1a',
+        border:`1px solid ${hitterCheck?.p0Suspect?'#ef444466':'#1e293b'}`}}>
+        <canvas ref={canvasRef} width={width} height={height}
+          style={{display:'block',maxWidth:'100%'}}/>
+        {!frameLoaded && (
+          <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',
+            justifyContent:'center',pointerEvents:'none'}}>
+            <div style={{fontSize:11,color:'#475569',fontFamily:M}}>Loading frame…</div>
+          </div>
+        )}
+      </div>
+      {/* ── Hitter validation panel ── */}
+      {hitterCheck && (
+        <div style={{marginTop:5,padding:'7px 10px',borderRadius:6,
+          background: hitterCheck.p0Suspect ? '#ef444411' : '#0f172a',
+          border:`1px solid ${hitterCheck.p0Suspect?'#ef444433':'#1e293b'}`}}>
+          <div style={{display:'flex',flexWrap:'wrap',gap:10,alignItems:'center'}}>
+            {/* Warning badge */}
+            {hitterCheck.p0Suspect ? (
+              <span style={{fontSize:9,fontFamily:M,color:'#ef4444',fontWeight:600,
+                background:'#ef444422',padding:'2px 7px',borderRadius:3,whiteSpace:'nowrap'}}>
+                ⚠ P0.x={hitterCheck.p0x.toFixed(0)}px — chair umpire likely as P0
+              </span>
+            ) : (
+              <span style={{fontSize:9,fontFamily:M,color:'#10b981',
+                background:'#10b98111',padding:'2px 7px',borderRadius:3,whiteSpace:'nowrap'}}>
+                ✓ P0 position ok ({hitterCheck.p0x.toFixed(0)}px)
+              </span>
+            )}
+            {/* Y-sort check */}
+            <span style={{fontSize:9,fontFamily:M,
+              color:hitterCheck.ySortOk?'#64748b':'#f59e0b',whiteSpace:'nowrap'}}>
+              Y-sort: {hitterCheck.ySortOk?'✓':'⚠'} P0.y={hitterCheck.p0y.toFixed(0)} P1.y={hitterCheck.p1y.toFixed(0)}
+            </span>
+            {/* Hitter annotation */}
+            <span style={{fontSize:9,fontFamily:M,color:'#64748b',whiteSpace:'nowrap'}}>
+              Annotation: hitter=<span style={{
+                color:hitterCheck.hitter==='top'?'#60a5fa':'#f472b6',fontWeight:600}}>
+                {hitterCheck.hitter||'?'}
+              </span>
+              {' → '}
+              <span style={{color:hitterCheck.hitter==='top'?'#60a5fa':'#f472b6'}}>
+                {hitterCheck.hitter==='top'?'P0 (cyan)':hitterCheck.hitter==='bottom'?'P1 (pink)':'unknown'}
+              </span>
+              {' should be hitter'}
+            </span>
+            {/* Source */}
+            <span style={{marginLeft:'auto',fontSize:8,fontFamily:M,color:'#334155',whiteSpace:'nowrap'}}>
+              {skelSource==='gdino'?'GDINO-guided':skelSource==='gdino-fallback'?'GDINO→original fallback':'Original YOLOv8'}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Rally scrubber ───────────────────────────────────────────────────────────
+function RallyScrubber({ rallyMeta, currentShot, scrubFrame, onScrub, onShotJump }) {
+  const barRef = useRef(null);
+  if(!rallyMeta || !currentShot) return null;
+
+  const { frame_min, frame_max, shots: rallyShots } = rallyMeta;
+  const range  = frame_max - frame_min || 1;
+  const frac   = fn => Math.max(0, Math.min(1, (fn - frame_min) / range));
+  const active = scrubFrame ?? currentShot.hit_frame;
+
+  const seekTo = e => {
+    if(!barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const x    = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onScrub(Math.round(frame_min + x * range));
+  };
+
+  const elapsed = active - frame_min;
+  const total   = frame_max - frame_min;
+
+  return (
+    <div style={{marginTop:8,userSelect:'none'}}>
+      {/* Info row */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+        marginBottom:4,padding:'0 2px'}}>
+        <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+          f<span style={{color:'#e2e8f0'}}>{active}</span>
+          &nbsp;·&nbsp;t=<span style={{color:'#e2e8f0'}}>{elapsed}</span>
+          {active===currentShot.hit_frame &&
+            <span style={{color:STRAT[currentShot.strategy].color,marginLeft:4}}> [HIT]</span>}
+        </span>
+        <span style={{fontSize:9,fontFamily:M,color:'#475569'}}>
+          {elapsed} / {total} frames &nbsp;·&nbsp; {rallyShots.length} shots in rally
+        </span>
+      </div>
+
+      {/* Timeline bar */}
+      <div ref={barRef}
+        style={{position:'relative',height:32,background:'#0f172a',borderRadius:6,
+          cursor:'crosshair',border:'1px solid #1e293b'}}
+        onPointerDown={e=>{ e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
+        onPointerMove={e=>{ if(e.buttons&1) seekTo(e); }}>
+
+        {/* Played region */}
+        <div style={{position:'absolute',left:0,top:0,bottom:0,
+          width:`${frac(active)*100}%`,background:'#1e293b',borderRadius:'6px 0 0 6px'}}/>
+
+        {/* Unlabeled hit ticks (from annotation windows, no strategy) */}
+        {(rallyMeta.windows||[]).filter(w => !rallyShots.some(s=>s.hit_frame===w.hit_frame)).map((w,i) => (
+          <div key={`w${i}`}
+            title={`${w.hitter} hitter · f${w.hit_frame} (unlabeled)`}
+            style={{position:'absolute',left:`${frac(w.hit_frame)*100}%`,top:'25%',bottom:'25%',
+              width:1,marginLeft:-0.5,background:'#475569',opacity:0.6,pointerEvents:'none',zIndex:0}}/>
+        ))}
+
+        {/* Labeled shot tick marks */}
+        {rallyShots.map(s => {
+          const x    = frac(s.hit_frame)*100;
+          const isAct= s.id === currentShot.id;
+          const col  = STRAT[s.strategy].color;
+          return (
+            <div key={s.id}
+              onClick={()=>onShotJump(s)}
+              onPointerDown={e=>e.stopPropagation()}
+              title={`${STRAT[s.strategy].label} · f${s.hit_frame}`}
+              style={{position:'absolute',left:`${x}%`,top:0,bottom:0,
+                width: isAct?3:2,marginLeft:isAct?-1.5:-1,
+                background: col,
+                opacity: isAct?1:0.7,
+                cursor:'pointer',
+                boxShadow: isAct?`0 0 6px ${col}`:'none',
+                zIndex: isAct?2:1}}>
+              {/* Strategy icon above the tick for the active shot */}
+              {isAct && (
+                <div style={{position:'absolute',bottom:'calc(100% + 3px)',
+                  left:'50%',transform:'translateX(-50%)',
+                  fontSize:10,lineHeight:1,pointerEvents:'none'}}>
+                  {STRAT[s.strategy].icon}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Playhead */}
+        <div style={{position:'absolute',left:`${frac(active)*100}%`,
+          top:-4,width:2,height:'calc(100% + 8px)',marginLeft:-1,
+          background:'#f8fafc',borderRadius:1,pointerEvents:'none',zIndex:3,
+          boxShadow:'0 0 4px #fff8'}}/>
+      </div>
+
+      {/* Legend */}
+      <div style={{display:'flex',gap:12,marginTop:4,flexWrap:'wrap'}}>
+        {rallyShots.reduce((seen,s)=>{
+          if(!seen.has(s.strategy)){
+            seen.set(s.strategy, rallyShots.filter(x=>x.strategy===s.strategy).length);
+          }
+          return seen;
+        }, new Map()).entries().toArray().map(([k,n])=>(
+          <span key={k} style={{fontSize:8,fontFamily:M,color:STRAT[k].color,display:'flex',alignItems:'center',gap:3}}>
+            <span style={{display:'inline-block',width:8,height:8,background:STRAT[k].color,borderRadius:1}}/>
+            {STRAT[k].label} ×{n}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── SS SCRUBBER ─────────────────────────────────────────────────────────────
+// Simpler scrubber for ShuttleSet — no strategy colours, uses shot_type ticks.
+function SSScrubber({ rallyMeta, hitFrame, scrubFrame, onScrub, onShotJump }) {
+  const barRef = useRef(null);
+  if (!rallyMeta) return null;
+
+  const { frame_min, frame_max, shots } = rallyMeta;
+  const range   = frame_max - frame_min || 1;
+  const frac    = fn => Math.max(0, Math.min(1, (fn - frame_min) / range));
+  const active  = scrubFrame ?? hitFrame;
+  const elapsed = active - frame_min;
+
+  const seekTo = e => {
+    if (!barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const x    = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onScrub(Math.round(frame_min + x * range));
+  };
+
+  return (
+    <div style={{marginTop:8,userSelect:'none',background:'#0f172a',borderRadius:8,
+      border:'1px solid #1e293b',padding:'8px 12px'}}>
+      {/* Info row */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+        <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+          f<span style={{color:'#e2e8f0',fontWeight:600}}>{active}</span>
+          &nbsp;·&nbsp;t=<span style={{color:'#60a5fa',fontWeight:600}}>{elapsed}</span>
+          {active === hitFrame && <span style={{color:'#10b981',marginLeft:6}}>● HIT</span>}
+        </span>
+        <span style={{fontSize:9,fontFamily:M,color:'#475569'}}>
+          {elapsed} / {frame_max - frame_min} frames · {shots.length} shots
+        </span>
+      </div>
+
+      {/* Timeline bar */}
+      <div ref={barRef}
+        style={{position:'relative',height:28,background:'#0a0f1a',borderRadius:5,
+          cursor:'crosshair',border:'1px solid #1e293b22'}}
+        onPointerDown={e=>{ e.currentTarget.setPointerCapture(e.pointerId); seekTo(e); }}
+        onPointerMove={e=>{ if (e.buttons & 1) seekTo(e); }}>
+
+        {/* Played region */}
+        <div style={{position:'absolute',left:0,top:0,bottom:0,
+          width:`${frac(active)*100}%`,background:'#1e293b55',borderRadius:'5px 0 0 5px'}}/>
+
+        {/* Shot tick marks */}
+        {shots.map((s, i) => {
+          const isHit = s.hit_frame === hitFrame;
+          const isNear = !isHit && Math.abs(s.hit_frame - (scrubFrame ?? hitFrame)) < range * 0.02;
+          return (
+            <div key={i}
+              onClick={()=>onShotJump(s)}
+              onPointerDown={e=>e.stopPropagation()}
+              title={`${SS_SHOT_TYPE_EN[s.shot_type]||s.shot_type} · P${s.player} · f${s.hit_frame}`}
+              style={{position:'absolute',left:`${frac(s.hit_frame)*100}%`,top:0,bottom:0,
+                width: isHit ? 3 : 2, marginLeft: isHit ? -1.5 : -1,
+                background: isHit ? '#10b981' : '#60a5fa88',
+                cursor:'pointer',zIndex: isHit ? 2 : 1,
+                boxShadow: isHit ? '0 0 5px #10b981' : 'none'}}/>
+          );
+        })}
+
+        {/* Playhead */}
+        <div style={{position:'absolute',left:`${frac(active)*100}%`,
+          top:-3,width:2,height:'calc(100% + 6px)',marginLeft:-1,
+          background:'#f8fafc',borderRadius:1,pointerEvents:'none',zIndex:3,
+          boxShadow:'0 0 4px #fff8'}}/>
+      </div>
+    </div>
+  );
+}
+
+// ─── SS SHUTTLE TRAJECTORY PANEL ─────────────────────────────────────────────
+// 3-panel trajectory visualisation for a rally: xy scatter (colour=time), x vs frame, y vs frame.
+function SSTrajectoryPanel({ matchName, rallyUid, currentFrame=null, width=760, height=180 }) {
+  const canvasRef = useRef(null);
+  const [trajData, setTrajData] = useState(null);
+
+  // Fetch trajectory when rally changes
+  useEffect(() => {
+    if (!matchName || !rallyUid) { setTrajData(null); return; }
+    const enc = encodeURIComponent(matchName);
+    fetch(`${SERVER}/api/ss/shuttle_trajectory/${enc}/${rallyUid}`)
+      .then(r => r.json())
+      .then(d => { if (d.points) setTrajData(d); else setTrajData(null); })
+      .catch(() => setTrajData(null));
+  }, [matchName, rallyUid]);
+
+  // Draw
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.fillStyle = '#0a0f1a'; ctx.fillRect(0, 0, W, H);
+
+    if (!trajData || !trajData.points || trajData.points.length === 0) {
+      ctx.fillStyle = '#475569'; ctx.font = `11px ${M}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('No shuttle trajectory data for this rally', W / 2, H / 2);
+      return;
+    }
+
+    const pts = trajData.points.filter(p => p.visible);
+    if (pts.length === 0) {
+      ctx.fillStyle = '#475569'; ctx.font = `11px ${M}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('No visible shuttle detections', W / 2, H / 2);
+      return;
+    }
+
+    const pad = { top: 22, bottom: 18, left: 36, right: 8 };
+    const gap = 16;
+    const panelW = Math.floor((W - gap * 2) / 3);
+
+    // Data ranges
+    const xs = pts.map(p => p.x), ys = pts.map(p => p.y), fs = pts.map(p => p.frame);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    const fMin = Math.min(...fs), fMax = Math.max(...fs);
+    const fRange = fMax - fMin || 1;
+
+    // Colour by time (purple → yellow, like viridis)
+    const viridis = (t) => {
+      // Simplified viridis: purple(0) → teal(0.5) → yellow(1)
+      const r = Math.round(t < 0.5 ? 68 + t * 2 * (49 - 68) : 49 + (t - 0.5) * 2 * (253 - 49));
+      const g = Math.round(t < 0.5 ? 1 + t * 2 * (104 - 1) : 104 + (t - 0.5) * 2 * (231 - 104));
+      const b = Math.round(t < 0.5 ? 84 + t * 2 * (142 - 84) : 142 + (t - 0.5) * 2 * (37 - 142));
+      return `rgb(${r},${g},${b})`;
+    };
+
+    // Helper: draw one panel
+    const drawPanel = (ox, oy, pw, ph, dataX, dataY, dxMin, dxMax, dyMin, dyMax, title, xLabel, yLabel, invertY=false) => {
+      const plotL = ox + pad.left, plotR = ox + pw - pad.right;
+      const plotT = oy + pad.top,  plotB = oy + ph - pad.bottom;
+      const plotW = plotR - plotL, plotH = plotB - plotT;
+      const dxRange = dxMax - dxMin || 1, dyRange = dyMax - dyMin || 1;
+
+      // Background
+      ctx.fillStyle = '#0f172a'; ctx.fillRect(ox, oy, pw, ph);
+      ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1;
+      ctx.strokeRect(plotL, plotT, plotW, plotH);
+
+      // Title
+      ctx.fillStyle = '#94a3b8'; ctx.font = `bold 10px ${M}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(title, ox + pw / 2, oy + 14);
+
+      // Axis labels
+      ctx.fillStyle = '#475569'; ctx.font = `8px ${M}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(xLabel, ox + pw / 2, oy + ph - 2);
+      ctx.save();
+      ctx.translate(ox + 8, oy + ph / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(yLabel, 0, 0);
+      ctx.restore();
+
+      // Axis ticks (3 each)
+      ctx.fillStyle = '#334155'; ctx.font = `7px ${M}`;
+      for (let i = 0; i <= 2; i++) {
+        const frac = i / 2;
+        // X tick
+        const tx = plotL + frac * plotW;
+        ctx.textAlign = 'center';
+        ctx.fillText(Math.round(dxMin + frac * dxRange), tx, plotB + 10);
+        ctx.beginPath(); ctx.moveTo(tx, plotB); ctx.lineTo(tx, plotB + 3); ctx.strokeStyle = '#334155'; ctx.stroke();
+        // Y tick
+        const ty = invertY ? plotT + frac * plotH : plotB - frac * plotH;
+        ctx.textAlign = 'right';
+        ctx.fillText(Math.round(dyMin + frac * dyRange), plotL - 3, ty + 3);
+        ctx.beginPath(); ctx.moveTo(plotL - 3, ty); ctx.lineTo(plotL, ty); ctx.stroke();
+      }
+
+      // Plot points
+      for (let i = 0; i < dataX.length; i++) {
+        const sx = plotL + ((dataX[i] - dxMin) / dxRange) * plotW;
+        const rawY = ((dataY[i] - dyMin) / dyRange);
+        const sy = invertY ? plotT + rawY * plotH : plotB - rawY * plotH;
+        const t = (pts[i].frame - fMin) / fRange;
+        ctx.fillStyle = viridis(t);
+        ctx.beginPath(); ctx.arc(sx, sy, 2.5, 0, Math.PI * 2); ctx.fill();
+      }
+
+      // Current frame marker
+      if (currentFrame != null) {
+        const ci = pts.findIndex(p => p.frame >= currentFrame);
+        if (ci >= 0 && Math.abs(pts[ci].frame - currentFrame) <= 2) {
+          const sx = plotL + ((dataX[ci] - dxMin) / dxRange) * plotW;
+          const rawY = ((dataY[ci] - dyMin) / dyRange);
+          const sy = invertY ? plotT + rawY * plotH : plotB - rawY * plotH;
+          ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2); ctx.stroke();
+          ctx.lineWidth = 1;
+        }
+      }
+    };
+
+    const ph = H;
+
+    // Panel 1: XY scatter (court view)
+    drawPanel(0, 0, panelW, ph, xs, ys, xMin, xMax, yMin, yMax,
+      'Shuttle path (colour=time)', 'x (px)', 'y (px) ↓', true);
+
+    // Panel 2: X (lateral) over time
+    drawPanel(panelW + gap, 0, panelW, ph, fs, xs, fMin, fMax, xMin, xMax,
+      'Lateral position over time', 'Frame', 'x (px)', false);
+
+    // Panel 3: Y (depth) over time
+    drawPanel((panelW + gap) * 2, 0, panelW, ph, fs, ys, fMin, fMax, yMin, yMax,
+      'Depth position over time', 'Frame', 'y (px) ↓', true);
+
+    // Colour bar for panel 1
+    const barX = panelW - pad.right - 12, barY = pad.top, barH = ph - pad.top - pad.bottom;
+    for (let i = 0; i < barH; i++) {
+      ctx.fillStyle = viridis(i / barH);
+      ctx.fillRect(barX, barY + i, 8, 1);
+    }
+    ctx.strokeStyle = '#334155'; ctx.strokeRect(barX, barY, 8, barH);
+    ctx.fillStyle = '#475569'; ctx.font = `7px ${M}`;
+    ctx.textAlign = 'left';
+    ctx.fillText(fMin, barX + 11, barY + 6);
+    ctx.fillText(fMax, barX + 11, barY + barH);
+
+    // Format badge
+    ctx.fillStyle = trajData.format === 'dense' ? '#10b98133' : '#f59e0b33';
+    ctx.fillRect(W - 52, 2, 50, 14); ctx.borderRadius = 4;
+    ctx.fillStyle = trajData.format === 'dense' ? '#10b981' : '#f59e0b';
+    ctx.font = `bold 8px ${M}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(trajData.format === 'dense' ? 'DENSE' : 'SPARSE', W - 27, 12);
+
+  }, [trajData, currentFrame, width, height]);
+
+  return (
+    <div style={{marginTop:8}}>
+      <canvas ref={canvasRef} width={width} height={height}
+        style={{borderRadius:8,border:'1px solid #1e293b',display:'block'}}/>
+    </div>
+  );
+}
+
+// ─── SS FRAME CANVAS ─────────────────────────────────────────────────────────
+// frameNum: absolute frame to display. null = show shot.frame_num (hit frame).
+function SSFrameCanvas({ shot, frameNum=null, rallyShots=[], skelMode='gdino', width=760, height=427 }) {
+  const canvasRef = useRef(null);
+  const [skelData,    setSkelData]    = useState(null);
+  const [skelSource,  setSkelSource]  = useState(null); // 'original'|'gdino'|'gdino-fallback'
+  const [skelHitter,  setSkelHitter]  = useState(null); // 'top'|'bottom'|null — from server
+  const [shuttleData, setShuttleData] = useState(null);
+  const [frameLoaded, setFrameLoaded] = useState(false);
+
+  const displayFrame = frameNum ?? shot?.frame_num;
+  const isHitFrame   = displayFrame === shot?.frame_num;
+
+  // Reset frameLoaded when match/rally changes (not on scrub — keep previous frame visible)
+  useEffect(() => { setFrameLoaded(false); }, [shot?.match, shot?.rally]);
+
+  // Fetch shuttle position for the current display frame
+  useEffect(() => {
+    if (!shot || !displayFrame) { setShuttleData(null); return; }
+    const enc = encodeURIComponent(shot.match);
+    fetch(`${SERVER}/api/ss/shuttle/${enc}/${displayFrame}`)
+      .then(r => r.json())
+      .then(d => setShuttleData(d))
+      .catch(() => setShuttleData(null));
+  }, [shot?.match, displayFrame]);
+
+  // Fetch skeleton for the current displayFrame.
+  // Server returns skeleton (P0=top, P1=bottom always) + hitter ('top'|'bottom') for coloring.
+  useEffect(() => {
+    if (!shot || !displayFrame) { setSkelData(null); setSkelSource(null); setSkelHitter(null); return; }
+    setSkelData(null); setSkelSource(null); setSkelHitter(null);
+    const enc = encodeURIComponent(shot.match);
+    if (skelMode === 'gdino') {
+      fetch(`${SERVER}/api/ss/skeleton_gdino/${enc}/${shot.rally}/${displayFrame}`)
+        .then(r => r.json())
+        .then(d => {
+          if (!d.has_skeleton) { setSkelData(null); return; }
+          setSkelData(d.skeleton);
+          setSkelSource(d.has_gdino ? 'gdino' : 'gdino-fallback');
+          setSkelHitter(d.hitter || null);
+        })
+        .catch(() => setSkelData(null));
+    } else {
+      // Original skeletons are per-shot; only meaningful at the hit frame
+      if (!isHitFrame) { setSkelData(null); return; }
+      fetch(`${SERVER}/api/ss/skeleton/${enc}/${shot.rally}/${shot.ball_round}`)
+        .then(r => r.json())
+        .then(d => {
+          setSkelData(d.has_skeleton ? d.skeleton : null);
+          setSkelSource('original');
+          setSkelHitter(shot.hitter || null);
+        })
+        .catch(() => setSkelData(null));
+    }
+  }, [shot?.match, shot?.rally, shot?.ball_round, skelMode, displayFrame]);
+
+  // Draw
+  useEffect(() => {
+    if (!shot || !canvasRef.current) return;
+    let cancelled = false;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    // Don't clear here — keep previous frame while next loads (avoids black flash on scrub).
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      ctx.fillStyle = '#0a0f1a'; ctx.fillRect(0, 0, W, H);
+      ctx.drawImage(img, 0, 0, W, H);
+      setFrameLoaded(true);
+
+      // Hitter identity: P0=top-court, P1=bottom-court (always, no swapping).
+      // hitter='top'|'bottom' tells us which one hit — color them accordingly.
+      // Same pattern as FineBadminton's RealFrameCanvas.
+      const hitter = skelHitter || shot.hitter || null;
+      const hitIsTop = hitter === 'top' ? true : hitter === 'bottom' ? false : null;
+      const p0color = hitIsTop === true ? '#60a5fa' : hitIsTop === false ? '#f472b6' : '#a78bfa';
+      const p1color = hitIsTop === true ? '#f472b6' : hitIsTop === false ? '#60a5fa' : '#a78bfa';
+
+      if (skelData) {
+        const p0lbl = hitIsTop === true ? 'Hitter (top)' : hitIsTop === false ? 'Opp (top)' : 'P0';
+        const p1lbl = hitIsTop === true ? 'Opp (bot)' : hitIsTop === false ? 'Hitter (bot)' : 'P1';
+        [[skelData[0], p0color, p0lbl],
+         [skelData[1], p1color, p1lbl]].forEach(([joints, col, lbl]) => {
+          const valid = joints.filter(j => j[0] > 0 && j[1] > 0);
+          if (!valid.length) return;
+          const xs = valid.map(j => j[0]), ys = valid.map(j => j[1]);
+          const sx1 = (Math.min(...xs)/shot.img_w)*W - 6, sy1 = (Math.min(...ys)/shot.img_h)*H - 10;
+          const sx2 = (Math.max(...xs)/shot.img_w)*W + 6, sy2 = (Math.max(...ys)/shot.img_h)*H + 6;
+          ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+          ctx.strokeRect(sx1, sy1, sx2 - sx1, sy2 - sy1);
+          ctx.setLineDash([]);
+          ctx.fillStyle = col + 'cc'; roundRect(ctx, sx1, sy1-14, ctx.measureText(lbl).width+8, 13, 3); ctx.fill();
+          ctx.fillStyle = '#0a0f1a'; ctx.font = `8px ${M}`; ctx.textAlign = 'left';
+          ctx.fillText(lbl, sx1+4, sy1-4);
+        });
+        drawRealSkeleton(ctx, skelData[0], shot.img_w, shot.img_h, W, H, p0color);
+        drawRealSkeleton(ctx, skelData[1], shot.img_w, shot.img_h, W, H, p1color);
+      }
+
+      // Shuttle overlay
+      if (shuttleData && shuttleData.visible) {
+        const sx = (shuttleData.x / shot.img_w) * W;
+        const sy = (shuttleData.y / shot.img_h) * H;
+        // Glow ring
+        ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI*2);
+        ctx.strokeStyle = '#FFE66D88'; ctx.lineWidth = 3; ctx.stroke();
+        // Dot
+        ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI*2);
+        ctx.fillStyle = '#FFE66D'; ctx.fill();
+        ctx.strokeStyle = '#FF6B35'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+
+      // Shot-type info overlay (top-left)
+      const typeEn = SS_SHOT_TYPE_EN[shot.shot_type] || shot.shot_type;
+      ctx.fillStyle = '#00000088';
+      ctx.beginPath(); roundRect(ctx, 8, 8, 220, 52, 6); ctx.fill();
+      ctx.fillStyle = '#60a5fa'; ctx.font = `bold 15px ${F}`; ctx.textAlign = 'left';
+      ctx.fillText(typeEn, 16, 30);
+      ctx.fillStyle = '#e2e8f0'; ctx.font = `11px ${M}`;
+      const hitterLabel = hitter ? `${hitter} hitter` : `Player ${shot.player}`;
+      ctx.fillText(`${shot.shot_type}  ·  ${hitterLabel}  ·  Rally ${shot.rally}`, 16, 48);
+
+      // Legend (bottom-right)
+      const hasSh = shuttleData && shuttleData.visible;
+      const legendRows = (skelData ? 2 : 0) + (hasSh ? 1 : 0);
+      const legendH = legendRows > 0 ? legendRows * 16 + 10 : 0;
+      if (legendH > 0) {
+        const skelLegend = hitIsTop !== null
+          ? [['●','Hitter', '#60a5fa'], ['●','Opponent', '#f472b6']]
+          : [['●','P0 (top)', '#a78bfa'], ['●','P1 (bot)', '#a78bfa']];
+        ctx.fillStyle = '#00000088'; roundRect(ctx, W-120, H-legendH-8, 115, legendH, 4); ctx.fill();
+        const rows = [
+          ...(skelData ? skelLegend : []),
+          ...(hasSh ? [['●','Shuttle', '#FFE66D']] : []),
+        ];
+        rows.forEach(([dot, lbl, c], i) => {
+          ctx.fillStyle = c; ctx.font = `11px ${M}`; ctx.textAlign = 'left';
+          ctx.fillText(dot, W-115, H-legendH+10+i*16);
+          ctx.fillStyle = '#e2e8f0'; ctx.font = `10px ${F}`;
+          ctx.fillText(lbl, W-102, H-legendH+10+i*16);
+        });
+      }
+      if (!skelData) {
+        ctx.fillStyle = '#f59e0b88'; roundRect(ctx, W-185, H-legendH-34, 180, 22, 4); ctx.fill();
+        ctx.fillStyle = '#f59e0b'; ctx.font = `9px ${M}`; ctx.textAlign = 'left';
+        ctx.fillText('⚠ Skeleton not extracted for this match', W-181, H-legendH-20);
+      }
+
+      // Skeleton source badge (top-right)
+      if (skelData && skelSource) {
+        const srcLabel = skelSource==='gdino' ? '🎯 GDINO'
+                       : skelSource==='gdino-fallback' ? '⚠ GDINO→orig'
+                       : 'YOLOv8';
+        const srcColor = skelSource==='gdino' ? '#10b981'
+                       : skelSource==='gdino-fallback' ? '#f59e0b'
+                       : '#60a5fa';
+        const bw = ctx.measureText(srcLabel).width + 16;
+        ctx.fillStyle = srcColor + '33'; roundRect(ctx, W-bw-6, 6, bw, 20, 4); ctx.fill();
+        ctx.fillStyle = srcColor; ctx.font = `bold 9px ${M}`; ctx.textAlign = 'right';
+        ctx.fillText(srcLabel, W-10, 19);
+      }
+
+      // Watermark — show current display frame + rally_t offset
+      ctx.fillStyle = '#ffffff44'; ctx.font = `8px ${M}`; ctx.textAlign = 'right';
+      const tOffset = displayFrame - (shot.rally_frame_start ?? shot.frame_num);
+      ctx.fillText(`${ssMatchLabel(shot.match)} · f${displayFrame} · t=${tOffset}`, W-6, H-6);
+    };
+    img.onerror = () => { if (cancelled) return; setFrameLoaded(true); };
+    const enc = encodeURIComponent(shot.match);
+    img.src = `${SERVER}/ss/frame/${enc}/${displayFrame}`;
+    return () => { cancelled = true; };
+  }, [shot?.match, displayFrame, shot?.rally, shot?.ball_round, skelData, skelHitter, shuttleData]);
+
+  return (
+    <div style={{position:'relative',borderRadius:8,overflow:'hidden',background:'#0a0f1a',border:'1px solid #1e293b'}}>
+      <canvas ref={canvasRef} width={width} height={height} style={{display:'block',maxWidth:'100%'}}/>
+      {!frameLoaded && (
+        <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',
+          justifyContent:'center',pointerEvents:'none',background:'#0a0f1acc'}}>
+          <div style={{textAlign:'center'}}>
+            <div className="spin" style={{width:28,height:28,border:'3px solid #334155',
+              borderTopColor:'#60a5fa',borderRadius:'50%',margin:'0 auto 8px'}}/>
+            <div style={{fontSize:11,color:'#64748b',fontFamily:M}}>Loading frame…</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SS BROWSER ──���──────────────────────────────────────��─────────────────�����──
+function SSBrowser() {
+  // ── Lazy-load: match list on mount, shots per match on selection ─────��────
+  const [ssMatches,    setSSMatches]    = useState(null);   // null = not yet loaded
+  const [ssOnline,     setSSOnline]     = useState(false);
+  const [matchShots,   setMatchShots]   = useState([]);
+  const [shotsLoading, setShotsLoading] = useState(false);
+  const [splitFilter,  setSplitFilter]  = useState('all'); // 'all' | 'train' | 'test' | 'held_out'
+  // Fetch match summaries once
+  useEffect(() => {
+    fetch(`${SERVER}/api/ss/matches`, { signal: AbortSignal.timeout(5000) })
+      .then(r => r.json())
+      .then(data => { setSSMatches(data); setSSOnline(true); })
+      .catch(() => { setSSMatches([]); setSSOnline(false); });
+  }, []);
+
+  const [selMatch,   setSelMatch]   = useState(null);
+  const [selRally,   setSelRally]   = useState(null);
+  const [selShotIdx, setSelShotIdx] = useState(0);
+
+  // Auto-select first active match when matches load
+  useEffect(() => {
+    if (ssMatches && ssMatches.length > 0 && !selMatch) {
+      const active = ssMatches.filter(m => ['train','held_out'].includes(m.split));
+      if (active.length > 0) setSelMatch(active[0].match);
+    }
+  }, [ssMatches]);
+  const [scrubFrame,   setScrubFrame]   = useState(null);  // null = show hit frame
+  const [rallyMeta,    setRallyMeta]    = useState(null);  // /api/ss/rally response
+
+  // Fetch shots when a match is selected
+  useEffect(() => {
+    if (!selMatch) return;
+    setShotsLoading(true);
+    fetch(`${SERVER}/api/ss/match/${encodeURIComponent(selMatch)}`)
+      .then(r => r.json())
+      .then(data => setMatchShots(data.shots || []))
+      .catch(() => setMatchShots([]))
+      .finally(() => setShotsLoading(false));
+  }, [selMatch]);
+
+  // Group loaded shots by rally_uid (unique per set+rally, avoids set1-rally1 = set2-rally1)
+  const rallyGroups = useMemo(() => {
+    const g = {};
+    matchShots.forEach(s => {
+      const key = s.rally_uid || String(s.rally);
+      if (!g[key]) g[key] = [];
+      g[key].push(s);
+    });
+    return g;
+  }, [matchShots]);
+
+  // Auto-select first rally when shots load
+  useEffect(() => {
+    if (matchShots.length > 0) {
+      const r = Object.keys(rallyGroups).sort()[0];
+      setSelRally(r); setSelShotIdx(0);
+    }
+  }, [matchShots]);
+
+  // Fetch rally frame range whenever rally changes (enables scrubber)
+  useEffect(() => {
+    if (!selMatch || !selRally) { setRallyMeta(null); return; }
+    const enc = encodeURIComponent(selMatch);
+    fetch(`${SERVER}/api/ss/rally/${enc}/${selRally}`)
+      .then(r => r.json()).then(setRallyMeta).catch(() => setRallyMeta(null));
+  }, [selMatch, selRally]);
+
+  // Reset scrubber when shot changes
+  useEffect(() => { setScrubFrame(null); }, [selShotIdx]);
+
+  const rallies    = Object.keys(rallyGroups).sort();
+  const rallyShots = (selRally != null && rallyGroups[selRally]) || [];
+  const currentShot = rallyShots[selShotIdx] || null;
+
+  // Shot whose hit frame the scrubber has most recently passed — drives metadata/prediction panels
+  const activeShot = useMemo(() => {
+    if (!scrubFrame || !rallyShots.length) return currentShot;
+    let result = null;
+    for (const s of rallyShots) {
+      if (s.frame_num <= scrubFrame) result = s;
+    }
+    return result || currentShot;
+  }, [scrubFrame, rallyShots, currentShot]);
+
+  const selectMatch = m => {
+    setSelMatch(m); setSelRally(null); setSelShotIdx(0); setMatchShots([]);
+  };
+
+  if (ssMatches === null) return (
+    <div style={{padding:'10px 14px',background:'#1e293b',borderRadius:8,fontSize:11,color:'#64748b',fontFamily:M}}>
+      Loading ShuttleSet matches…</div>
+  );
+  if (!ssOnline) return (
+    <div style={{padding:'12px 16px',background:'#7f1d1d22',border:'1px solid #ef444433',borderRadius:8}}>
+      <div style={{fontSize:12,color:'#ef4444',fontFamily:M,fontWeight:600,marginBottom:4}}>⚠ Server not running</div>
+      <div style={{fontSize:11,color:'#fca5a5',lineHeight:1.7}}>
+        Start: <code style={{fontFamily:M,color:'#f87171',background:'#450a0a',padding:'2px 8px',borderRadius:4}}>python badminton_server.py</code>
+      </div>
+    </div>
+  );
+
+  // Show all matches in the active split (train/test/held_out)
+  const skelMatches  = ssMatches.filter(m => ['train','held_out'].includes(m.split));
+  const totalShots   = skelMatches.reduce((a,m) => a + m.shot_count, 0);
+  const totalSkel    = skelMatches.reduce((a,m) => a + m.skeleton_count, 0);
+  const trainCount    = skelMatches.filter(m => m.split === 'train').length;
+  const testCount     = skelMatches.filter(m => m.split === 'test').length;
+  const heldOutCount  = skelMatches.filter(m => m.split === 'held_out').length;
+  const visMatches    = splitFilter === 'all'      ? skelMatches
+                      : splitFilter === 'train'    ? skelMatches.filter(m => m.split === 'train')
+                      : splitFilter === 'test'     ? skelMatches.filter(m => m.split === 'test')
+                      : splitFilter === 'held_out' ? skelMatches.filter(m => m.split === 'held_out')
+                      : skelMatches;
+
+  return (
+    <>
+      <div style={{padding:'6px 12px',background:'#10b98111',border:'1px solid #10b98133',
+        borderRadius:8,marginBottom:10,display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+        <span style={{color:'#10b981',fontSize:12}}>●</span>
+        <span style={{fontSize:11,color:'#10b981',fontFamily:M}}>
+          Server online · {skelMatches.length} matches with skeletons
+        </span>
+        {[
+          ['all',      'All',      '#60a5fa', skelMatches.length],
+          ['train',    'Train',    '#22c55e', trainCount],
+          ['test',     'Test',     '#f59e0b', testCount],
+          ['held_out', 'Held-out', '#a78bfa', heldOutCount],
+        ].map(([v,lbl,col,count]) => {
+          const active = splitFilter === v;
+          return (
+            <span key={v} onClick={()=>setSplitFilter(v)}
+              style={{fontSize:10,fontFamily:M,cursor:'pointer',borderRadius:4,
+                padding:'2px 8px',border:`1px solid ${col}${active?'':'44'}`,
+                color: active ? '#0f172a' : col,
+                background: active ? col : col+'18',
+                fontWeight: active ? 700 : 400,
+                transition:'all .15s'}}>
+              {lbl} ({count})
+            </span>
+          );
+        })}
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'160px 200px 1fr',gap:12}}>
+
+        {/* Col 1: Match + Rally */}
+        <div style={{display:'flex',flexDirection:'column',gap:10}}>
+          <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+            <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+              MATCHES ({visMatches.length}{splitFilter !== 'all' ? ` · ${splitFilter.toUpperCase()}` : ''})</div>
+            <div style={{overflowY:'auto',maxHeight:200}}>
+              {visMatches.map(entry => {
+                const {match:m, ss_num, winner, loser, rally_count, shot_count, split} = entry;
+                const isSel = m === selMatch;
+                const label = winner && loser ? `${winner} vs ${loser}` : ssMatchLabel(m);
+                const splitColor = split === 'train' ? '#22c55e' : split === 'test' ? '#f59e0b' : split === 'held_out' ? '#a78bfa' : '#64748b';
+                const splitLabel = split === 'train' ? 'Train' : split === 'test' ? 'Test' : split === 'held_out' ? 'Held-out' : split;
+                return (
+                  <div key={m} onClick={()=>selectMatch(m)}
+                    style={{padding:'6px 10px',cursor:'pointer',
+                      background:isSel?'#1e293b':'transparent',
+                      borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                      borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                    <div style={{display:'flex',alignItems:'center',gap:4}}>
+                      <span style={{fontSize:7,fontFamily:M,color:splitColor,fontWeight:700,
+                        background:splitColor+'18',borderRadius:3,padding:'1px 3px',flexShrink:0,
+                        border:`1px solid ${splitColor}44`}}
+                        title={splitLabel}>{splitLabel}</span>
+                      {ss_num && (
+                        <span style={{fontSize:8,fontFamily:M,color:'#60a5fa',fontWeight:700,
+                          background:'#60a5fa18',borderRadius:3,padding:'1px 4px',flexShrink:0}}>
+                          {ss_num}</span>
+                      )}
+                      <span style={{fontSize:9,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400,
+                        whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',flex:1}}
+                        title={m}>{label}</span>
+                    </div>
+                    <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                      {rally_count} rall{rally_count===1?'y':'ies'} · {shot_count} shots</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {selMatch && (
+            <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+              <div style={{padding:'6px 10px',borderBottom:'1px solid #1e293b',fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+                {shotsLoading ? 'LOADING…' : `RALLIES — ${rallies.length}`}</div>
+              <div style={{overflowY:'auto',maxHeight:300}}>
+                {rallies.map(r => {
+                  const isSel  = r === selRally;
+                  const rshots = rallyGroups[r];
+                  const s0 = rshots[0];
+                  // rally_uid = "s1r3" → "Set 1 · R3"
+                  const uid = s0?.rally_uid || r;
+                  const uidLabel = uid.replace(/^s(\d+)r(\d+)$/, 'Set $1 · R$2');
+                  return (
+                    <div key={r} onClick={()=>{ setSelRally(r); setSelShotIdx(0); setScrubFrame(null); }}
+                      style={{padding:'6px 10px',cursor:'pointer',
+                        background:isSel?'#1e293b':'transparent',
+                        borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                        borderBottom:'1px solid #1e293b22',display:'flex',flexDirection:'column',gap:2}}>
+                      <span style={{fontSize:11,fontFamily:M,color:isSel?'#f8fafc':'#94a3b8',fontWeight:isSel?600:400}}>
+                        {uidLabel}</span>
+                      <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                        {rshots.length} shot{rshots.length!==1?'s':''}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Col 2: Shot list */}
+        <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',
+          display:'flex',flexDirection:'column',maxHeight:600,overflow:'hidden'}}>
+          <div style={{padding:'6px 8px',borderBottom:'1px solid #1e293b',flexShrink:0,
+            fontSize:8,color:'#64748b',fontFamily:M}}>
+            {selRally != null ? `Rally ${selRally}  ·  ${rallyShots.length} shots` : 'SELECT A RALLY'}
+          </div>
+          <div style={{flex:1,overflowY:'auto'}}>
+            {rallyShots.map((shot, i) => {
+              const typeEn = SS_SHOT_TYPE_EN[shot.shot_type] || shot.shot_type;
+              const isSel  = i === selShotIdx;
+              return (
+                <div key={shot.id} onClick={()=>setSelShotIdx(i)}
+                  style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',
+                    cursor:'pointer',background:isSel?'#1e293b':'transparent',
+                    borderLeft:`3px solid ${isSel?'#60a5fa':'transparent'}`,
+                    borderBottom:'1px solid #1e293b22'}}>
+                  <div style={{width:20,height:20,borderRadius:3,flexShrink:0,fontSize:9,
+                    display:'flex',alignItems:'center',justifyContent:'center',
+                    background:'#60a5fa22',color:'#60a5fa',fontFamily:M,fontWeight:600}}>
+                    {shot.ball_round}
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:9,color:isSel?'#f8fafc':'#94a3b8',fontFamily:M,
+                      whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{typeEn}</div>
+                    <div style={{fontSize:7,color:'#475569',fontFamily:M,marginTop:1}}>
+                      {shot.shot_type} · P{shot.player} · f{shot.frame_num}</div>
+                  </div>
+                  {shot.has_skeleton && (
+                    <div style={{width:6,height:6,borderRadius:'50%',background:'#10b981',flexShrink:0}}
+                      title="Skeleton extracted"/>
+                  )}
+                </div>
+              );
+            })}
+            {rallyShots.length === 0 && (
+              <div style={{padding:16,textAlign:'center',color:'#475569',fontSize:10}}>
+                {selMatch ? 'Select a rally' : 'Select a match'}</div>
+            )}
+          </div>
+        </div>
+
+        {/* Col 3: Frame canvas */}
+        <div>
+          {/* Match info card */}
+          {selMatch && ssMatches && (() => {
+            const info = ssMatches.find(x => x.match === selMatch);
+            if (!info || !info.winner) return null;
+            return (
+              <div style={{marginBottom:8,padding:'7px 12px',background:'#0f172a',borderRadius:8,
+                border:'1px solid #1e293b',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                {info.ss_num && (
+                  <span style={{fontSize:9,fontFamily:M,color:'#60a5fa',fontWeight:700,
+                    background:'#60a5fa18',borderRadius:3,padding:'2px 6px',flexShrink:0}}>
+                    {info.ss_num}</span>
+                )}
+                {(() => {
+                  const sc = info.split === 'train' ? '#22c55e' : info.split === 'test' ? '#f59e0b' : info.split === 'held_out' ? '#a78bfa' : '#64748b';
+                  const lbl = info.split === 'train' ? 'TRAIN' : info.split === 'test' ? 'TEST' : info.split === 'held_out' ? 'HELD-OUT' : (info.split||'').toUpperCase();
+                  return <span style={{fontSize:8,fontFamily:M,color:sc,fontWeight:700,
+                    background:sc+'18',borderRadius:3,padding:'1px 5px',border:`1px solid ${sc}44`}}>
+                    {lbl}</span>;
+                })()}
+                <span style={{fontSize:12,color:'#f8fafc',fontWeight:600,fontFamily:F}}>{info.winner}</span>
+                <span style={{fontSize:10,color:'#475569',fontFamily:M}}>vs</span>
+                <span style={{fontSize:12,color:'#f8fafc',fontWeight:600,fontFamily:F}}>{info.loser}</span>
+                <span style={{fontSize:9,color:'#64748b',fontFamily:M,marginLeft:'auto',textAlign:'right'}}>
+                  {info.tournament}{info.year?` ${info.year}`:''}{info.round?` · ${info.round}`:''}</span>
+              </div>
+            );
+          })()}
+          {currentShot ? (
+            <>
+              <div style={{display:'flex',gap:10,alignItems:'flex-start'}}>
+                <SSFrameCanvas shot={currentShot} frameNum={scrubFrame} rallyShots={rallyShots} skelMode='gdino' width={760} height={427}/>
+                <CourtBirdseyePanel
+                  shot={currentShot}
+                  frameNum={scrubFrame}
+                  courtUrl={`${SERVER}/api/ss/court_coords/${encodeURIComponent(currentShot.match)}/${scrubFrame ?? currentShot.frame_num}`}
+                  hitterOverride={currentShot.hitter}/>
+              </div>
+
+              {/* ── Rally frame scrubber (only when consecutive frames available) ── */}
+              {rallyMeta && rallyMeta.frame_max > rallyMeta.frame_min && (
+                <SSScrubber
+                  rallyMeta={rallyMeta}
+                  hitFrame={currentShot.frame_num}
+                  scrubFrame={scrubFrame}
+                  onScrub={setScrubFrame}
+                  onShotJump={s => {
+                    const idx = rallyShots.findIndex(r => r.frame_num === s.hit_frame);
+                    if (idx >= 0) { setSelShotIdx(idx); setScrubFrame(null); }
+                  }}
+                />
+              )}
+
+              {/* ── Shuttle trajectory panel ── */}
+              <SSTrajectoryPanel
+                matchName={selMatch}
+                rallyUid={selRally}
+                currentFrame={scrubFrame ?? currentShot.frame_num}
+                width={760}
+                height={180}/>
+
+              {/* ── Shot slider (hidden — scrubber handles navigation) ── */}
+              {false && rallyShots.length > 1 && (
+                <div style={{marginTop:8,background:'#0f172a',borderRadius:8,
+                  border:'1px solid #1e293b',padding:'8px 12px'}}>
+                  {/* Info row */}
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+                    <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+                      Shot&nbsp;
+                      <span style={{color:'#e2e8f0',fontWeight:600}}>{selShotIdx+1}</span>
+                      &nbsp;/&nbsp;{rallyShots.length}
+                      &nbsp;·&nbsp;
+                      <span style={{color:'#60a5fa'}}>
+                        {SS_SHOT_TYPE_EN[currentShot.shot_type]||currentShot.shot_type}
+                      </span>
+                      &nbsp;·&nbsp;f{currentShot.frame_num}
+                      {currentShot.has_shuttle && (
+                        <span style={{color:'#FFE66D',marginLeft:6}}>● shuttle</span>
+                      )}
+                    </span>
+                    <div style={{display:'flex',gap:6}}>
+                      <button
+                        onClick={()=>setSelShotIdx(i=>Math.max(0,i-1))}
+                        disabled={selShotIdx===0}
+                        style={{padding:'2px 10px',borderRadius:4,border:'1px solid #334155',
+                          background:'#1e293b',color:selShotIdx===0?'#334155':'#94a3b8',
+                          fontFamily:M,fontSize:11,cursor:selShotIdx===0?'default':'pointer'}}>←</button>
+                      <button
+                        onClick={()=>setSelShotIdx(i=>Math.min(rallyShots.length-1,i+1))}
+                        disabled={selShotIdx===rallyShots.length-1}
+                        style={{padding:'2px 10px',borderRadius:4,border:'1px solid #334155',
+                          background:'#1e293b',
+                          color:selShotIdx===rallyShots.length-1?'#334155':'#94a3b8',
+                          fontFamily:M,fontSize:11,
+                          cursor:selShotIdx===rallyShots.length-1?'default':'pointer'}}>→</button>
+                    </div>
+                  </div>
+                  {/* Slider */}
+                  <input type="range" min={0} max={rallyShots.length-1} value={selShotIdx}
+                    onChange={e=>setSelShotIdx(Number(e.target.value))}
+                    style={{width:'100%',accentColor:'#60a5fa'}}/>
+                  {/* Shot-type tick labels (evenly sampled, max 12) */}
+                  <div style={{position:'relative',height:14,marginTop:2}}>
+                    {rallyShots.filter((_,i)=>
+                      rallyShots.length<=12 || i%(Math.ceil(rallyShots.length/12))===0
+                    ).map((s,_,arr)=>{
+                      const idx = rallyShots.indexOf(s);
+                      const pct  = idx/(rallyShots.length-1||1)*100;
+                      const typeShort = (SS_SHOT_TYPE_EN[s.shot_type]||s.shot_type).slice(0,6);
+                      return (
+                        <span key={idx} style={{position:'absolute',left:`${pct}%`,
+                          transform:'translateX(-50%)',fontSize:7,fontFamily:M,
+                          color: idx===selShotIdx?'#60a5fa':'#334155',
+                          whiteSpace:'nowrap',cursor:'pointer'}}
+                          onClick={()=>setSelShotIdx(idx)}>
+                          {typeShort}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Stats row ── */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginTop:8}}>
+                {[
+                  ['Shot type', SS_SHOT_TYPE_EN[activeShot.shot_type]||activeShot.shot_type, '#60a5fa'],
+                  ['Player',    `Player ${activeShot.player}`, '#e2e8f0'],
+                  ['Skeleton',  activeShot.has_skeleton?'✓ extracted':'pending',
+                                activeShot.has_skeleton?'#10b981':'#f59e0b'],
+                  ['Frame',     `#${scrubFrame ?? activeShot.frame_num}`, '#94a3b8'],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{background:'#0f172a',borderRadius:6,padding:'8px 10px',
+                    border:'1px solid #1e293b',textAlign:'center'}}>
+                    <div style={{fontSize:7,color:'#64748b',fontFamily:M,marginBottom:3}}>{l}</div>
+                    <div style={{fontSize:11,fontWeight:600,fontFamily:M,color:c}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* ── Strategy prediction panel ── */}
+              {activeShot.predicted_strategy ? (()=>{
+                const strat     = activeShot.predicted_strategy;
+                const conf      = activeShot.strategy_confidence || 0;
+                const probs     = activeShot.strategy_probs || {};
+                const si        = STRAT[strat] || {};
+                const confPct   = Math.round(conf * 100);
+                const confColor = conf >= 0.7 ? '#10b981' : conf >= 0.5 ? '#f59e0b' : '#ef4444';
+                const stratKeys = Object.keys(STRAT).filter(k => !STRAT[k].excluded);
+                return (
+                  <div style={{marginTop:8,background:'#0f172a',borderRadius:8,
+                    border:`1px solid ${si.color||'#334155'}44`,padding:'10px 14px'}}>
+                    <div style={{display:'flex',alignItems:'center',
+                      justifyContent:'space-between',marginBottom:8}}>
+                      <span style={{fontSize:9,fontFamily:M,color:'#64748b',letterSpacing:1}}>
+                        PREDICTED STRATEGY</span>
+                      <span style={{fontSize:9,fontFamily:M,color:'#64748b'}}>
+                        {activeShot.hit_type_pred &&
+                          <span style={{color:'#a78bfa'}}>{activeShot.hit_type_pred} · </span>}
+                        conf <span style={{color:confColor,fontWeight:700}}>{confPct}%</span>
+                      </span>
+                    </div>
+                    <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+                      <span style={{fontSize:20}}>{si.icon||'?'}</span>
+                      <div>
+                        <div style={{fontSize:14,fontWeight:700,fontFamily:F,
+                          color:si.color||'#e2e8f0'}}>{si.label||strat}</div>
+                        <div style={{width:200,height:4,background:'#1e293b',
+                          borderRadius:2,marginTop:4}}>
+                          <div style={{width:`${confPct}%`,height:'100%',
+                            background:confColor,borderRadius:2,transition:'width 0.3s'}}/>
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:4}}>
+                      {stratKeys.map(s=>{
+                        const p   = probs[s] || 0;
+                        const pct = Math.round(p * 100);
+                        const si2 = STRAT[s];
+                        const top = s === strat;
+                        return (
+                          <div key={s} style={{textAlign:'center',borderRadius:4,padding:'4px 2px',
+                            background: top ? `${si2.color}18` : 'transparent',
+                            border: top ? `1px solid ${si2.color}55` : '1px solid transparent'}}>
+                            <div style={{fontSize:8,color:si2.color,fontFamily:M,
+                              fontWeight:top?700:400,whiteSpace:'nowrap',overflow:'hidden',
+                              textOverflow:'ellipsis'}}>{si2.label.split(' ')[0]}</div>
+                            <div style={{fontSize:12,color:top?si2.color:'#475569',
+                              fontFamily:M,fontWeight:600}}>{pct}%</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })() : null}
+
+              {/* ── Shot-type classifier prediction panel ── */}
+              {activeShot.pred_shot_type ? (()=>{
+                const predType  = activeShot.pred_shot_type;
+                const trueType  = SS_SHOT_TYPE_EN[activeShot.shot_type]||activeShot.shot_type;
+                const correct   = activeShot.pred_correct;
+                const probs     = activeShot.pred_probs || {};
+                const topProb   = Math.max(...Object.values(probs));
+                const confPct   = Math.round(topProb * 100);
+                const confColor = topProb >= 0.7 ? '#10b981' : topProb >= 0.5 ? '#f59e0b' : '#ef4444';
+                const predColor = correct ? '#10b981' : '#ef4444';
+                return (
+                  <div style={{marginTop:8,background:'#0f172a',borderRadius:8,
+                    border:`1px solid ${predColor}44`,padding:'10px 14px'}}>
+                    <div style={{display:'flex',alignItems:'center',
+                      justifyContent:'space-between',marginBottom:8}}>
+                      <span style={{fontSize:9,fontFamily:M,color:'#64748b',letterSpacing:1}}>
+                        PREDICTED SHOT TYPE</span>
+                      <span style={{fontSize:9,fontFamily:M,color:predColor,fontWeight:700}}>
+                        {correct ? '✓ CORRECT' : '✗ WRONG'}
+                      </span>
+                    </div>
+                    <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+                      <div style={{fontSize:14,fontWeight:700,fontFamily:F,color:predColor}}>
+                        {predType}
+                      </div>
+                      <div style={{fontSize:10,color:'#64748b',fontFamily:M}}>
+                        conf <span style={{color:confColor,fontWeight:700}}>{confPct}%</span>
+                      </div>
+                    </div>
+                    <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                      {Object.entries(probs).sort((a,b)=>b[1]-a[1]).map(([name,p])=>{
+                        const pct = Math.round(p * 100);
+                        const isTop = name === predType;
+                        const isTrue = name === trueType;
+                        return (
+                          <div key={name} style={{textAlign:'center',borderRadius:4,padding:'3px 6px',
+                            background: isTop ? `${predColor}18` : 'transparent',
+                            border: isTrue ? `1px solid #60a5fa55` : isTop ? `1px solid ${predColor}55` : '1px solid transparent'}}>
+                            <div style={{fontSize:8,color:isTop?predColor:isTrue?'#60a5fa':'#475569',
+                              fontFamily:M,fontWeight:isTop||isTrue?700:400,whiteSpace:'nowrap'}}>{name}</div>
+                            <div style={{fontSize:11,color:isTop?predColor:isTrue?'#60a5fa':'#475569',
+                              fontFamily:M,fontWeight:600}}>{pct}%</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })() : null}
+            </>
+          ) : (
+            <div style={{background:'#0f172a',borderRadius:10,border:'1px solid #1e293b',
+              padding:40,textAlign:'center',color:'#475569',fontSize:12,
+              width:760,height:427,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              {shotsLoading ? (
+                <div><div className="spin" style={{width:24,height:24,border:'3px solid #334155',
+                  borderTopColor:'#60a5fa',borderRadius:'50%',margin:'0 auto 8px'}}/> Loading match…</div>
+              ) : selMatch ? 'Loading rally…' : 'Select a match'}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── TAB: FINEBADMINTON ────────────────────────────────────────────────────────
+function FBTab() {
+  const { online, shots, loading }     = useRealFrames();
+  const [selRally,    setSelRally]     = useState(null);
+  const [selShotIdx,  setSelShotIdx]   = useState(0);
+  const [scrubFrame,  setScrubFrame]   = useState(null);
+  const [rallyMeta,   setRallyMeta]    = useState(null);
+  const [skelMode,    setSkelMode]     = useState('gdino');
+  const [gdinoRallies,setGdinoRallies] = useState([]);
+  const [fbPreds,     setFbPreds]      = useState(null);
+  const [inferLoading,setInferLoading] = useState(false);
+  const [expandedMatch,setExpandedMatch]= useState(null);
+  const [topK,        setTopK]         = useState(1);  // top-K accuracy mode
+
+  // rally_id → [shots] map
+  const rallyMap = useMemo(() => {
+    const m = {};
+    shots.forEach(s => { if(!m[s.video]) m[s.video]=[]; m[s.video].push(s); });
+    return m;
+  }, [shots]);
+
+  // match_id → [rally_id, ...] map
+  const matchGroups = useMemo(() => {
+    const g = {};
+    Object.keys(rallyMap).sort().forEach(rid => {
+      const match = rid.split('_')[0];
+      if (!g[match]) g[match] = [];
+      g[match].push(rid);
+    });
+    return g;
+  }, [rallyMap]);
+
+  const matches = useMemo(() => Object.keys(matchGroups).sort(), [matchGroups]);
+
+  // Auto-select first match + rally
+  useEffect(() => {
+    if (matches.length > 0 && !selRally) {
+      const m = matches[0];
+      setExpandedMatch(m);
+      setSelRally(matchGroups[m][0]);
+    }
+  }, [matches]);
+
+  const rallyShots  = selRally ? (rallyMap[selRally] || []) : [];
+  const currentShot = rallyShots[selShotIdx] || null;
+
+  // predictions keyed by rally_id|hit_frame
+  const predByKey = useMemo(() => {
+    if (!fbPreds) return {};
+    const m = {};
+    fbPreds.forEach(p => { m[`${p.rally_id}|${p.hit_frame}`] = p; });
+    return m;
+  }, [fbPreds]);
+
+  // predictions for the currently selected rally
+  const rallyPreds = useMemo(() =>
+    fbPreds ? fbPreds.filter(p => p.rally_id === selRally) : [],
+  [fbPreds, selRally]);
+
+  // Check if FB label appears in the top-K predictions (best match across positions)
+  const topKMatch = (pred, k) => {
+    const truth = pred.fb_label_en;
+    if (!truth || !pred.top5) return 'none';
+    let best = 'none';
+    for (let i = 0; i < Math.min(k, pred.top5.length); i++) {
+      const m = semMatch(pred.top5[i][0], truth);
+      if (m === 'exact') return 'exact';
+      if (m === 'semantic') best = 'semantic';
+    }
+    return best;
+  };
+
+  const rallyScore = useMemo(() => {
+    if (!rallyPreds.length) return null;
+    let exact = 0, sem = 0;
+    rallyPreds.forEach(p => {
+      const m = topKMatch(p, topK);
+      if (m === 'exact') exact++;
+      else if (m === 'semantic') sem++;
+    });
+    const n = rallyPreds.length;
+    return { exact, sem, none: n-exact-sem, n, exactPct: exact/n, semPct:(exact+sem)/n };
+  }, [rallyPreds, topK]);
+
+  // Overall accuracy across ALL predictions (not just the selected rally)
+  const overallScore = useMemo(() => {
+    if (!fbPreds?.length) return null;
+    let exact = 0, sem = 0;
+    fbPreds.forEach(p => {
+      const m = topKMatch(p, topK);
+      if (m === 'exact') exact++;
+      else if (m === 'semantic') sem++;
+    });
+    const n = fbPreds.length;
+    return { exact, sem, n, exactPct: exact/n, semPct:(exact+sem)/n };
+  }, [fbPreds, topK]);
+
+  const loadInference = () => {
+    if (inferLoading) return;
+    setInferLoading(true);
+    fetch(`${SERVER}/api/fb/infer_all`)
+      .then(r => r.json())
+      .then(data => { setFbPreds(data); setInferLoading(false); })
+      .catch(() => { setFbPreds([]); setInferLoading(false); });
+  };
+
+  useEffect(() => {
+    if (!selRally) return;
+    fetch(`${SERVER}/api/rally/${selRally}`)
+      .then(r=>r.json()).then(setRallyMeta).catch(()=>setRallyMeta(null));
+  }, [selRally]);
+
+  useEffect(() => {
+    fetch(`${SERVER}/api/gdino_rallies`)
+      .then(r=>r.json()).then(d=>setGdinoRallies(d.rallies||[])).catch(()=>{});
+  }, []);
+
+  useEffect(() => { setScrubFrame(null); }, [currentShot?.id]);
+
+  const frameHitter = useMemo(() => {
+    if (!scrubFrame || !rallyMeta?.windows?.length) return null;
+    let result = null;
+    for (const w of rallyMeta.windows) { if (w.hit_frame <= scrubFrame) result = w.hitter; }
+    return result;
+  }, [scrubFrame, rallyMeta]);
+
+  const activeScrubShot = useMemo(() => {
+    if (!scrubFrame || !rallyShots.length) return currentShot;
+    let result = null;
+    for (const s of rallyShots) { if (s.hit_frame <= scrubFrame) result = s; }
+    return result || currentShot;
+  }, [scrubFrame, rallyShots, currentShot]);
+
+  if (loading) return (
+    <div style={{padding:40,textAlign:'center',color:'#64748b',fontFamily:M}}>Connecting to server…</div>
+  );
+  if (!online) return (
+    <div style={{padding:40}}>
+      <div style={{padding:'12px 16px',background:'#7f1d1d22',border:'1px solid #ef444433',borderRadius:8}}>
+        <div style={{fontSize:12,color:'#ef4444',fontFamily:M,fontWeight:600,marginBottom:4}}>⚠ Server not running</div>
+        <div style={{fontSize:11,color:'#fca5a5',lineHeight:1.7}}>
+          Start the local frame server:<br/>
+          <code style={{fontFamily:M,color:'#f87171',background:'#450a0a',padding:'2px 8px',borderRadius:4}}>python badminton_server.py</code>
+          &nbsp; then refresh.
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'calc(100vh - 51px)',overflow:'hidden'}}>
+    <div style={{display:'grid',gridTemplateColumns:'230px 1fr 290px',flex:'1 1 0',minHeight:0}}>
+
+      {/* ── LEFT: Video Library ── */}
+      <div style={{borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column',overflow:'hidden',background:'#080d16'}}>
+        <div style={{padding:'12px 14px',borderBottom:'1px solid #1e293b',flexShrink:0}}>
+          <div style={{fontSize:12,fontWeight:600,color:'#e2e8f0',marginBottom:1}}>Video Library</div>
+          <div style={{fontSize:9,color:'#475569',fontFamily:M}}>{Object.keys(rallyMap).length} rallies · {shots.length} shots</div>
+        </div>
+        <div style={{flex:1,overflowY:'auto'}}>
+          {matches.map(match => {
+            const isExp  = expandedMatch === match;
+            const rallies = matchGroups[match];
+            const totalShots = rallies.reduce((a,r)=>a+(rallyMap[r]?.length||0),0);
+            return (
+              <div key={match}>
+                <div onClick={()=>setExpandedMatch(isExp?null:match)}
+                  style={{padding:'9px 14px',cursor:'pointer',display:'flex',alignItems:'center',gap:8,
+                    background:isExp?'#0f172a':'transparent',borderBottom:'1px solid #1e293b22',
+                    userSelect:'none'}}>
+                  <span style={{fontSize:9,color:isExp?'#94a3b8':'#334155'}}>{isExp?'▾':'▸'}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,fontWeight:600,color:isExp?'#e2e8f0':'#475569',fontFamily:M}}>Match {match}</div>
+                    <div style={{fontSize:8,color:'#334155',fontFamily:M}}>{rallies.length} rallies · {totalShots} shots</div>
+                  </div>
+                </div>
+                {isExp && rallies.map(rid => {
+                  const rshots  = rallyMap[rid] || [];
+                  const isSel   = rid === selRally;
+                  const rnum    = rid.split('_').slice(1).join('_');
+                  const rPreds  = fbPreds ? fbPreds.filter(p=>p.rally_id===rid) : [];
+                  const rExact  = rPreds.filter(p=>semMatch(p.predicted,p.fb_label_en)==='exact').length;
+                  const rSem    = rPreds.filter(p=>semMatch(p.predicted,p.fb_label_en)==='semantic').length;
+                  const rN      = rPreds.length;
+                  return (
+                    <div key={rid}
+                      onClick={()=>{ setSelRally(rid); setSelShotIdx(0); setScrubFrame(null); setRallyMeta(null); }}
+                      style={{padding:'8px 14px 8px 28px',cursor:'pointer',
+                        background:isSel?'#1e293b':'transparent',
+                        borderLeft:`3px solid ${isSel?'#FF6B35':'transparent'}`,
+                        borderBottom:'1px solid #1e293b22',
+                        display:'flex',alignItems:'center',gap:8}}>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:10,color:isSel?'#f8fafc':'#94a3b8',fontFamily:M,fontWeight:isSel?600:400}}>
+                          🎬 Rally {rnum}</div>
+                        <div style={{fontSize:8,color:'#334155',fontFamily:M,marginTop:1}}>{rshots.length} shots</div>
+                      </div>
+                      {rN > 0 && (
+                        <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:1,flexShrink:0}}>
+                          <span style={{fontSize:8,fontFamily:M,fontWeight:700,
+                            color:'#10b981'}}>{(rExact/rN*100).toFixed(0)}%</span>
+                          <span style={{fontSize:7,fontFamily:M,color:'#f59e0b'}}>
+                            ≈{((rExact+rSem)/rN*100).toFixed(0)}%</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── CENTER: Frame Viewer ── */}
+      <div style={{display:'flex',flexDirection:'column',overflow:'hidden',background:'#080d16'}}>
+        {/* Top bar */}
+        <div style={{padding:'8px 14px',borderBottom:'1px solid #1e293b',flexShrink:0,
+          display:'flex',alignItems:'center',gap:10}}>
+          <span style={{fontSize:9,color:'#334155',fontFamily:M}}>
+            Model: <span style={{color:'#818cf8'}}>D4_mlp_bn</span>
+            <span style={{color:'#1e293b'}}> · 15 cls · F1=0.652</span>
+          </span>
+          <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:5}}>
+            <span style={{fontSize:8,color:'#334155',fontFamily:M}}>Skeleton:</span>
+            {['original','gdino'].map(mode => {
+              const hasGdino = gdinoRallies.includes(selRally);
+              const disabled = mode==='gdino' && !hasGdino;
+              const active   = skelMode===mode;
+              return (
+                <button key={mode} onClick={()=>!disabled&&setSkelMode(mode)}
+                  style={{padding:'3px 8px',borderRadius:4,fontSize:8,fontFamily:M,
+                    cursor:disabled?'not-allowed':'pointer',border:'none',
+                    background:active?'#3b82f6':'#1e293b',
+                    color:active?'#fff':disabled?'#2d3748':'#64748b',
+                    opacity:disabled?0.4:1}}>
+                  {mode==='original'?'YOLOv8':'GDINO'}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {currentShot ? (
+          <div style={{flex:1,overflowY:'auto',padding:'12px 14px',display:'flex',flexDirection:'column',gap:10}}>
+            {/* Rally + shot info bar */}
+            <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+              <span style={{fontSize:12,fontWeight:600,color:'#e2e8f0',fontFamily:M}}>{selRally}</span>
+              <span style={{fontSize:9,color:'#334155',fontFamily:M}}>
+                shot {selShotIdx+1}/{rallyShots.length}
+              </span>
+              <span style={{fontSize:9,fontFamily:M,padding:'2px 7px',borderRadius:3,
+                background:'#1e293b',color:'#64748b'}}>
+                {activeScrubShot?.hitter||currentShot.hitter} hitter
+              </span>
+              <span style={{fontSize:9,fontFamily:M,padding:'2px 7px',borderRadius:3,
+                background:'#1e293b',color:'#64748b'}}>
+                f {scrubFrame || currentShot.hit_frame}
+              </span>
+              {/* Active prediction badge */}
+              {(() => {
+                const p = predByKey[`${currentShot.video}|${currentShot.hit_frame}`];
+                if (!p) return null;
+                const mk = semMatch(p.predicted, p.fb_label_en);
+                const mc = mk==='exact'?'#10b981':mk==='semantic'?'#f59e0b':'#ef4444';
+                const mi = mk==='exact'?'✓':mk==='semantic'?'≈':'✗';
+                return (
+                  <span style={{marginLeft:'auto',fontSize:9,fontFamily:M,fontWeight:600,
+                    padding:'3px 8px',borderRadius:4,
+                    color:mc,background:`${mc}18`,border:`1px solid ${mc}44`}}>
+                    {mi} {p.predicted} · {(p.confidence*100).toFixed(0)}%
+                  </span>
+                );
+              })()}
+            </div>
+
+            {/* Canvas */}
+            <RealFrameCanvas shot={currentShot} width={600} height={338}
+              frameNum={scrubFrame} rallyMeta={rallyMeta} skelMode={skelMode}
+              hitterOverride={frameHitter}/>
+
+            {/* Scrubber */}
+            <RallyScrubber rallyMeta={rallyMeta} currentShot={currentShot}
+              scrubFrame={scrubFrame} onScrub={fn=>setScrubFrame(fn)}
+              onShotJump={s=>{
+                const idx=rallyShots.findIndex(x=>x.id===s.id);
+                if(idx>=0){setSelShotIdx(idx);setScrubFrame(null);}
+              }}/>
+
+            {/* Info chips */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8}}>
+              {[
+                ['FB Label',   currentShot.hit_type,           '#94a3b8'],
+                ['Player',     currentShot.hitter,             '#e2e8f0'],
+                ['Hit Frame',  `#${currentShot.hit_frame}`,    '#475569'],
+              ].map(([l,v,c])=>(
+                <div key={l} style={{background:'#0f172a',border:'1px solid #1e293b',
+                  borderRadius:6,padding:'7px 10px',textAlign:'center'}}>
+                  <div style={{fontSize:7,color:'#334155',fontFamily:M,marginBottom:2}}>{l}</div>
+                  <div style={{fontSize:11,fontWeight:600,fontFamily:M,color:c}}>{v||'—'}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Top-5 bar chart for current shot (only when preds loaded) */}
+            {(() => {
+              const p = predByKey[`${currentShot.video}|${currentShot.hit_frame}`];
+              if (!p?.top5?.length) return null;
+              const confColor = p.confidence>=0.75?'#10b981':p.confidence>=0.5?'#f59e0b':'#ef4444';
+              return (
+                <div style={{background:'#0f172a',border:'1px solid #1e293b',borderRadius:8,padding:'10px 12px'}}>
+                  <div style={{fontSize:8,color:'#475569',fontFamily:M,letterSpacing:.6,marginBottom:8}}>TOP-5 CLASS PROBABILITIES</div>
+                  <div style={{display:'flex',flexDirection:'column',gap:5}}>
+                    {p.top5.map(([cls,prob],i)=>{
+                      const isTop = i===0;
+                      const col   = isTop ? confColor : '#334155';
+                      return (
+                        <div key={cls} style={{display:'flex',alignItems:'center',gap:8}}>
+                          <div style={{width:110,fontSize:9,fontFamily:M,flexShrink:0,
+                            color:isTop?'#e2e8f0':'#475569',
+                            overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{cls}</div>
+                          <div style={{flex:1,height:4,background:'#1e293b',borderRadius:2,overflow:'hidden'}}>
+                            <div style={{width:`${prob*100}%`,height:'100%',background:col,
+                              transition:'width 0.3s ease'}}/>
+                          </div>
+                          <span style={{fontSize:9,fontFamily:M,color:col,width:30,textAlign:'right',flexShrink:0}}>
+                            {(prob*100).toFixed(0)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        ) : (
+          <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',
+            flexDirection:'column',gap:12,color:'#1e293b',fontFamily:M}}>
+            <div style={{fontSize:32}}>🎬</div>
+            <div style={{fontSize:12}}>Select a rally from the library</div>
+          </div>
+        )}
+      </div>
+
+      {/* ── RIGHT: Predictions Panel ── */}
+      <div style={{borderLeft:'1px solid #1e293b',display:'flex',flexDirection:'column',overflow:'hidden',background:'#080d16'}}>
+        {/* Header */}
+        <div style={{padding:'12px 14px',borderBottom:'1px solid #1e293b',flexShrink:0}}>
+          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:8}}>
+            <div style={{fontSize:12,fontWeight:600,color:'#e2e8f0'}}>Shot Predictions</div>
+            {rallyScore !== null && (
+              <div style={{marginLeft:'auto',display:'flex',gap:4,alignItems:'center'}}>
+                <span title={`Top-${topK} exact match (this rally)`} style={{fontSize:9,fontFamily:M,fontWeight:700,
+                  color:'#10b981',background:'#10b98118',padding:'2px 6px',borderRadius:4}}>
+                  ✓ {(rallyScore.exactPct*100).toFixed(0)}%</span>
+                <span title={`Top-${topK} semantic match (same shot family)`} style={{fontSize:9,fontFamily:M,fontWeight:700,
+                  color:'#f59e0b',background:'#f59e0b18',padding:'2px 6px',borderRadius:4}}>
+                  ≈ {(rallyScore.semPct*100).toFixed(0)}%</span>
+              </div>
+            )}
+          </div>
+          {/* Top-K toggle */}
+          {fbPreds !== null && (
+            <div style={{display:'flex',alignItems:'center',gap:4,marginBottom:8}}>
+              <span style={{fontSize:8,color:'#475569',fontFamily:M,fontWeight:600}}>Top-K:</span>
+              {[1,2,3,5].map(k => (
+                <button key={k} onClick={()=>setTopK(k)}
+                  style={{
+                    padding:'2px 7px',fontSize:9,fontFamily:M,fontWeight:700,
+                    background: topK===k ? '#6366f122' : 'transparent',
+                    color:      topK===k ? '#a5b4fc' : '#475569',
+                    border:`1px solid ${topK===k ? '#6366f1' : '#1e293b'}`,
+                    borderRadius:3,cursor:'pointer',transition:'all 0.15s',
+                  }}>
+                  {k}
+                </button>
+              ))}
+              {overallScore && (
+                <span style={{marginLeft:'auto',fontSize:8,color:'#64748b',fontFamily:M}}>
+                  all: <span style={{color:'#10b981',fontWeight:700}}>{(overallScore.exactPct*100).toFixed(1)}%</span>
+                  {' / '}
+                  <span style={{color:'#f59e0b',fontWeight:700}}>{(overallScore.semPct*100).toFixed(1)}%</span>
+                </span>
+              )}
+            </div>
+          )}
+          <button onClick={loadInference} disabled={inferLoading}
+            style={{width:'100%',padding:'7px 0',borderRadius:6,fontSize:10,fontFamily:M,
+              cursor:inferLoading?'wait':'pointer',
+              border:`1px solid ${fbPreds===null?'#6366f1':'#334155'}`,
+              background:fbPreds===null?'#6366f122':'transparent',
+              color:inferLoading?'#334155':fbPreds===null?'#a5b4fc':'#475569',
+              transition:'all 0.15s'}}>
+            {inferLoading ? '⏳ Running inference…' : fbPreds===null ? '▶  Run Model on All Shots' : '↻  Re-run'}
+          </button>
+          {fbPreds !== null && (
+            <div style={{fontSize:8,color:'#334155',fontFamily:M,marginTop:4,textAlign:'center'}}>
+              {fbPreds.length} shots predicted across all rallies
+            </div>
+          )}
+        </div>
+
+        {/* Shot-by-shot list */}
+        <div style={{flex:1,overflowY:'auto'}}>
+          {fbPreds === null ? (
+            <div style={{padding:32,textAlign:'center',color:'#1e293b',fontFamily:M,lineHeight:2}}>
+              <div style={{fontSize:28,marginBottom:8}}>🔮</div>
+              <div style={{fontSize:11,color:'#334155'}}>Run the model to compare<br/>predictions vs. FB labels</div>
+            </div>
+          ) : rallyPreds.length === 0 ? (
+            <div style={{padding:24,textAlign:'center',color:'#334155',fontSize:10,fontFamily:M,lineHeight:1.8}}>
+              No predictions for this rally<br/>
+              <span style={{color:'#1e293b'}}>(skeleton not extracted)</span>
+            </div>
+          ) : rallyPreds.map((pred, i) => {
+            const shot    = rallyShots.find(s => s.hit_frame === pred.hit_frame);
+            const isSel   = shot && shot.id === currentShot?.id;
+            const conf    = pred.confidence;
+            const cColor  = conf>=0.75?'#10b981':conf>=0.5?'#f59e0b':'#ef4444';
+            const mKind   = semMatch(pred.predicted, pred.fb_label_en);
+            const mColor  = mKind==='exact'?'#10b981':mKind==='semantic'?'#f59e0b':'#ef4444';
+            const mIcon   = mKind==='exact'?'✓':mKind==='semantic'?'≈':'✗';
+            return (
+              <div key={`${pred.rally_id}|${pred.hit_frame}`}
+                onClick={()=>{
+                  if(shot){ const idx=rallyShots.findIndex(s=>s.id===shot.id); if(idx>=0){setSelShotIdx(idx);setScrubFrame(null);} }
+                }}
+                style={{padding:'10px 14px',cursor:'pointer',
+                  background:isSel?'#1e293b':'transparent',
+                  borderLeft:`3px solid ${isSel?mColor:'transparent'}`,
+                  borderBottom:'1px solid #0f172a'}}>
+                {/* Row header */}
+                <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:6}}>
+                  <span style={{fontSize:8,fontFamily:M,color:'#334155',width:18,flexShrink:0}}>#{i+1}</span>
+                  <span style={{fontSize:8,fontFamily:M,color:'#334155'}}>f{pred.hit_frame}</span>
+                  <span style={{fontSize:8,fontFamily:M,color:'#334155',
+                    background:'#0f172a',padding:'1px 5px',borderRadius:2}}>{pred.hitter}</span>
+                  <span style={{marginLeft:'auto',fontSize:13,fontWeight:700,color:mColor}}>
+                    {mIcon}
+                  </span>
+                </div>
+                {/* Label comparison */}
+                <div style={{display:'grid',gridTemplateColumns:'1fr 16px 1fr',gap:4,alignItems:'center',marginBottom:6}}>
+                  <div style={{background:'#0f172a',borderRadius:4,padding:'5px 7px'}}>
+                    <div style={{fontSize:7,color:'#334155',fontFamily:M,marginBottom:1}}>FB LABEL</div>
+                    <div style={{fontSize:10,color:'#64748b',fontFamily:M,fontWeight:500,lineHeight:1.2}}>{pred.fb_label}</div>
+                  </div>
+                  <div style={{textAlign:'center',color:'#334155',fontSize:10}}>→</div>
+                  <div style={{background:'#0f172a',borderRadius:4,padding:'5px 7px',
+                    border:`1px solid ${cColor}33`}}>
+                    <div style={{fontSize:7,color:'#334155',fontFamily:M,marginBottom:1}}>PREDICTED</div>
+                    <div style={{fontSize:10,color:cColor,fontFamily:M,fontWeight:700,lineHeight:1.2}}>{pred.predicted}</div>
+                    <div style={{fontSize:7,color:cColor,fontFamily:M}}>{(conf*100).toFixed(0)}%</div>
+                  </div>
+                </div>
+                {/* Confidence bar */}
+                <div style={{height:2,background:'#0f172a',borderRadius:1,overflow:'hidden'}}>
+                  <div style={{width:`${conf*100}%`,height:'100%',background:cColor,transition:'width 0.3s ease'}}/>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+
+    {/* ── TAXONOMY ── */}
+    <div style={{flexShrink:0,borderTop:'1px solid #1e293b',background:'#080d16',
+      overflowX:'auto',overflowY:'hidden'}}>
+      <ShotTaxonomy/>
+    </div>
+    </div>
+  );
+}
+
+// ─── Shot taxonomy component ───────────────────────────────────────────────────
+const FB_SHOTS = [
+  { fb:'serve',                model:'short service',          ss:'short service',          color:'#6366f1' },
+  { fb:'kill',                 model:'smash',                  ss:'smash',                  color:'#ef4444' },
+  { fb:'clear',                model:'clear',                  ss:'clear',                  color:'#3b82f6' },
+  { fb:'drive',                model:'drive',                  ss:'drive (4 merged)',       color:'#f59e0b' },
+  { fb:'drop shot',            model:'drop',                   ss:'drop',                   color:'#10b981' },
+  { fb:'net shot',             model:'net shot',               ss:'net shot',               color:'#06b6d4' },
+  { fb:'block',                model:'return net',             ss:'return net',             color:'#84cc16' },
+  { fb:'push shot',            model:'push',                   ss:'push',                   color:'#f97316' },
+  { fb:'net lift',             model:'lob',                    ss:'lob',                    color:'#a78bfa' },
+  { fb:'net kill',             model:'rush',                   ss:'rush',                   color:'#fb7185' },
+  { fb:'cross-court net shot', model:'cross-court net shot',   ss:'cross-court net shot',   color:'#38bdf8' },
+];
+const SS_ONLY = [
+  { ss:'long service',         model:'long service',           note:'FB uses one "serve" type' },
+  { ss:'wrist smash',          model:'wrist smash',            note:'quick wrist-only smash' },
+  { ss:'defensive return lob', model:'defensive return lob',   note:'reactive lob under pressure' },
+  { ss:'passive drop',         model:'passive drop',           note:'weak / transitional drop' },
+];
+
+function ShotTaxonomy() {
+  return (
+    <div style={{display:'flex',gap:0,alignItems:'stretch',minWidth:900,height:162}}>
+
+      {/* ── FB column ── */}
+      <div style={{width:220,flexShrink:0,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column'}}>
+        <div style={{padding:'6px 12px',borderBottom:'1px solid #1e293b',flexShrink:0,
+          display:'flex',alignItems:'baseline',gap:6}}>
+          <span style={{fontSize:10,fontWeight:700,color:'#e2e8f0'}}>FineBadminton</span>
+          <span style={{fontSize:8,color:'#334155',fontFamily:M}}>11 shot types</span>
+        </div>
+        <div style={{flex:1,overflowY:'auto',padding:'4px 0'}}>
+          {FB_SHOTS.map(r => (
+            <div key={r.fb} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 12px',height:12}}>
+              <div style={{width:6,height:6,borderRadius:'50%',background:r.color,flexShrink:0}}/>
+              <span style={{fontSize:9,fontFamily:M,color:'#94a3b8',whiteSpace:'nowrap'}}>{r.fb}</span>
+            </div>
+          ))}
+          <div style={{margin:'4px 0',borderTop:'1px dashed #1e293b',display:'flex',alignItems:'center',padding:'0 12px',height:14}}>
+            <span style={{fontSize:7,fontFamily:M,color:'#334155',letterSpacing:.5}}>not in FB</span>
+          </div>
+          {SS_ONLY.map(r => (
+            <div key={r.model} style={{height:12}}/>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Run6 model column ── */}
+      <div style={{width:200,flexShrink:0,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column',
+        background:'#0a0f1a'}}>
+        <div style={{padding:'6px 12px',borderBottom:'1px solid #1e293b',flexShrink:0,
+          display:'flex',alignItems:'baseline',gap:6}}>
+          <span style={{fontSize:10,fontWeight:700,color:'#818cf8'}}>Run6 Model</span>
+          <span style={{fontSize:8,color:'#334155',fontFamily:M}}>15 classes</span>
+        </div>
+        <div style={{flex:1,overflowY:'auto',padding:'4px 0'}}>
+          {FB_SHOTS.map(r => (
+            <div key={r.model} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 12px',height:12}}>
+              <span style={{fontSize:9,fontFamily:M,color:'#818cf8',whiteSpace:'nowrap'}}>{r.model}</span>
+            </div>
+          ))}
+          <div style={{margin:'4px 0',borderTop:'1px dashed #1e293b',display:'flex',alignItems:'center',padding:'0 12px',height:14}}>
+            <span style={{fontSize:7,fontFamily:M,color:'#334155',letterSpacing:.5}}>SS ONLY ↓</span>
+          </div>
+          {SS_ONLY.map(r => (
+            <div key={r.model} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 12px',height:12}}>
+              <span style={{fontSize:9,fontFamily:M,color:'#334155',whiteSpace:'nowrap'}}>{r.model}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── ShuttleSet column ── */}
+      <div style={{width:240,flexShrink:0,borderRight:'1px solid #1e293b',display:'flex',flexDirection:'column'}}>
+        <div style={{padding:'6px 12px',borderBottom:'1px solid #1e293b',flexShrink:0,
+          display:'flex',alignItems:'baseline',gap:6}}>
+          <span style={{fontSize:10,fontWeight:700,color:'#e2e8f0'}}>ShuttleSet</span>
+          <span style={{fontSize:8,color:'#334155',fontFamily:M}}>17 types → 15 model classes</span>
+        </div>
+        <div style={{flex:1,overflowY:'auto',padding:'4px 0'}}>
+          {FB_SHOTS.map(r => (
+            <div key={r.ss} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 12px',height:12}}>
+              <div style={{width:6,height:6,borderRadius:'50%',background:r.color,flexShrink:0}}/>
+              <span style={{fontSize:9,fontFamily:M,color:'#94a3b8',whiteSpace:'nowrap'}}>{r.ss}</span>
+            </div>
+          ))}
+          <div style={{margin:'4px 0',borderTop:'1px dashed #1e293b',display:'flex',alignItems:'center',padding:'0 12px',height:14}}>
+            <span style={{fontSize:7,fontFamily:M,color:'#334155',letterSpacing:.5}}>no FB equivalent</span>
+          </div>
+          {SS_ONLY.map(r => (
+            <div key={r.ss} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 12px',height:12,opacity:.5}}>
+              <span style={{fontSize:9,fontFamily:M,color:'#475569',whiteSpace:'nowrap'}}>{r.ss}</span>
+              <span style={{fontSize:7,fontFamily:M,color:'#334155',whiteSpace:'nowrap'}}>— {r.note}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Legend / notes ── */}
+      <div style={{flex:1,display:'flex',flexDirection:'column',padding:'6px 14px',minWidth:200}}>
+        <div style={{fontSize:10,fontWeight:700,color:'#e2e8f0',marginBottom:6}}>Notes</div>
+        <div style={{display:'flex',flexDirection:'column',gap:4,fontSize:8,fontFamily:M,color:'#475569',lineHeight:1.5}}>
+          <div><span style={{color:'#94a3b8'}}>Shared (11):</span> FB and SS overlap on all major shot types. Colour-coded rows above align them.</div>
+          <div><span style={{color:'#94a3b8'}}>SS-only (4):</span> long service, wrist smash, defensive return lob, passive drop — absent from FB annotations.</div>
+          <div><span style={{color:'#94a3b8'}}>passive drop:</span> run6 class for 過渡切球 (weak/transitional drop). FB has no exact match — model may over-predict on uncertain FB shots.</div>
+          <div><span style={{color:'#94a3b8'}}>drive (SS):</span> 平球 + 後場抽平球 + 防守回抽 + 小平球 merged into one class (all individually too rare to learn).</div>
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+const TABS = [
+  { id:'fb',       label:'FineBadminton',  icon:'🏸', tag:'inference' },
+  { id:'ss',       label:'ShuttleSet',     icon:'📊', tag:'training' },
+  { id:'analysis', label:'Match Analysis', icon:'🗺' },
+];
+
+function App() {
+  const [tab, setTab] = useState('ss');
+  return (
+    <div style={{minHeight:'100vh',background:'#0a0f1a',color:'#e2e8f0',
+      fontFamily:"'DM Sans','Helvetica Neue',sans-serif"}}>
+      {/* Header */}
+      <div style={{borderBottom:'1px solid #1e293b',padding:'10px 20px',
+        display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <div style={{width:30,height:30,borderRadius:6,
+            background:'linear-gradient(135deg,#FF6B35,#A855F7)',
+            display:'flex',alignItems:'center',justifyContent:'center',fontSize:15}}>🏸</div>
+          <div>
+            <div style={{fontSize:14,fontWeight:600,letterSpacing:'-.02em'}}>Badminton Pipeline Demo</div>
+          </div>
+        </div>
+        <div style={{display:'flex',gap:2}}>
+          {TABS.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              style={{background:tab===t.id?'#1e293b':'transparent',
+                border:`1px solid ${tab===t.id?'#FF6B35':'transparent'}`,
+                color:tab===t.id?'#f8fafc':'#64748b',padding:'6px 12px',
+                borderRadius:6,fontSize:11,cursor:'pointer',
+                display:'flex',alignItems:'center',gap:5}}>
+              <span style={{fontSize:12}}>{t.icon}</span>{t.label}
+              {t.tag && (
+                <span style={{fontSize:8,fontFamily:M,fontWeight:600,letterSpacing:.3,
+                  padding:'1px 5px',borderRadius:3,textTransform:'uppercase',
+                  background:t.tag==='inference'?'#6366f122':'#10b98122',
+                  color:t.tag==='inference'?'#a5b4fc':'#34d399'}}>
+                  {t.tag}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Tab content */}
+      {tab==='fb'       && <FBTab/>}
+      {tab==='ss'       && <div style={{padding:20}}><SSBrowser/></div>}
+      {tab==='analysis' && <MatchAnalysisTab/>}
+    </div>
+  );
+}
+
+function MatchAnalysisTab() {
+  const [ssMatches, setSSMatches] = useState(null);
+  const [ssOnline,  setSSOnline]  = useState(false);
+
+  useEffect(() => {
+    fetch(`${SERVER}/api/ss/matches`, { signal: AbortSignal.timeout(5000) })
+      .then(r => r.json())
+      .then(data => { setSSMatches(data); setSSOnline(true); })
+      .catch(() => { setSSMatches([]); setSSOnline(false); });
+  }, []);
+
+  const noSkelMatches = useMemo(() =>
+    (ssMatches || []).filter(m => !m.has_gdino), [ssMatches]);
+
+  return (
+    <div style={{padding:20}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 300px',gap:16,alignItems:'start'}}>
+        <div style={{display:'flex',flexDirection:'column',gap:16}}>
+          <CourtCanvas width={700} height={500}/>
+        </div>
+
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+            <div style={{padding:'8px 10px',borderBottom:'1px solid #1e293b',fontSize:8,
+              color:'#64748b',fontFamily:M,letterSpacing:.8}}>PIPELINE STAGES</div>
+            <div style={{padding:'6px 10px'}}>
+              {['ffmpeg 30fps','Court detect (RANSAC)','TrackNetV3 shuttle','Hit detect (>90°)',
+                'YOLOv8-Pose','T=16 segment','Feature eng. L2','ST-GCN 256-d','ProtoNet 5-way'].map((s,i)=>(
+                <div key={i} style={{display:'flex',alignItems:'center',gap:6,padding:'3px 0',
+                  borderBottom:'1px solid #1e293b22'}}>
+                  <div style={{width:14,height:14,borderRadius:'50%',background:'#10b981',fontSize:7,
+                    color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>✓</div>
+                  <span style={{fontSize:9,fontFamily:M,color:'#94a3b8'}}>{s}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* SS matches without GDINO skeletons */}
+          <div style={{background:'#0f172a',borderRadius:8,border:'1px solid #1e293b',overflow:'hidden'}}>
+            <div style={{padding:'8px 10px',borderBottom:'1px solid #1e293b',
+              display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+              <span style={{fontSize:8,color:'#64748b',fontFamily:M,letterSpacing:.8}}>
+                SS MATCHES (NO SKELETON)</span>
+              <span style={{fontSize:8,color:'#f59e0b',fontFamily:M}}>
+                {ssMatches === null ? '…' : `${noSkelMatches.length} awaiting extraction`}</span>
+            </div>
+            {!ssOnline ? (
+              <div style={{padding:10,fontSize:10,color:'#ef4444',fontFamily:M}}>Server offline</div>
+            ) : ssMatches === null ? (
+              <div style={{padding:10,fontSize:10,color:'#64748b',fontFamily:M}}>Loading…</div>
+            ) : (
+              <div style={{overflowY:'auto',maxHeight:400}}>
+                {noSkelMatches.map(entry => {
+                  const {match:m, winner, loser, rally_count, shot_count, split} = entry;
+                  const label = winner && loser ? `${winner} vs ${loser}` : ssMatchLabel(m);
+                  const sc = split === 'train' ? '#22c55e' : split === 'test' ? '#f59e0b' : split === 'held_out' ? '#a78bfa' : '#64748b';
+                  const sl = split === 'train' ? 'Train' : split === 'test' ? 'Test' : split === 'held_out' ? 'Held-out' : 'Unused';
+                  return (
+                    <div key={m} style={{padding:'6px 10px',borderBottom:'1px solid #1e293b22',
+                      display:'flex',flexDirection:'column',gap:2}}>
+                      <div style={{display:'flex',alignItems:'center',gap:4}}>
+                        <span style={{fontSize:7,fontFamily:M,color:sc,fontWeight:700,
+                          background:sc+'18',borderRadius:3,padding:'1px 4px',flexShrink:0,
+                          border:`1px solid ${sc}44`}}>{sl}</span>
+                        <span style={{fontSize:9,fontFamily:M,color:'#94a3b8',
+                          whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',flex:1}}
+                          title={m}>{label}</span>
+                      </div>
+                      <span style={{fontSize:8,color:'#475569',fontFamily:M}}>
+                        {rally_count} rall{rally_count===1?'y':'ies'} · {shot_count} shots</span>
+                    </div>
+                  );
+                })}
+                {noSkelMatches.length === 0 && (
+                  <div style={{padding:12,fontSize:10,color:'#475569',fontFamily:M,textAlign:'center'}}>
+                    All matches have skeletons extracted</div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

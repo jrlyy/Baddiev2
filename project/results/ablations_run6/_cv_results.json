@@ -1,0 +1,94 @@
+{
+  "C3_shuttle_xattn": {
+    "scores": [
+      0.5961,
+      0.6365,
+      0.6163,
+      0.5855,
+      0.6756,
+      0.6412,
+      0.6016,
+      0.6783,
+      0.6729,
+      0.6676
+    ],
+    "mean": 0.6372,
+    "std": 0.0338
+  },
+  "_meta": {
+    "cv_mode": "winner_only",
+    "n_folds": 10,
+    "folds": [
+      {
+        "val": [
+          "Anders_Antonsen_Sameer_Verma_TOYOTA_THAILAND_OPEN_2021_QuarterFinals",
+          "CHOU_Tien_Chen_Jonatan_CHRISTIE_Indonesia_Open_2019_Quarter-finals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Anders_Antonsen_Viktor_Axelsen_HSBC_BWF_WORLD_TOUR_FINALS_2020_Finals",
+          "Viktor_AXELSEN _SHI_Yu_Qi_All_England_Open_2020_QuarterFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "NG_Ka_Long_Angus_Jonatan_CHRISTIE_Malaysia_Masters_2020_QuarterFinals",
+          "Viktor_Axelsen_Jonatan_Christie_YONEX_Thailand_Open_2021_QuarterFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Anthony_Sinisuka_GINTING_Viktor_AXELSEN _Indonesia_Masters_2020_SemiFinals",
+          "Viktor_AXELSEN_NG_Ka_Long_Angus_Malaysia_Masters_2020_SemiFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Viktor_Axelsen_Hans-Kristian_Solberg_VIittinghus_TOYOTA_THAILAND_OPEN_2021_Finals",
+          "Viktor_Axelsen_Liew_Daren_TOYOTA_THAILAND_OPEN_2021_QuarterFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Anthony_Sinisuka_GINTING_Anders_ANTONSEN_Indonesia_Masters_2020_Final",
+          "Ng_Ka_Long_Angus_Kidambi_Srikanth_HSBC_BWF_WORLD_TOUR_FINALS_2020_QuarterFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "CHOU_Tien_Chen_Anders_ANTONSEN_Fuzhou_Open_2019_Semi-finals",
+          "Viktor_Axelsen_Ng_Ka_Long_Angus_YONEX_Thailand_Open_2021_Finals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Hans-Kristian_Solberg_Vittinghus_Lee_Cheuk_Yu_TOYOTA_THAILAND_OPEN_2021_QuarterFinals",
+          "Viktor_AXELSEN_CHEN_Long_Malaysia_Masters_2020_QuarterFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Ng_Ka_Long_Angus_Lee_Cheuk_Yiu_YONEX_Thailand_Open_2021_QuarterFinals",
+          "Viktor_Axelsen_Anthony_Sinisuka_Ginting_YONEX_Thailand_Open_2021_SemiFinals"
+        ],
+        "train_size": 17
+      },
+      {
+        "val": [
+          "Hans-Kristian_Solberg_Vittinghus_Anders_Antonsen_TOYOTA_THAILAND_OPEN_2021_SemiFinals"
+        ],
+        "train_size": 18
+      }
+    ],
+    "elapsed_min": 87.1
+  }
+}

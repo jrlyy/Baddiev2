@@ -1,7 +1,7 @@
-datasets/
-frames/
-videos/
-checkpoints/
+project/datasets/
+project/frames/
+project/videos/
+project/checkpoints/
 *.pt
 *.pth
 *.mp4
@@ -10,12 +10,15 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 .DS_Store
-notebooks/*_FULL.ipynb
+project/notebooks/*_FULL.ipynb
 
 # Large data directories
-datasets_preprocessing/shuttleset_frames/
-datasets_preprocessing/shuttleset_skeletons_gdino/
-datasets_preprocessing/finebadminton_skeletons_gdino_v2/
-datasets_preprocessing/shuttleset_shuttles/
-utility/
-baddiev2_colab.zip
+project/datasets_preprocessing/shuttleset_frames/
+project/datasets_preprocessing/shuttleset_skeletons_gdino/
+project/datasets_preprocessing/finebadminton_skeletons_gdino_v2/
+project/datasets_preprocessing/shuttleset_shuttles/
+project/utility/
+project/baddiev2_colab.zip
+
+# Presentation MP4s (large)
+presentation/*.mp4
